@@ -7,8 +7,17 @@ documentation.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "build_memory_index"
+path = "src/bin/build_memory_index.rs"
+
+[[bin]]
+name = "search_memory_index"
+path = "src/bin/search_memory_index.rs"
+
 [dependencies]
 anyhow.workspace = true
+num_cpus.workspace = true
 bf-tree.workspace = true
 bit-set.workspace = true
 bytemuck.workspace = true

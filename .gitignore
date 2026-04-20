@@ -337,3 +337,8 @@ target/
 
 # Ignore local settings for claude code AI agent
 .claude/settings.local.json
+
+
+
+test_data/disk_index_search/gt_filtered.bin
+test_data/disk_index_search/gt_unfiltered.bin
