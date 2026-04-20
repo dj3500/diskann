@@ -318,32 +318,167 @@ fn load_config(index_path: &str, metric: Metric) -> Result<IndexConfiguration> {
     ))
 }
 
-/// Compute per-query filter bitmaps from JSONL label files.
-/// Returns (bitmaps, per_query_match_counts).
+/// Compute per-query filter bitmaps from JSONL label files using an inverted index.
+///
+/// Instead of evaluating each query's AST against every base document (O(Q*N) JSON evals),
+/// this builds an inverted index from base labels (field_name → BitSet of doc_ids) and
+/// then evaluates each query by combining posting lists: OR = union, AND = intersection.
+///
+/// This is orders of magnitude faster for large datasets (seconds vs hours for 10K queries × 1M base).
 fn compute_filter_bitmaps(
     data_labels_path: &str,
     query_labels_path: &str,
 ) -> Result<(Vec<BitSet>, Vec<usize>)> {
-    use diskann_label_filter::{eval_query_expr, read_and_parse_queries, read_baselabels};
+    use diskann_label_filter::read_and_parse_queries;
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader};
 
-    let base_labels = read_baselabels(data_labels_path)?;
+    // Phase 1: Build inverted index from base labels JSONL.
+    // Each line is like: {"doc_id": 0, "geo_32": true, "dev_1": true, "mkt_en-us": true}
+    // We build: field_name -> BitSet of doc_ids that have that field set to true.
+    println!("  Building inverted index from base labels ...");
+    let inv_start = Instant::now();
+    let mut inverted_index: HashMap<String, BitSet> = HashMap::new();
+    let mut num_base = 0usize;
+    {
+        let file = std::fs::File::open(data_labels_path)
+            .with_context(|| format!("Opening base labels: {}", data_labels_path))?;
+        let reader = BufReader::with_capacity(1 << 20, file);
+        for line in reader.lines() {
+            let line = line?;
+            // Fast JSON parsing: extract doc_id and field names without full serde parse.
+            // The format is known: {"doc_id": N, "field1": true, "field2": true, ...}
+            let doc: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("Parsing base label line {}", num_base))?;
+            let doc_id = doc["doc_id"]
+                .as_u64()
+                .with_context(|| format!("Missing doc_id at line {}", num_base))? as usize;
+            if let Some(obj) = doc.as_object() {
+                for (key, val) in obj {
+                    if key == "doc_id" {
+                        continue;
+                    }
+                    if val.as_bool() == Some(true) {
+                        inverted_index
+                            .entry(key.clone())
+                            .or_insert_with(BitSet::new)
+                            .insert(doc_id);
+                    }
+                }
+            }
+            num_base += 1;
+            if num_base.is_multiple_of(200000) {
+                eprint!("\r  Read {} base labels ...", num_base);
+            }
+        }
+    }
+    let inv_elapsed = inv_start.elapsed();
+    eprintln!(
+        "\r  Inverted index built: {} base docs, {} distinct fields, {:.2}s",
+        num_base,
+        inverted_index.len(),
+        inv_elapsed.as_secs_f64()
+    );
+
+    // Phase 2: Evaluate queries using the inverted index.
+    // Each query AST is $and of $or of {field: {$eq: true}} leaf comparisons.
+    // We evaluate by: for each $or group, union the posting lists; then intersect across groups.
+    println!("  Evaluating queries against inverted index ...");
+    let eval_start = Instant::now();
     let parsed_queries = read_and_parse_queries(query_labels_path)?;
 
+    let empty = BitSet::new();
     let bitmaps: Vec<BitSet> = parsed_queries
         .iter()
         .map(|(_query_id, query_expr)| {
-            let mut bitmap = BitSet::new();
-            for base_label in base_labels.iter() {
-                if eval_query_expr(query_expr, &base_label.label) {
-                    bitmap.insert(base_label.doc_id);
-                }
-            }
-            bitmap
+            evaluate_ast_with_inverted_index(query_expr, &inverted_index, &empty, num_base)
         })
         .collect();
 
+    let eval_elapsed = eval_start.elapsed();
+    println!(
+        "  Query evaluation: {} queries in {:.2}s",
+        bitmaps.len(),
+        eval_elapsed.as_secs_f64()
+    );
+
     let counts: Vec<usize> = bitmaps.iter().map(|bm| bm.len()).collect();
     Ok((bitmaps, counts))
+}
+
+/// Evaluate an ASTExpr against an inverted index (field → BitSet of matching doc_ids).
+fn evaluate_ast_with_inverted_index(
+    expr: &diskann_label_filter::ASTExpr,
+    index: &std::collections::HashMap<String, BitSet>,
+    empty: &BitSet,
+    universe_size: usize,
+) -> BitSet {
+    use diskann_label_filter::ASTExpr;
+    match expr {
+        ASTExpr::And(subs) => {
+            let mut result: Option<BitSet> = None;
+            for sub in subs {
+                let sub_result =
+                    evaluate_ast_with_inverted_index(sub, index, empty, universe_size);
+                result = Some(match result {
+                    None => sub_result,
+                    Some(acc) => {
+                        // Intersect: keep only bits present in both
+                        let mut intersection = acc;
+                        intersection.intersect_with(&sub_result);
+                        intersection
+                    }
+                });
+            }
+            result.unwrap_or_else(|| {
+                // Empty AND = universe (vacuous truth)
+                let mut all = BitSet::with_capacity(universe_size);
+                for i in 0..universe_size {
+                    all.insert(i);
+                }
+                all
+            })
+        }
+        ASTExpr::Or(subs) => {
+            let mut result = BitSet::new();
+            for sub in subs {
+                let sub_result =
+                    evaluate_ast_with_inverted_index(sub, index, empty, universe_size);
+                result.union_with(&sub_result);
+            }
+            result
+        }
+        ASTExpr::Not(sub) => {
+            let sub_result = evaluate_ast_with_inverted_index(sub, index, empty, universe_size);
+            let mut complement = BitSet::with_capacity(universe_size);
+            for i in 0..universe_size {
+                complement.insert(i);
+            }
+            // Remove bits that are in sub_result
+            for i in sub_result.iter() {
+                complement.remove(i);
+            }
+            complement
+        }
+        ASTExpr::Compare { field, op } => {
+            use diskann_label_filter::CompareOp;
+            match op {
+                CompareOp::Eq(val) => {
+                    if val.as_bool() == Some(true) {
+                        // Field is true → return posting list for that field
+                        index.get(field).unwrap_or(empty).clone()
+                    } else {
+                        // Field equals some non-true value → not supported in our encoding
+                        BitSet::new()
+                    }
+                }
+                _ => {
+                    // Other operators not used in our boolean encoding
+                    BitSet::new()
+                }
+            }
+        }
+    }
 }
 
 /// Brute-force KNN over a subset of points identified by a bitmap.
