@@ -245,12 +245,16 @@ fn load_data<T: Copy + bytemuck::Pod>(path: &str) -> Result<Matrix<T>> {
     Ok(data)
 }
 
-/// Load groundtruth: [num_queries: u32, dim: u32, then num_queries * dim u32 IDs]
-fn load_groundtruth(path: &str) -> Result<(Vec<u32>, usize, usize)> {
+/// Load groundtruth: [num_queries: u32, dim: u32, then num_queries * dim u32 IDs,
+/// optionally followed by num_queries * dim f32 distances].
+/// Returns (ids, optional distances, num_queries, dim).
+fn load_groundtruth(path: &str) -> Result<(Vec<u32>, Option<Vec<f32>>, usize, usize)> {
     let provider = FileStorageProvider;
     let mut file = provider
         .open_reader(path)
         .with_context(|| format!("Opening ground truth file: {}", path))?;
+
+    let actual_file_size = std::fs::metadata(path)?.len() as usize;
 
     let (num_queries, dim) = {
         let mut buf = [0u8; 4];
@@ -265,13 +269,29 @@ fn load_groundtruth(path: &str) -> Result<(Vec<u32>, usize, usize)> {
     let gt_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut gt);
     file.read_exact(gt_bytes)?;
 
-    Ok((gt, num_queries, dim))
+    // Check if distances are appended after IDs
+    let expected_with_dists = 2 * 4 + num_queries * dim * 4 + num_queries * dim * 4;
+    let gt_dists = if actual_file_size == expected_with_dists {
+        let mut dists = vec![0f32; num_queries * dim];
+        let dist_bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut dists);
+        file.read_exact(dist_bytes)?;
+        Some(dists)
+    } else {
+        None
+    };
+
+    Ok((gt, gt_dists, num_queries, dim))
 }
 
-/// Compute K-recall@N: fraction of top-K ground truth neighbors found in top-N results.
+/// Compute K-recall@N with tie-aware scoring.
+///
+/// When `gt_dists` is provided, points tied at the K-th GT distance boundary
+/// are treated as interchangeable: the algorithm credits up to the number of
+/// "slots" available in that tie band, matching the C++ `calculate_recall`.
 fn compute_recall(
     num_queries: usize,
     gt: &[u32],
+    gt_dists: Option<&[f32]>,
     gt_dim: usize,
     results: &[u32],
     results_dim: usize,
@@ -279,16 +299,74 @@ fn compute_recall(
 ) -> f64 {
     let k = recall_k.min(gt_dim);
     let n = recall_k.min(results_dim);
-    let mut total = 0usize;
+    let mut total = 0.0f64;
+
     for q in 0..num_queries {
-        let gt_set: HashSet<u32> = gt[q * gt_dim..q * gt_dim + k].iter().copied().collect();
-        let res_set: HashSet<u32> = results[q * results_dim..q * results_dim + n]
-            .iter()
-            .copied()
-            .collect();
-        total += gt_set.intersection(&res_set).count();
+        let gt_vec = &gt[q * gt_dim..q * gt_dim + gt_dim];
+        let res_vec = &results[q * results_dim..q * results_dim + n];
+
+        // Count valid GT entries (skip u32::MAX sentinels)
+        let mut num_pts_in_gt = 0usize;
+        while num_pts_in_gt < k && gt_vec[num_pts_in_gt] != u32::MAX {
+            num_pts_in_gt += 1;
+        }
+
+        if num_pts_in_gt == 0 {
+            // No feasible base point exists → 100% recall by convention
+            total += 1.0;
+            continue;
+        }
+
+        let res_set: HashSet<u32> = res_vec.iter().copied().collect();
+
+        let cur_recall = if num_pts_in_gt < k || gt_dists.is_none() {
+            // No tiebreaking needed (or possible)
+            let mut count = 0usize;
+            for j in 0..num_pts_in_gt {
+                if res_set.contains(&gt_vec[j]) {
+                    count += 1;
+                }
+            }
+            count
+        } else {
+            // Tie-aware scoring
+            let gt_dist_vec = &gt_dists.unwrap()[q * gt_dim..q * gt_dim + gt_dim];
+            let boundary_dist = gt_dist_vec[k - 1];
+
+            // Find tiebreaker_start: first index with distance == boundary_dist
+            let mut tiebreaker_start = k - 1;
+            while tiebreaker_start >= 1 && gt_dist_vec[tiebreaker_start - 1] == boundary_dist {
+                tiebreaker_start -= 1;
+            }
+
+            // Find tiebreaker_end: last index (exclusive) with distance == boundary_dist
+            let mut tiebreaker_end = k;
+            while tiebreaker_end < gt_dim && gt_dist_vec[tiebreaker_end] == boundary_dist {
+                tiebreaker_end += 1;
+            }
+
+            // Non-tied part: count normally
+            let mut count = 0usize;
+            for j in 0..tiebreaker_start {
+                if res_set.contains(&gt_vec[j]) {
+                    count += 1;
+                }
+            }
+
+            // Tied part: credit at most (k - tiebreaker_start) matches
+            let mut tie_recall = 0usize;
+            for j in tiebreaker_start..tiebreaker_end {
+                if res_set.contains(&gt_vec[j]) {
+                    tie_recall += 1;
+                }
+            }
+            count + tie_recall.min(k - tiebreaker_start)
+        };
+
+        total += cur_recall as f64 / num_pts_in_gt as f64;
     }
-    total as f64 / (num_queries as f64 * k as f64) * 100.0
+
+    total / num_queries as f64 * 100.0
 }
 
 /// Build an IndexConfiguration from the saved graph metadata.
@@ -599,19 +677,22 @@ where
     );
 
     // Load ground truth
-    let (gt, _gt_nq, gt_dim, has_gt) = if args.gt_file == "null" {
+    let (gt, gt_dists, _gt_nq, gt_dim, has_gt) = if args.gt_file == "null" {
         println!("No ground truth file provided. Recall will not be computed.");
-        (vec![], 0, 0, false)
+        (vec![], None, 0, 0, false)
     } else {
         println!("Loading ground truth from {} ...", args.gt_file);
-        let (gt, nq, dim) = load_groundtruth(&args.gt_file)?;
+        let (gt, gt_dists, nq, dim) = load_groundtruth(&args.gt_file)?;
         println!("Ground truth: {} queries, {} neighbors each", nq, dim);
+        if gt_dists.is_some() {
+            println!("  (GT file includes distances — tie-aware recall enabled)");
+        }
         assert_eq!(
             nq, num_queries,
             "Mismatch: ground truth has {} queries but query file has {}",
             nq, num_queries
         );
-        (gt, nq, dim, true)
+        (gt, gt_dists, nq, dim, true)
     };
 
     // Load filter bitmaps if provided
@@ -910,7 +991,7 @@ where
 
         // Recall
         let recall = if has_gt {
-            compute_recall(num_queries, &gt, gt_dim, &all_ids, k, k)
+            compute_recall(num_queries, &gt, gt_dists.as_deref(), gt_dim, &all_ids, k, k)
         } else {
             f64::NAN
         };
