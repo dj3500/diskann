@@ -72,7 +72,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bit_set::BitSet;
 use clap::{Parser, ValueEnum};
 use diskann::graph::index::QueryLabelProvider;
 use diskann::graph::search_output_buffer;
@@ -81,10 +80,11 @@ use diskann::neighbor::Neighbor;
 use diskann::provider::DefaultContext;
 use diskann::utils::{IntoUsize, VectorRepr};
 use diskann_label_filter::attribute::Attribute;
+use diskann_label_filter::encoded_attribute_provider::attribute_encoder::AttributeEncoder;
 use diskann_label_filter::encoded_attribute_provider::encoded_filter_expr::EncodedFilterExpr;
 use diskann_label_filter::encoded_attribute_provider::roaring_attribute_store::RoaringAttributeStore;
-use diskann_label_filter::traits::attribute_store::AttributeStore;
-use diskann_label_filter::{read_and_parse_queries, read_baselabels};
+use diskann_label_filter::parser::ast::{ASTExpr, CompareOp};
+use diskann_label_filter::read_and_parse_queries;
 use diskann_providers::model::configuration::IndexConfiguration;
 use diskann_providers::model::graph::provider::async_::common::FullPrecision;
 use diskann_providers::model::graph::provider::async_::inmem::FullPrecisionProvider;
@@ -406,6 +406,266 @@ fn load_config(index_path: &str, metric: Metric) -> Result<IndexConfiguration> {
     ))
 }
 
+// ============================================================================
+// Label JSONL parsing. Both filter strategies (Bitmap64 inverted index and
+// inline-beta encoded attribute store) stream the base label file once at
+// startup and share this byte-level parser.
+// ============================================================================
+
+/// Parse a JSONL label line of the form
+///   `{"doc_id": N, "<field>": true, ..., "<field>": false, ...}`
+/// Calls `on_true_field(name)` for each top-level key whose value is JSON
+/// `true`. Returns the doc_id on success, or `None` if the line is malformed.
+///
+/// Non-bool values (numbers, strings) are scanned past but not indexed,
+/// matching the convention of the bitmap inverted-index builder.
+fn parse_label_line<F>(line: &[u8], mut on_true_field: F) -> Option<u32>
+where
+    F: FnMut(&str),
+{
+    let mut i = 0usize;
+    let n = line.len();
+    let mut doc_id: Option<u32> = None;
+
+    while i < n {
+        let q1 = match line[i..].iter().position(|&b| b == b'"') {
+            Some(p) => p,
+            None => break,
+        };
+        i += q1 + 1;
+        if i >= n {
+            break;
+        }
+        let key_start = i;
+        let q2 = match line[i..].iter().position(|&b| b == b'"') {
+            Some(p) => p,
+            None => break,
+        };
+        i += q2;
+        let key_end = i;
+        i += 1;
+
+        let key = match std::str::from_utf8(&line[key_start..key_end]) {
+            Ok(s) => s,
+            Err(_) => return doc_id,
+        };
+
+        while i < n && line[i] != b':' {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        i += 1;
+        while i < n && (line[i] == b' ' || line[i] == b'\t') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+
+        let v = line[i];
+        if v == b't' {
+            if i + 4 > n || &line[i..i + 4] != b"true" {
+                return doc_id;
+            }
+            i += 4;
+            if key != "doc_id" {
+                on_true_field(key);
+            }
+        } else if v == b'f' {
+            if i + 5 > n || &line[i..i + 5] != b"false" {
+                return doc_id;
+            }
+            i += 5;
+        } else if v == b'"' {
+            i += 1;
+            while i < n && line[i] != b'"' {
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+        } else if v.is_ascii_digit() || v == b'-' {
+            let start = i;
+            while i < n
+                && (line[i].is_ascii_digit()
+                    || matches!(line[i], b'.' | b'e' | b'E' | b'+' | b'-'))
+            {
+                i += 1;
+            }
+            if key == "doc_id" {
+                doc_id = std::str::from_utf8(&line[start..i]).ok()?.parse().ok();
+            }
+        } else {
+            return doc_id;
+        }
+    }
+
+    doc_id
+}
+
+/// Fixed-size dense bitmap backed by `Vec<u64>`.
+///
+/// Designed for fast per-query filter computation: all hot-path operations
+/// (`union_with`, `intersect_with`, `complement_in_place`, `copy_from`, `clear`)
+/// are in-place and allocation-free, working on 64-bit words to enable
+/// auto-vectorization (vs `bit_set::BitSet`'s 32-bit words).
+#[derive(Clone, Debug)]
+struct Bitmap64 {
+    words: Vec<u64>,
+    universe: usize,
+}
+
+impl Bitmap64 {
+    /// New all-zero bitmap with capacity for `universe` bits.
+    fn with_universe(universe: usize) -> Self {
+        let n_words = universe.div_ceil(64);
+        Self {
+            words: vec![0u64; n_words],
+            universe,
+        }
+    }
+
+    /// Empty bitmap (zero universe). Used as a placeholder; resize before use.
+    fn empty() -> Self {
+        Self {
+            words: Vec::new(),
+            universe: 0,
+        }
+    }
+
+    /// Mask off trailing bits beyond `universe` in the last word.
+    #[inline]
+    fn mask_tail(&mut self) {
+        if self.words.is_empty() {
+            return;
+        }
+        let extra = self.words.len() * 64 - self.universe;
+        if extra > 0 {
+            let last = self.words.len() - 1;
+            self.words[last] &= (!0u64) >> extra;
+        }
+    }
+
+    /// Insert a bit, growing the underlying storage as needed.
+    /// Used during inverted-index construction when the universe size is not
+    /// yet known. After construction, call `resize_universe` to normalize.
+    fn insert_grow(&mut self, idx: usize) {
+        let word_idx = idx >> 6;
+        if word_idx >= self.words.len() {
+            self.words.resize(word_idx + 1, 0);
+        }
+        self.words[word_idx] |= 1u64 << (idx & 63);
+        if idx + 1 > self.universe {
+            self.universe = idx + 1;
+        }
+    }
+
+    /// Pad/truncate to the given universe size. Trailing bits beyond universe
+    /// are cleared.
+    fn resize_universe(&mut self, universe: usize) {
+        let n_words = universe.div_ceil(64);
+        self.words.resize(n_words, 0);
+        self.universe = universe;
+        self.mask_tail();
+    }
+
+    #[inline]
+    fn contains(&self, idx: usize) -> bool {
+        let word_idx = idx >> 6;
+        word_idx < self.words.len() && (self.words[word_idx] >> (idx & 63)) & 1 != 0
+    }
+
+    /// In-place `self |= other`. Both bitmaps must have the same universe.
+    fn union_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a |= *b;
+        }
+    }
+
+    /// In-place `self &= other`. Both bitmaps must have the same universe.
+    fn intersect_with(&mut self, other: &Self) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a &= *b;
+        }
+    }
+
+    /// In-place `self = !self` (within universe).
+    fn complement_in_place(&mut self) {
+        for w in &mut self.words {
+            *w = !*w;
+        }
+        self.mask_tail();
+    }
+
+    /// In-place `self = other`. No allocation when sizes match.
+    fn copy_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        self.words.copy_from_slice(&other.words);
+        self.universe = other.universe;
+    }
+
+    /// In-place `self = all zeros`.
+    fn clear_bits(&mut self) {
+        for w in &mut self.words {
+            *w = 0;
+        }
+    }
+
+    /// In-place `self = all ones` (within universe).
+    fn fill_ones(&mut self) {
+        for w in &mut self.words {
+            *w = !0u64;
+        }
+        self.mask_tail();
+    }
+
+    /// Number of set bits (popcount).
+    fn count_ones(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Iterator over set bit indices.
+    fn iter(&self) -> Bitmap64Iter<'_> {
+        Bitmap64Iter::new(&self.words)
+    }
+}
+
+struct Bitmap64Iter<'a> {
+    words: &'a [u64],
+    word_idx: usize,
+    remaining: u64,
+}
+
+impl<'a> Bitmap64Iter<'a> {
+    fn new(words: &'a [u64]) -> Self {
+        Self {
+            words,
+            word_idx: 0,
+            remaining: words.first().copied().unwrap_or(0),
+        }
+    }
+}
+
+impl Iterator for Bitmap64Iter<'_> {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        while self.remaining == 0 {
+            self.word_idx += 1;
+            if self.word_idx >= self.words.len() {
+                return None;
+            }
+            self.remaining = self.words[self.word_idx];
+        }
+        let tz = self.remaining.trailing_zeros() as usize;
+        self.remaining &= self.remaining - 1;
+        Some(self.word_idx * 64 + tz)
+    }
+}
+
 /// Compute per-query filter bitmaps from JSONL label files using an inverted index.
 ///
 /// Instead of evaluating each query's AST against every base document (O(Q*N) JSON evals),
@@ -416,50 +676,100 @@ fn load_config(index_path: &str, metric: Metric) -> Result<IndexConfiguration> {
 fn compute_filter_bitmaps(
     data_labels_path: &str,
     query_labels_path: &str,
-) -> Result<(Vec<BitSet>, Vec<usize>)> {
+) -> Result<(Vec<Bitmap64>, Vec<usize>)> {
     use diskann_label_filter::read_and_parse_queries;
     use std::collections::HashMap;
+    use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    // Phase 1: Build inverted index from base labels JSONL.
-    // Each line is like: {"doc_id": 0, "geo_32": true, "dev_1": true, "mkt_en-us": true}
-    // We build: field_name -> BitSet of doc_ids that have that field set to true.
+    // Phase 1: Stream the base label JSONL once and build a Vec<Bitmap64>
+    // keyed by attr_id, plus a parallel attr-name table. Each line's true
+    // fields are interned into a small id_buf during parsing; the doc_id is
+    // only known at end-of-line so we apply the buffered ids in a second tiny
+    // pass over id_buf.
     println!("  Building inverted index from base labels ...");
     let inv_start = Instant::now();
-    let mut inverted_index: HashMap<String, BitSet> = HashMap::new();
-    let mut num_base = 0usize;
-    {
-        let file = std::fs::File::open(data_labels_path)
-            .with_context(|| format!("Opening base labels: {}", data_labels_path))?;
-        let reader = BufReader::with_capacity(1 << 20, file);
-        for line in reader.lines() {
-            let line = line?;
-            // Fast JSON parsing: extract doc_id and field names without full serde parse.
-            // The format is known: {"doc_id": N, "field1": true, "field2": true, ...}
-            let doc: serde_json::Value = serde_json::from_str(&line)
-                .with_context(|| format!("Parsing base label line {}", num_base))?;
-            let doc_id = doc["doc_id"]
-                .as_u64()
-                .with_context(|| format!("Missing doc_id at line {}", num_base))? as usize;
-            if let Some(obj) = doc.as_object() {
-                for (key, val) in obj {
-                    if key == "doc_id" {
-                        continue;
-                    }
-                    if val.as_bool() == Some(true) {
-                        inverted_index
-                            .entry(key.clone())
-                            .or_insert_with(BitSet::new)
-                            .insert(doc_id);
-                    }
-                }
+
+    let src_file = File::open(data_labels_path)
+        .with_context(|| format!("Opening base labels file: {}", data_labels_path))?;
+    let mut reader = BufReader::with_capacity(1 << 22, src_file);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(512);
+
+    let mut attr_ids: HashMap<String, u32> = HashMap::with_capacity(1 << 16);
+    let mut attr_names: Vec<String> = Vec::new();
+    let mut attr_bitmaps: Vec<Bitmap64> = Vec::new();
+    let mut id_buf: Vec<u32> = Vec::with_capacity(16);
+
+    let mut max_doc_id: u32 = 0;
+    let mut num_docs: u32 = 0;
+    let mut last_print = inv_start;
+    loop {
+        line_buf.clear();
+        let n = reader.read_until(b'\n', &mut line_buf)?;
+        if n == 0 {
+            break;
+        }
+        let line = if line_buf.last() == Some(&b'\n') {
+            &line_buf[..line_buf.len() - 1]
+        } else {
+            &line_buf[..]
+        };
+
+        id_buf.clear();
+        let doc_id = match parse_label_line(line, |field: &str| {
+            if let Some(&id) = attr_ids.get(field) {
+                id_buf.push(id);
+            } else {
+                let id = attr_names.len() as u32;
+                attr_names.push(field.to_string());
+                attr_ids.insert(field.to_string(), id);
+                attr_bitmaps.push(Bitmap64::empty());
+                id_buf.push(id);
             }
-            num_base += 1;
-            if num_base.is_multiple_of(200000) {
-                eprint!("\r  Read {} base labels ...", num_base);
+        }) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        for &aid in &id_buf {
+            attr_bitmaps[aid as usize].insert_grow(doc_id as usize);
+        }
+        if doc_id > max_doc_id {
+            max_doc_id = doc_id;
+        }
+        num_docs += 1;
+        if num_docs % 500_000 == 0 {
+            let now = Instant::now();
+            if (now - last_print).as_secs_f64() > 1.0 {
+                eprint!(
+                    "\r  Building inverted index: {} docs, {} distinct fields, {:.1}s",
+                    num_docs,
+                    attr_names.len(),
+                    inv_start.elapsed().as_secs_f64()
+                );
+                last_print = now;
             }
         }
     }
+    eprintln!(
+        "\r  Building inverted index: {} docs, {} distinct fields, {:.1}s",
+        num_docs,
+        attr_names.len(),
+        inv_start.elapsed().as_secs_f64()
+    );
+
+    let num_base = (max_doc_id as usize) + 1;
+    for bm in &mut attr_bitmaps {
+        bm.resize_universe(num_base);
+    }
+
+    // Transpose attr_id -> field name keying so the AST evaluator (which
+    // looks up by `field: String`) keeps working unchanged.
+    let mut inverted_index: HashMap<String, Bitmap64> = HashMap::with_capacity(attr_names.len());
+    for (name, bm) in attr_names.drain(..).zip(attr_bitmaps.drain(..)) {
+        inverted_index.insert(name, bm);
+    }
+
     let inv_elapsed = inv_start.elapsed();
     eprintln!(
         "\r  Inverted index built: {} base docs, {} distinct fields, {:.2}s",
@@ -470,18 +780,37 @@ fn compute_filter_bitmaps(
 
     // Phase 2: Evaluate queries using the inverted index.
     // Each query AST is $and of $or of {field: {$eq: true}} leaf comparisons.
-    // We evaluate by: for each $or group, union the posting lists; then intersect across groups.
     println!("  Evaluating queries against inverted index ...");
     let eval_start = Instant::now();
     let parsed_queries = read_and_parse_queries(query_labels_path)?;
 
-    let empty = BitSet::new();
-    let bitmaps: Vec<BitSet> = parsed_queries
-        .iter()
-        .map(|(_query_id, query_expr)| {
-            evaluate_ast_with_inverted_index(query_expr, &inverted_index, &empty, num_base)
-        })
+    // Pre-allocate result vector: one Bitmap64 per query at the full universe.
+    // This is the dominant memory cost (10K * 5MB = 50GB for 40M-bit queries)
+    // but it's allocated up front, not per query.
+    let num_queries = parsed_queries.len();
+    let mut bitmaps: Vec<Bitmap64> = (0..num_queries)
+        .map(|_| Bitmap64::with_universe(num_base))
         .collect();
+
+    // Scratch buffers for nested AND/OR/NOT evaluation. Each level of nesting
+    // that has multiple subexpressions needs one scratch slot. Our queries are
+    // AND-of-OR-of-terminals (depth 2), so 4 buffers is ample.
+    let scratch_depth = 8;
+    let mut scratch: Vec<Bitmap64> = (0..scratch_depth)
+        .map(|_| Bitmap64::with_universe(num_base))
+        .collect();
+
+    // Build a precomputed all-zeros template for terminal-not-found case.
+    // We reference `inverted_index` entries directly when present.
+    for (i, (_query_id, query_expr)) in parsed_queries.iter().enumerate() {
+        evaluate_ast_into(
+            query_expr,
+            &inverted_index,
+            num_base,
+            &mut bitmaps[i],
+            &mut scratch[..],
+        );
+    }
 
     let eval_elapsed = eval_start.elapsed();
     println!(
@@ -490,82 +819,76 @@ fn compute_filter_bitmaps(
         eval_elapsed.as_secs_f64()
     );
 
-    let counts: Vec<usize> = bitmaps.iter().map(|bm| bm.len()).collect();
+    let counts: Vec<usize> = bitmaps.iter().map(|bm| bm.count_ones()).collect();
     Ok((bitmaps, counts))
 }
 
-/// Evaluate an ASTExpr against an inverted index (field → BitSet of matching doc_ids).
-fn evaluate_ast_with_inverted_index(
+/// Evaluate an `ASTExpr` against an inverted index, writing the result into `out`.
+///
+/// Uses caller-provided scratch buffers to avoid all per-call allocation.
+/// For an AST of nesting depth D with N-ary AND/OR nodes, at most D scratch
+/// buffers are consumed (one per non-trivial AND/OR/NOT level).
+fn evaluate_ast_into(
     expr: &diskann_label_filter::ASTExpr,
-    index: &std::collections::HashMap<String, BitSet>,
-    empty: &BitSet,
-    universe_size: usize,
-) -> BitSet {
-    use diskann_label_filter::ASTExpr;
+    index: &std::collections::HashMap<String, Bitmap64>,
+    universe: usize,
+    out: &mut Bitmap64,
+    scratch: &mut [Bitmap64],
+) {
+    use diskann_label_filter::{ASTExpr, CompareOp};
     match expr {
         ASTExpr::And(subs) => {
-            let mut result: Option<BitSet> = None;
-            for sub in subs {
-                let sub_result =
-                    evaluate_ast_with_inverted_index(sub, index, empty, universe_size);
-                result = Some(match result {
-                    None => sub_result,
-                    Some(acc) => {
-                        // Intersect: keep only bits present in both
-                        let mut intersection = acc;
-                        intersection.intersect_with(&sub_result);
-                        intersection
-                    }
-                });
+            if subs.is_empty() {
+                // Empty AND = vacuous truth = all bits set.
+                out.fill_ones();
+                return;
             }
-            result.unwrap_or_else(|| {
-                // Empty AND = universe (vacuous truth)
-                let mut all = BitSet::with_capacity(universe_size);
-                for i in 0..universe_size {
-                    all.insert(i);
+            // First subexpression writes directly into `out` using the full scratch.
+            evaluate_ast_into(&subs[0], index, universe, out, scratch);
+            if subs.len() > 1 {
+                // Subsequent subexpressions write into one slot, AND'd into `out`.
+                let (slot, rest) = scratch
+                    .split_first_mut()
+                    .expect("not enough scratch buffers for AST nesting depth");
+                for sub in &subs[1..] {
+                    evaluate_ast_into(sub, index, universe, slot, rest);
+                    out.intersect_with(slot);
                 }
-                all
-            })
+            }
         }
         ASTExpr::Or(subs) => {
-            let mut result = BitSet::new();
-            for sub in subs {
-                let sub_result =
-                    evaluate_ast_with_inverted_index(sub, index, empty, universe_size);
-                result.union_with(&sub_result);
+            if subs.is_empty() {
+                out.clear_bits();
+                return;
             }
-            result
+            evaluate_ast_into(&subs[0], index, universe, out, scratch);
+            if subs.len() > 1 {
+                let (slot, rest) = scratch
+                    .split_first_mut()
+                    .expect("not enough scratch buffers for AST nesting depth");
+                for sub in &subs[1..] {
+                    evaluate_ast_into(sub, index, universe, slot, rest);
+                    out.union_with(slot);
+                }
+            }
         }
         ASTExpr::Not(sub) => {
-            let sub_result = evaluate_ast_with_inverted_index(sub, index, empty, universe_size);
-            let mut complement = BitSet::with_capacity(universe_size);
-            for i in 0..universe_size {
-                complement.insert(i);
-            }
-            // Remove bits that are in sub_result
-            for i in sub_result.iter() {
-                complement.remove(i);
-            }
-            complement
+            evaluate_ast_into(sub, index, universe, out, scratch);
+            out.complement_in_place();
         }
-        ASTExpr::Compare { field, op } => {
-            use diskann_label_filter::CompareOp;
-            match op {
-                CompareOp::Eq(val) => {
-                    if val.as_bool() == Some(true) {
-                        // Field is true → return posting list for that field
-                        index.get(field).unwrap_or(empty).clone()
-                    } else {
-                        // Field equals some non-true value → not supported in our encoding
-                        BitSet::new()
-                    }
-                }
-                _ => {
-                    // Other operators not used in our boolean encoding
-                    BitSet::new()
+        ASTExpr::Compare { field, op } => match op {
+            CompareOp::Eq(val) if val.as_bool() == Some(true) => {
+                if let Some(bm) = index.get(field) {
+                    out.copy_from(bm);
+                } else {
+                    out.clear_bits();
                 }
             }
-        }
+            _ => {
+                // Other operators / non-boolean Eq aren't used in our encoding.
+                out.clear_bits();
+            }
+        },
     }
 }
 
@@ -574,7 +897,7 @@ fn evaluate_ast_with_inverted_index(
 fn brute_force_knn<T>(
     query: &[T],
     base_data: &Matrix<T>,
-    bitmap: &BitSet,
+    bitmap: &Bitmap64,
     k: usize,
     metric: Metric,
 ) -> Vec<u32>
@@ -614,9 +937,9 @@ where
     results.iter().map(|n| n.id).collect()
 }
 
-/// Wrapper implementing QueryLabelProvider for a BitSet.
+/// Wrapper implementing QueryLabelProvider for a Bitmap64.
 #[derive(Debug)]
-struct BitmapLabelProvider(BitSet);
+struct BitmapLabelProvider(Bitmap64);
 
 impl QueryLabelProvider<u32> for BitmapLabelProvider {
     fn is_match(&self, vec_id: u32) -> bool {
@@ -640,6 +963,83 @@ impl std::fmt::Debug for InlineLabelProvider {
 impl QueryLabelProvider<u32> for InlineLabelProvider {
     fn is_match(&self, vec_id: u32) -> bool {
         self.store.matches_filter(&vec_id, &self.encoded_filter)
+    }
+}
+
+/// Label provider that matches nothing. Used for queries whose predicate references
+/// attributes that don't exist in the base dataset and would otherwise be empty.
+#[derive(Debug)]
+struct AlwaysFalseLabelProvider;
+
+impl QueryLabelProvider<u32> for AlwaysFalseLabelProvider {
+    fn is_match(&self, _vec_id: u32) -> bool {
+        false
+    }
+}
+
+/// Result of cleaning a query AST against the encoder's attribute map.
+enum CleanedAst {
+    /// Expression after pruning unknown leaves; safe to encode.
+    Expr(ASTExpr),
+    /// The whole expression is unsatisfiable (no document can match).
+    Empty,
+}
+
+/// Walk a parsed query AST and prune `field == value` leaves whose attribute is not
+/// present in `encoder`. Such leaves can never match any base point, so:
+///   * inside an OR, they are dropped;
+///   * inside an AND, they make the whole AND unsatisfiable.
+/// Other compare operators (Ne / Lt / Lte / Gt / Gte) are left untouched so the
+/// downstream encoder/evaluator handles them as before.
+fn clean_ast(expr: &ASTExpr, encoder: &AttributeEncoder) -> CleanedAst {
+    match expr {
+        ASTExpr::Compare {
+            field,
+            op: CompareOp::Eq(value),
+        } => match Attribute::from_json_value(field, value) {
+            Ok(attr) => {
+                if encoder.get(&attr).is_some() {
+                    CleanedAst::Expr(expr.clone())
+                } else {
+                    CleanedAst::Empty
+                }
+            }
+            Err(_) => CleanedAst::Empty,
+        },
+        ASTExpr::Compare { .. } => CleanedAst::Expr(expr.clone()),
+        ASTExpr::And(children) => {
+            let mut out: Vec<ASTExpr> = Vec::with_capacity(children.len());
+            for c in children {
+                match clean_ast(c, encoder) {
+                    CleanedAst::Expr(e) => out.push(e),
+                    CleanedAst::Empty => return CleanedAst::Empty,
+                }
+            }
+            match out.len() {
+                0 => CleanedAst::Empty,
+                1 => CleanedAst::Expr(out.into_iter().next().unwrap()),
+                _ => CleanedAst::Expr(ASTExpr::And(out)),
+            }
+        }
+        ASTExpr::Or(children) => {
+            let mut out: Vec<ASTExpr> = Vec::with_capacity(children.len());
+            for c in children {
+                if let CleanedAst::Expr(e) = clean_ast(c, encoder) {
+                    out.push(e);
+                }
+            }
+            match out.len() {
+                0 => CleanedAst::Empty,
+                1 => CleanedAst::Expr(out.into_iter().next().unwrap()),
+                _ => CleanedAst::Expr(ASTExpr::Or(out)),
+            }
+        }
+        ASTExpr::Not(inner) => match clean_ast(inner, encoder) {
+            CleanedAst::Expr(e) => CleanedAst::Expr(ASTExpr::Not(Box::new(e))),
+            // NOT(unsatisfiable) is a tautology, which we cannot easily express.
+            // Conservatively pass the original through so the encoder can decide.
+            CleanedAst::Empty => CleanedAst::Expr(expr.clone()),
+        },
     }
 }
 
@@ -730,7 +1130,7 @@ where
 
     // Load filter bitmaps if provided
     let mut bitmap_time_ms: f64 = 0.0;
-    let filter_bitmaps: Option<Vec<BitSet>> =
+    let filter_bitmaps: Option<Vec<Bitmap64>> =
         match (&args.data_labels, &args.query_labels) {
             (Some(dl), Some(ql)) => {
                 println!("Computing filter bitmaps ...");
@@ -874,7 +1274,7 @@ where
                     // Check if brute-force should be used for this query
                     let use_brute_force = args.brute_force_threshold > 0
                         && filter_bitmaps.is_some()
-                        && filter_bitmaps.as_ref().unwrap()[q].len()
+                        && filter_bitmaps.as_ref().unwrap()[q].count_ones()
                             < args.brute_force_threshold;
 
                     let mut ids = vec![0u32; search_k];
@@ -1112,29 +1512,99 @@ where
     let index = Arc::new(fp_index);
     println!("Index loaded.");
 
-    // Build RoaringAttributeStore from base labels JSONL
+    // Stream the base label JSONL once, interning field names into attr_ids
+    // and collecting per-doc (doc_id, attr_ids) pairs. The store then bulk-
+    // builds each RoaringTreemap from a sorted iterator under one set of
+    // locks.
     println!("Loading base labels from {} ...", dl);
     let label_start = Instant::now();
-    let base_labels = read_baselabels(dl)
-        .map_err(|e| anyhow::anyhow!("Failed to read base labels: {}", e))?;
-    let roaring_store = RoaringAttributeStore::<u32>::new();
-    for doc in &base_labels {
-        let attrs: Vec<Attribute> = doc
-            .flatten_metadata()
-            .into_iter()
-            .map(|(k, v)| Attribute::from_value(k, v))
-            .collect();
-        if !attrs.is_empty() {
-            roaring_store
-                .set_element(&(doc.doc_id as u32), &attrs)
-                .map_err(|e| anyhow::anyhow!("Failed to set attributes for doc {}: {}", doc.doc_id, e))?;
+
+    let src_file = std::fs::File::open(dl)
+        .map_err(|e| anyhow::anyhow!("Opening base labels file {}: {}", dl, e))?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 22, src_file);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(512);
+
+    let mut attr_ids: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::with_capacity(1 << 16);
+    let mut attr_names: Vec<String> = Vec::new();
+    let mut docs_buf: Vec<(u32, Vec<u64>)> = Vec::with_capacity(1 << 25);
+    let mut ids_u64: Vec<u64> = Vec::with_capacity(16);
+
+    let mut num_docs: u32 = 0;
+    let mut last_print = label_start;
+    use std::io::BufRead;
+    loop {
+        line_buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut line_buf)
+            .map_err(|e| anyhow::anyhow!("Reading base labels: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        let line = if line_buf.last() == Some(&b'\n') {
+            &line_buf[..line_buf.len() - 1]
+        } else {
+            &line_buf[..]
+        };
+
+        ids_u64.clear();
+        let doc_id = match parse_label_line(line, |field: &str| {
+            if let Some(&id) = attr_ids.get(field) {
+                ids_u64.push(id as u64);
+            } else {
+                let id = attr_names.len() as u32;
+                attr_names.push(field.to_string());
+                attr_ids.insert(field.to_string(), id);
+                ids_u64.push(id as u64);
+            }
+        }) {
+            Some(d) => d,
+            None => continue,
+        };
+
+        if !ids_u64.is_empty() {
+            docs_buf.push((doc_id, std::mem::take(&mut ids_u64)));
+            // Restore capacity for the next iteration without re-allocating.
+            ids_u64.reserve(16);
+        }
+
+        num_docs += 1;
+        if num_docs % 500_000 == 0 {
+            let now = Instant::now();
+            if (now - last_print).as_secs_f64() > 1.0 {
+                eprint!(
+                    "\r  Streaming base labels: {} docs, {} distinct fields, {:.1}s",
+                    num_docs,
+                    attr_names.len(),
+                    label_start.elapsed().as_secs_f64()
+                );
+                last_print = now;
+            }
         }
     }
+    eprintln!(
+        "\r  Streaming base labels: {} docs, {} distinct fields, {:.1}s",
+        num_docs,
+        attr_names.len(),
+        label_start.elapsed().as_secs_f64()
+    );
+
+    // Build attribute strings in attr_id order (matches the encoder convention).
+    let attr_strings: Vec<Attribute> = attr_names
+        .iter()
+        .map(|name| Attribute::from_json_value(name, &serde_json::Value::Bool(true)))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to build Attribute from field name: {}", e))?;
+
+    let num_docs_cache = num_docs as usize;
+    let roaring_store = RoaringAttributeStore::<u32>::new();
+    roaring_store
+        .bulk_insert_encoded(&attr_strings, docs_buf.into_iter())
+        .map_err(|e| anyhow::anyhow!("Failed to bulk-load attributes: {}", e))?;
     let label_load_ms = label_start.elapsed().as_secs_f64() * 1000.0;
     println!(
         "  Loaded {} base documents into RoaringAttributeStore ({:.2} ms)",
-        base_labels.len(),
-        label_load_ms
+        num_docs_cache, label_load_ms
     );
     let roaring_store = Arc::new(roaring_store);
 
@@ -1145,15 +1615,38 @@ where
     println!("  Parsed {} query predicates", query_exprs.len());
 
     let attr_map = roaring_store.attribute_map();
-    let encoded_filters: Vec<Arc<EncodedFilterExpr>> = query_exprs
-        .iter()
-        .map(|(_qid, ast)| {
-            let ef = EncodedFilterExpr::new(ast, attr_map.clone())
-                .map_err(|e| anyhow::anyhow!("Failed to encode filter: {}", e))?;
-            Ok(Arc::new(ef))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    println!("  Encoded {} query filters", encoded_filters.len());
+    let mut empty_filter_count: usize = 0;
+    let mut pruned_filter_count: usize = 0;
+    let encoded_filters: Vec<Option<Arc<EncodedFilterExpr>>> = {
+        let encoder_guard = attr_map.read().map_err(|_| {
+            anyhow::anyhow!("Failed to acquire read lock on attribute encoder")
+        })?;
+        let mut out: Vec<Option<Arc<EncodedFilterExpr>>> =
+            Vec::with_capacity(query_exprs.len());
+        for (_qid, ast) in query_exprs.iter() {
+            match clean_ast(ast, &encoder_guard) {
+                CleanedAst::Empty => {
+                    empty_filter_count += 1;
+                    out.push(None);
+                }
+                CleanedAst::Expr(cleaned) => {
+                    if &cleaned != ast {
+                        pruned_filter_count += 1;
+                    }
+                    let ef = EncodedFilterExpr::new(&cleaned, attr_map.clone())
+                        .map_err(|e| anyhow::anyhow!("Failed to encode filter: {}", e))?;
+                    out.push(Some(Arc::new(ef)));
+                }
+            }
+        }
+        out
+    };
+    println!(
+        "  Encoded {} query filters ({} pruned of unknown labels, {} unsatisfiable)",
+        encoded_filters.len(),
+        pruned_filter_count,
+        empty_filter_count
+    );
 
     // Load queries
     println!("Loading queries from {} ...", args.query_file);
@@ -1228,12 +1721,17 @@ where
                 for q in 0..num_queries {
                     let query_vec = queries.row(q);
 
-                    // Build inline label provider for this query (cheap: just Arc clones)
+                    // Build inline label provider for this query (cheap: just Arc clones).
+                    // Queries whose predicate references attributes absent from the base
+                    // dataset get an always-false provider so they match nothing.
                     let label_provider: Arc<dyn QueryLabelProvider<u32>> =
-                        Arc::new(InlineLabelProvider {
-                            store: roaring_store.clone(),
-                            encoded_filter: encoded_filters[q].clone(),
-                        });
+                        match &encoded_filters[q] {
+                            Some(ef) => Arc::new(InlineLabelProvider {
+                                store: roaring_store.clone(),
+                                encoded_filter: ef.clone(),
+                            }),
+                            None => Arc::new(AlwaysFalseLabelProvider),
+                        };
                     let beta_strategy =
                         BetaFilter::new(FullPrecision, label_provider, args.beta);
 

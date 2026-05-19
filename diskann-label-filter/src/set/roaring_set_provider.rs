@@ -168,6 +168,14 @@ where
             index: HashMap::with_hasher(BuildIdentityHasher::default()),
         }
     }
+
+    /// Install a pre-built `RoaringTreemap` for `key`, replacing any existing
+    /// mapping. Intended for bulk-loading paths that build each treemap in one
+    /// shot (e.g. via `RoaringTreemap::from_sorted_iter`) and stash it directly
+    /// rather than going through the per-value `insert` loop.
+    pub fn install_for_key(&mut self, key: Key, set: RoaringTreemap) {
+        self.index.insert(key, set);
+    }
 }
 
 // RoaringTreemap provider with u64 values

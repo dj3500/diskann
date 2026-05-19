@@ -67,6 +67,119 @@ where
             _ => false,
         }
     }
+
+    /// Bulk-load pre-encoded attributes in one shot. Intended for benchmark
+    /// harnesses that have already extracted attribute strings + per-doc
+    /// attr_id lists from a label file.
+    ///
+    /// `attribute_strings` lists the attribute objects in encoder-id order:
+    /// `attribute_strings[i]` becomes encoder id `i`. The store must be empty
+    /// when this is called (the caller has just `new()`'d it).
+    ///
+    /// `docs_iter` yields `(vec_id, attr_ids)` pairs where each `attr_id` is
+    /// an index into `attribute_strings`. Docs with no attributes are silently
+    /// skipped. Documents are expected to arrive in ascending `vec_id` order;
+    /// per-doc attr_id lists need not be sorted.
+    ///
+    /// Build strategy: stream once, bucketing each (vec_id, attr_id) pair into
+    /// a per-attr_id posting list while building per-doc treemaps inline. At
+    /// the end, each per-attr_id bucket is consumed in one shot via
+    /// `RoaringTreemap::from_sorted_iter`. This avoids the per-pair
+    /// `RoaringTreemap::insert` overhead that dominates the naive loop.
+    ///
+    /// Transient memory cost is `O(num_attribute_pairs)` u64s for the inverse
+    /// buckets; the final structures replace the empty placeholders held by
+    /// the store. All three internal write locks are taken once for the
+    /// duration of the load.
+    pub fn bulk_insert_encoded<I>(
+        &self,
+        attribute_strings: &[Attribute],
+        docs_iter: I,
+    ) -> ANNResult<()>
+    where
+        I: IntoIterator<Item = (IT, Vec<u64>)>,
+    {
+        use roaring::RoaringTreemap;
+
+        let mut attr_map = self.attribute_map.write().map_err(|_| {
+            ANNError::message(
+                ANNErrorKind::LockPoisonError,
+                "Failed to acquire write lock on attribute_map",
+            )
+        })?;
+        let mut index = self.index.write().map_err(|_| {
+            ANNError::message(
+                ANNErrorKind::LockPoisonError,
+                "Failed to acquire write lock on index",
+            )
+        })?;
+        let mut inv_index = self.inv_index.write().map_err(|_| {
+            ANNError::message(
+                ANNErrorKind::LockPoisonError,
+                "Failed to acquire write lock on inv_index",
+            )
+        })?;
+
+        // Populate the encoder with all attribute strings; the encoder assigns
+        // ids in insertion order starting at 0, which must match the caller's
+        // attr_id convention.
+        for (expected_id, attr) in attribute_strings.iter().enumerate() {
+            let id = attr_map.insert(attr);
+            debug_assert_eq!(id, expected_id as u64);
+        }
+
+        let num_attrs = attribute_strings.len();
+        // Inverse-index buckets: posting list of doc_ids per attr_id.
+        let mut inv_buckets: Vec<Vec<u64>> = (0..num_attrs).map(|_| Vec::new()).collect();
+
+        // Single pass: for each doc, build the forward treemap immediately and
+        // append the doc_id to each touched attr_id's bucket.
+        let mut sort_buf: Vec<u64> = Vec::with_capacity(16);
+        for (doc_id, attr_ids) in docs_iter {
+            if attr_ids.is_empty() {
+                continue;
+            }
+            let doc_id_u64: u64 = doc_id.into();
+
+            // Inverse: push doc_id onto each attr's bucket. Since docs arrive
+            // in ascending vec_id order, each bucket ends up sorted.
+            for &aid in &attr_ids {
+                debug_assert!((aid as usize) < num_attrs);
+                inv_buckets[aid as usize].push(doc_id_u64);
+            }
+
+            // Forward: build a sorted RoaringTreemap of attr_ids for this doc.
+            sort_buf.clear();
+            sort_buf.extend_from_slice(&attr_ids);
+            sort_buf.sort_unstable();
+            let tm = RoaringTreemap::from_sorted_iter(sort_buf.iter().copied()).map_err(|e| {
+                ANNError::message(
+                    ANNErrorKind::Opaque,
+                    format!("Forward treemap construction failed: {}", e),
+                )
+            })?;
+            index.install_for_key(doc_id, tm);
+        }
+
+        // Build each inverse-index treemap from its (already-sorted) bucket.
+        for (attr_id, doc_ids) in inv_buckets.into_iter().enumerate() {
+            if doc_ids.is_empty() {
+                continue;
+            }
+            let tm = RoaringTreemap::from_sorted_iter(doc_ids.iter().copied()).map_err(|e| {
+                ANNError::message(
+                    ANNErrorKind::Opaque,
+                    format!(
+                        "Inverse treemap for attr_id {} failed: {}",
+                        attr_id, e
+                    ),
+                )
+            })?;
+            inv_index.install_for_key(attr_id as u64, tm);
+        }
+
+        Ok(())
+    }
 }
 
 impl<IT> AttributeStore<IT> for RoaringAttributeStore<IT>

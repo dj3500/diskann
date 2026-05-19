@@ -39,7 +39,7 @@ pub mod traits {
 pub mod encoded_attribute_provider {
     pub(crate) mod ast_id_expr;
     pub(crate) mod ast_label_id_mapper;
-    pub(crate) mod attribute_encoder;
+    pub mod attribute_encoder;
     pub mod document_provider;
     pub mod encoded_attribute_accessor;
     pub mod encoded_filter_expr;
