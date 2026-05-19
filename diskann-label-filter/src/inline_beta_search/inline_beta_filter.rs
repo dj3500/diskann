@@ -28,6 +28,12 @@ pub struct InlineBetaStrategy<Strategy> {
     inner: Strategy,
 }
 
+impl<Strategy> InlineBetaStrategy<Strategy> {
+    pub fn new(inner: Strategy, beta: f32) -> Self {
+        Self { beta, inner }
+    }
+}
+
 impl<DP, Strategy, Q>
     SearchStrategy<DocumentProvider<DP, RoaringAttributeStore<DP::InternalId>>, FilteredQuery<Q>>
     for InlineBetaStrategy<Strategy>

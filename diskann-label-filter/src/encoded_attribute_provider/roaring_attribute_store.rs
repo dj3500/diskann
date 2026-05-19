@@ -7,7 +7,9 @@ use crate::{
     attribute::Attribute,
     encoded_attribute_provider::{
         attribute_encoder::AttributeEncoder, encoded_attribute_accessor::EncodedAttributeAccessor,
+        encoded_filter_expr::EncodedFilterExpr,
     },
+    inline_beta_search::predicate_evaluator::PredicateEvaluator,
     set::{roaring_set_provider::RoaringTreemapSetProvider, SetProvider},
     traits::attribute_store::AttributeStore,
 };
@@ -15,7 +17,7 @@ use diskann::{utils::VectorId, ANNError, ANNErrorKind, ANNResult};
 use diskann_utils::future::AsyncFriendly;
 use std::sync::{Arc, RwLock};
 
-pub(crate) struct RoaringAttributeStore<IT>
+pub struct RoaringAttributeStore<IT>
 where
     IT: VectorId + AsyncFriendly,
 {
@@ -45,8 +47,25 @@ where
         self.index.clone()
     }
 
-    pub(crate) fn attribute_map(&self) -> Arc<RwLock<AttributeEncoder>> {
+    pub fn attribute_map(&self) -> Arc<RwLock<AttributeEncoder>> {
         self.attribute_map.clone()
+    }
+
+    /// Check if a point's encoded attributes satisfy the given encoded filter.
+    /// Returns `true` if the point matches, `false` if it doesn't match or has no attributes.
+    /// This performs an efficient roaring bitmap lookup + integer predicate evaluation.
+    pub fn matches_filter(&self, vec_id: &IT, filter: &EncodedFilterExpr) -> bool {
+        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+        match index.get(vec_id) {
+            Ok(Some(set)) => {
+                let evaluator = PredicateEvaluator::new(set.as_ref());
+                filter
+                    .encoded_filter_expr()
+                    .accept(&evaluator)
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
     }
 }
 

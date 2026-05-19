@@ -80,6 +80,11 @@ use diskann::graph::{self, config, DiskANNIndex};
 use diskann::neighbor::Neighbor;
 use diskann::provider::DefaultContext;
 use diskann::utils::{IntoUsize, VectorRepr};
+use diskann_label_filter::attribute::Attribute;
+use diskann_label_filter::encoded_attribute_provider::encoded_filter_expr::EncodedFilterExpr;
+use diskann_label_filter::encoded_attribute_provider::roaring_attribute_store::RoaringAttributeStore;
+use diskann_label_filter::traits::attribute_store::AttributeStore;
+use diskann_label_filter::{read_and_parse_queries, read_baselabels};
 use diskann_providers::model::configuration::IndexConfiguration;
 use diskann_providers::model::graph::provider::async_::common::FullPrecision;
 use diskann_providers::model::graph::provider::async_::inmem::FullPrecisionProvider;
@@ -161,6 +166,11 @@ enum FilterStrategy {
     /// MultihopSearch: two-hop expansion through non-matching nodes to discover matching
     /// neighbors. Hard filter — only matching vectors enter the result set.
     Multihop,
+    /// InlineBeta: like Beta, but label lookup happens inline during graph traversal via
+    /// RoaringAttributeStore + DocumentProvider. No bitmap precomputation. Per-query label
+    /// evaluation cost is included in the reported latency.
+    #[value(alias("inline_beta"))]
+    InlineBeta,
 }
 
 #[derive(Debug, Parser)]
@@ -614,6 +624,25 @@ impl QueryLabelProvider<u32> for BitmapLabelProvider {
     }
 }
 
+/// Inline label provider: evaluates an encoded filter against a RoaringAttributeStore
+/// per node visit. No precomputed bitmaps — label lookups happen during graph traversal.
+struct InlineLabelProvider {
+    store: Arc<RoaringAttributeStore<u32>>,
+    encoded_filter: Arc<EncodedFilterExpr>,
+}
+
+impl std::fmt::Debug for InlineLabelProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineLabelProvider").finish()
+    }
+}
+
+impl QueryLabelProvider<u32> for InlineLabelProvider {
+    fn is_match(&self, vec_id: u32) -> bool {
+        self.store.matches_filter(&vec_id, &self.encoded_filter)
+    }
+}
+
 type FPIndex<T> = DiskANNIndex<FullPrecisionProvider<T>>;
 
 fn search_and_report<T>(args: &Args) -> Result<()>
@@ -629,6 +658,10 @@ where
         + 'static,
     [T]: Send + Sync,
 {
+    if matches!(args.filter_strategy, FilterStrategy::InlineBeta) {
+        return search_inline_beta::<T>(args);
+    }
+
     // Validate args
     if !matches!(args.filter_strategy, FilterStrategy::None)
         && (args.data_labels.is_none() || args.query_labels.is_none())
@@ -638,7 +671,7 @@ where
             args.filter_strategy
         );
     }
-    if matches!(args.filter_strategy, FilterStrategy::Beta)
+    if matches!(args.filter_strategy, FilterStrategy::Beta | FilterStrategy::InlineBeta)
         && (args.beta <= 0.0 || args.beta > 1.0)
     {
         anyhow::bail!("--beta must be in (0.0, 1.0], got {}", args.beta);
@@ -778,6 +811,7 @@ where
         }
         FilterStrategy::Beta => "beta-filter",
         FilterStrategy::Multihop => "multihop",
+        FilterStrategy::InlineBeta => unreachable!("handled by search_inline_beta"),
     };
 
     // Print table header
@@ -1032,6 +1066,254 @@ where
     Ok(())
 }
 
+/// Inline-beta search path: loads labels into RoaringAttributeStore and encodes
+/// query predicates into EncodedFilterExpr. During graph traversal, each node's
+/// labels are looked up via efficient roaring bitmap operations (no JSON parsing).
+/// Label lookup cost is included in per-query latency.
+fn search_inline_beta<T>(args: &Args) -> Result<()>
+where
+    T: VectorRepr
+        + DistanceProvider<T>
+        + AsyncFriendly
+        + Copy
+        + bytemuck::Pod
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
+    [T]: Send + Sync,
+{
+    let dl = args.data_labels.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("--filter_strategy inline_beta requires --data_labels")
+    })?;
+    let ql = args.query_labels.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("--filter_strategy inline_beta requires --query_labels")
+    })?;
+    if args.beta <= 0.0 || args.beta > 1.0 {
+        anyhow::bail!("--beta must be in (0.0, 1.0], got {}", args.beta);
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.num_threads)
+        .build()
+        .context("Failed to create tokio runtime")?;
+
+    // Load index (plain FPIndex — no DocumentProvider wrapper needed)
+    println!("Loading index from {} ...", args.index_path_prefix);
+    let index_config = load_config(&args.index_path_prefix, args.dist_fn)?;
+    let fp_index: FPIndex<T> = rt.block_on(async {
+        FPIndex::<T>::load_with(
+            &FileStorageProvider,
+            &(args.index_path_prefix.as_str(), index_config),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load index: {}", e))
+    })?;
+    let index = Arc::new(fp_index);
+    println!("Index loaded.");
+
+    // Build RoaringAttributeStore from base labels JSONL
+    println!("Loading base labels from {} ...", dl);
+    let label_start = Instant::now();
+    let base_labels = read_baselabels(dl)
+        .map_err(|e| anyhow::anyhow!("Failed to read base labels: {}", e))?;
+    let roaring_store = RoaringAttributeStore::<u32>::new();
+    for doc in &base_labels {
+        let attrs: Vec<Attribute> = doc
+            .flatten_metadata()
+            .into_iter()
+            .map(|(k, v)| Attribute::from_value(k, v))
+            .collect();
+        if !attrs.is_empty() {
+            roaring_store
+                .set_element(&(doc.doc_id as u32), &attrs)
+                .map_err(|e| anyhow::anyhow!("Failed to set attributes for doc {}: {}", doc.doc_id, e))?;
+        }
+    }
+    let label_load_ms = label_start.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "  Loaded {} base documents into RoaringAttributeStore ({:.2} ms)",
+        base_labels.len(),
+        label_load_ms
+    );
+    let roaring_store = Arc::new(roaring_store);
+
+    // Parse query predicates into ASTExpr, then encode into EncodedFilterExpr
+    println!("Parsing query predicates from {} ...", ql);
+    let query_exprs = read_and_parse_queries(ql)
+        .map_err(|e| anyhow::anyhow!("Failed to parse query predicates: {}", e))?;
+    println!("  Parsed {} query predicates", query_exprs.len());
+
+    let attr_map = roaring_store.attribute_map();
+    let encoded_filters: Vec<Arc<EncodedFilterExpr>> = query_exprs
+        .iter()
+        .map(|(_qid, ast)| {
+            let ef = EncodedFilterExpr::new(ast, attr_map.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to encode filter: {}", e))?;
+            Ok(Arc::new(ef))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    println!("  Encoded {} query filters", encoded_filters.len());
+
+    // Load queries
+    println!("Loading queries from {} ...", args.query_file);
+    let queries: Matrix<T> = load_data(&args.query_file)?;
+    let num_queries = queries.nrows();
+    println!(
+        "Loaded {} queries of dimension {}",
+        num_queries,
+        queries.ncols()
+    );
+    assert_eq!(
+        query_exprs.len(),
+        num_queries,
+        "Mismatch: {} query predicates but {} queries",
+        query_exprs.len(),
+        num_queries
+    );
+
+    // Load ground truth
+    let (gt, gt_dists, _gt_nq, gt_dim, has_gt) = if args.gt_file == "null" {
+        println!("No ground truth file provided. Recall will not be computed.");
+        (vec![], None, 0, 0, false)
+    } else {
+        println!("Loading ground truth from {} ...", args.gt_file);
+        let (gt, gt_dists, nq, dim) = load_groundtruth(&args.gt_file)?;
+        println!("Ground truth: {} queries, {} neighbors each", nq, dim);
+        if gt_dists.is_some() {
+            println!("  (GT file includes distances — tie-aware recall enabled)");
+        }
+        assert_eq!(
+            nq, num_queries,
+            "Mismatch: ground truth has {} queries but query file has {}",
+            nq, num_queries
+        );
+        (gt, gt_dists, nq, dim, true)
+    };
+
+    let k = args.recall_at;
+    let recall_header = format!("Recall@{}", k);
+
+    // Print table header
+    println!();
+    println!("Strategy: inline-beta (roaring encoded lookups)");
+    println!("Beta: {}", args.beta);
+    println!("Label load time: {:.2} ms", label_load_ms);
+    println!();
+    println!(
+        "{:>8}  {:>10}  {:>12}  {:>14}  {:>10}",
+        "Ls", "QPS", "Mean Lat(us)", "p99 Lat(us)", recall_header
+    );
+    println!("{}", "=".repeat(62));
+
+    for &l_search in &args.l_search {
+        if l_search < k {
+            eprintln!("Warning: L={} < K={}, skipping", l_search, k);
+            continue;
+        }
+
+        let mut all_ids: Vec<u32> = vec![0u32; num_queries * k];
+        let mut query_latencies_us = Vec::with_capacity(num_queries * args.search_reps);
+
+        let graph_search = graph::search::Knn::new(k, l_search, None).map_err(|e| {
+            anyhow::anyhow!("Invalid search params K={} L={}: {}", k, l_search, e)
+        })?;
+
+        for rep in 0..args.search_reps {
+            let mut rep_latencies: Vec<f64> = Vec::with_capacity(num_queries);
+
+            rt.block_on(async {
+                let context = DefaultContext;
+
+                for q in 0..num_queries {
+                    let query_vec = queries.row(q);
+
+                    // Build inline label provider for this query (cheap: just Arc clones)
+                    let label_provider: Arc<dyn QueryLabelProvider<u32>> =
+                        Arc::new(InlineLabelProvider {
+                            store: roaring_store.clone(),
+                            encoded_filter: encoded_filters[q].clone(),
+                        });
+                    let beta_strategy =
+                        BetaFilter::new(FullPrecision, label_provider, args.beta);
+
+                    let q_start = Instant::now();
+
+                    let mut ids = vec![0u32; k];
+                    let mut dists = vec![0.0f32; k];
+                    let mut output =
+                        search_output_buffer::IdDistance::new(&mut ids, &mut dists);
+
+                    let _stats = index
+                        .search(
+                            graph_search,
+                            &beta_strategy,
+                            &context,
+                            query_vec,
+                            &mut output,
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "InlineBeta search failed for query {}: {}",
+                                q,
+                                e
+                            )
+                        })?;
+
+                    let q_elapsed = q_start.elapsed();
+                    rep_latencies.push(q_elapsed.as_micros() as f64);
+
+                    if rep == 0 {
+                        all_ids[q * k..q * k + k].copy_from_slice(&ids[..k]);
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+
+            query_latencies_us.extend_from_slice(&rep_latencies);
+        }
+
+        // Compute stats
+        let total_queries = query_latencies_us.len();
+        let mean_lat = query_latencies_us.iter().sum::<f64>() / total_queries as f64;
+
+        let mut sorted = query_latencies_us.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p99_idx = ((total_queries as f64 * 0.99) as usize).min(total_queries - 1);
+        let p99_lat = sorted[p99_idx];
+
+        let total_time_s = query_latencies_us.iter().sum::<f64>() / 1_000_000.0;
+        let qps = total_queries as f64 / total_time_s;
+
+        let recall = if has_gt {
+            compute_recall(num_queries, &gt, gt_dists.as_deref(), gt_dim, &all_ids, k, k)
+        } else {
+            f64::NAN
+        };
+
+        if has_gt {
+            println!(
+                "{:>8}  {:>10.2}  {:>12.2}  {:>14.2}  {:>10.2}",
+                l_search, qps, mean_lat, p99_lat, recall
+            );
+        } else {
+            println!(
+                "{:>8}  {:>10.2}  {:>12.2}  {:>14.2}  {:>10}",
+                l_search, qps, mean_lat, p99_lat, "N/A"
+            );
+        }
+
+        if let Some(ref result_prefix) = args.result_path {
+            let result_file = format!("{}_{}", result_prefix, l_search);
+            write_results_bin(&result_file, &all_ids, num_queries, k)?;
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
 /// Write results in the standard DiskANN binary format:
 /// [num_queries: u32] [k: u32] [num_queries * k u32 IDs]
 fn write_results_bin(path: &str, ids: &[u32], num_queries: usize, k: usize) -> Result<()> {
@@ -1059,7 +1341,7 @@ fn main() -> Result<()> {
     println!("  threads:          {}", args.num_threads);
     println!("  search_reps:      {}", args.search_reps);
     println!("  filter_strategy:  {:?}", args.filter_strategy);
-    if matches!(args.filter_strategy, FilterStrategy::Beta) {
+    if matches!(args.filter_strategy, FilterStrategy::Beta | FilterStrategy::InlineBeta) {
         println!("  beta:             {}", args.beta);
     }
     if let Some(ref p) = args.data_labels {

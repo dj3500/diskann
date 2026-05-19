@@ -42,7 +42,7 @@ pub mod encoded_attribute_provider {
     pub(crate) mod attribute_encoder;
     pub mod document_provider;
     pub mod encoded_attribute_accessor;
-    pub(crate) mod encoded_filter_expr;
+    pub mod encoded_filter_expr;
     pub mod roaring_attribute_store;
 }
 

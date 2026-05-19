@@ -100,7 +100,7 @@ search_memory_index [OPTIONS] \
 | `--result_path` | *(none)* | Prefix for result output files |
 | `--data_labels` | *(none)* | Base vector labels JSONL file |
 | `--query_labels` | *(none)* | Query predicates JSONL file |
-| `--filter_strategy` | `none` | `none`, `beta`, or `multihop` |
+| `--filter_strategy` | `none` | `none`, `beta`, `multihop`, or `inline_beta` |
 | `--beta` | `0.5` | Beta factor for `beta` strategy (0, 1] |
 | `--data_path` | *(none)* | Base vectors for brute-force fallback |
 | `--brute_force_threshold` | `0` | Match count below which brute-force is used |
@@ -221,6 +221,19 @@ search_memory_index \
   --data_labels siftsmall/base_labels.jsonl \
   --query_labels siftsmall/query_labels.jsonl \
   --filter_strategy multihop \
+  -K 10 -L 10 20 50 100
+```
+
+**Inline beta (no bitmap precomputation):**
+```bash
+search_memory_index \
+  --data_type uint8 --dist_fn l2 \
+  --index_path_prefix siftsmall/index_R32_L50 \
+  --query_file siftsmall/siftsmall_query.fbin \
+  --gt_file siftsmall/gt_filtered.bin \
+  --data_labels siftsmall/base_labels.jsonl \
+  --query_labels siftsmall/query_labels.jsonl \
+  --filter_strategy inline_beta --beta 0.5 \
   -K 10 -L 10 20 50 100
 ```
 
@@ -346,38 +359,49 @@ Extends the beam search with two-hop expansion:
   are reachable within 2 hops.
 - Effectiveness degrades when matching vectors are >2 hops away in the graph.
 
-#### 3. InlineBetaStrategy (rich predicate evaluation)
+#### 3. InlineBeta (inline encoded predicate evaluation)
 
-**Crate:** `diskann-label-filter`
-**Key type:** `InlineBetaStrategy<Strategy>`
+**Crate:** `diskann-label-filter` (attribute store + encoded filter evaluation)
+**CLI:** `--filter_strategy inline_beta --beta 0.5`
 
-Combines beta-weighted scoring with per-document predicate evaluation against a
-`RoaringAttributeStore`. Unlike BetaFilter (which uses precomputed bitmaps),
-this evaluates the AST filter expression inline during search by reading each
-candidate's encoded attributes. In post-processing, non-matching candidates are
-removed (hard filter).
+Combines beta-weighted scoring with per-node predicate evaluation against a
+`RoaringAttributeStore`. Unlike BetaFilter (which uses precomputed per-query
+bitmaps), InlineBeta evaluates the query's encoded filter expression inline
+during graph traversal by looking up each candidate's encoded attributes in the
+roaring store.
 
-This strategy is used internally by the benchmark framework's
-`DocumentProvider` path and is **not exposed via the CLI tool**. The reason is
-architectural: InlineBetaStrategy requires the index to be wrapped in a
-`DocumentProvider<DP, RoaringAttributeStore<...>>`, which is a different
-index type from the `DiskANNIndex<FullPrecisionProvider<T>>` that the CLI
-creates/loads. Using InlineBetaStrategy would require:
+**How it works:**
 
-1. Creating a `RoaringAttributeStore` and populating it from the JSONL labels
-   (iterating all documents, converting JSON attributes to `Attribute` structs,
-   calling `set_element()` for each).
-2. Wrapping the loaded `FullPrecisionProvider` in a `DocumentProvider`.
-3. Rebuilding or re-loading the `DiskANNIndex` with this composite provider.
-4. Using `FilteredQuery<[T]>` as the query type instead of raw `&[T]`.
+1. **Precomputation (before search):** Base labels are loaded from the JSONL
+   file and inserted into a `RoaringAttributeStore`, which encodes
+   attribute field+value pairs as integer IDs in roaring bitmaps. Each query's
+   `ASTExpr` is then encoded into an `EncodedFilterExpr` using the store's
+   attribute map — this converts string field+value comparisons into integer
+   lookups.
+2. **Per query:** An `InlineLabelProvider` is created, wrapping a reference to
+   the `RoaringAttributeStore` and the query's `EncodedFilterExpr`. This
+   implements `QueryLabelProvider<u32>` and is passed to `BetaFilter::new()`.
+3. **During search:** For each candidate node visited, `is_match(vec_id)`
+   calls `RoaringAttributeStore::matches_filter()`, which reads the point's
+   encoded attribute set (a `RoaringTreemap`) and evaluates the encoded
+   predicate against it using `PredicateEvaluator`. This is an efficient
+   integer-level roaring bitmap operation — no JSON parsing occurs during
+   search.
+4. **Post-filter:** Same as BetaFilter — non-matching candidates removed.
 
-This is a substantial integration effort for marginal benefit over BetaFilter
-with precomputed bitmaps — both apply the same beta-weighted distance
-adjustment. The main advantage of InlineBetaStrategy is that it doesn't need
-bitmap precomputation (it evaluates predicates inline per-candidate during
-search), which could matter for very large datasets where precomputing bitmaps
-for all queries is expensive. But for the CLI tool's use case, bitmap
-precomputation is fast enough (the timing is reported in the output).
+**Parameters:**
+- `--beta` ∈ (0, 1]: Same as BetaFilter. Default: 0.5.
+
+**Characteristics:**
+- Same recall behavior as BetaFilter (both apply beta-weighted distance).
+- No per-query bitmap precomputation — the reported QPS includes the full
+  label-evaluation cost per node visit.
+- Attribute store construction is a one-time cost reported separately.
+- Uses the same `FPIndex<T>` (plain `DiskANNIndex<FullPrecisionProvider<T>>`)
+  as all other strategies — no `DocumentProvider` wrapper needed.
+- Slightly higher per-query cost than bitmap BetaFilter (roaring lookup vs
+  BitSet membership test), but avoids the O(queries × points) bitmap
+  precomputation.
 
 ### Bitmap computation
 

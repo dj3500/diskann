@@ -28,7 +28,7 @@ use crate::{
 
 type AttrAccessor<IA> = EncodedAttributeAccessor<RoaringTreemapSetProvider<<IA as HasId>::Id>>;
 
-pub(crate) struct EncodedDocumentAccessor<IA>
+pub struct EncodedDocumentAccessor<IA>
 where
     IA: HasId,
 {
