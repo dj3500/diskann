@@ -966,6 +966,7 @@ impl QueryLabelProvider<u32> for InlineLabelProvider {
     }
 }
 
+/// Like [`InlineLabelProvider`] but uses the compact sorted-`Vec<u32>` forward index.
 /// Label provider that matches nothing. Used for queries whose predicate references
 /// attributes that don't exist in the base dataset and would otherwise be empty.
 #[derive(Debug)]
@@ -1689,7 +1690,7 @@ where
 
     // Print table header
     println!();
-    println!("Strategy: inline-beta (roaring encoded lookups)");
+    println!("Strategy: inline-beta");
     println!("Beta: {}", args.beta);
     println!("Label load time: {:.2} ms", label_load_ms);
     println!();

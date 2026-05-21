@@ -3,18 +3,33 @@
  * Licensed under the MIT license.
  */
 
+//! Attribute store backed by:
+//!   * a **compact forward index** (`Vec<Box<[u32]>>` indexed by vec_id) for
+//!     per-point label lookups in the search hot path, and
+//!   * a roaring-bitmap **inverse index** (label_id -> set of doc_ids) for
+//!     bulk set operations used by bitmap-based filter strategies.
+//!
+//! The forward index intentionally does not use roaring bitmaps: per-point
+//! label sets are tiny (typically <= 20 labels), and a sorted `Box<[u32]>` is
+//! much faster to probe (one cache line, no `BTreeMap`/`HashMap` indirection)
+//! than a per-point `RoaringTreemap`. See `matches_filter` for the hot path.
+//!
+//! The inverse index keeps roaring because per-label posting lists can be
+//! large and dense, where roaring's compression + fast set ops pay off.
+
 use crate::{
     attribute::Attribute,
     encoded_attribute_provider::{
-        attribute_encoder::AttributeEncoder, encoded_attribute_accessor::EncodedAttributeAccessor,
+        ast_id_expr::{ASTIdExpr, ASTIdExprVisitor},
+        attribute_encoder::AttributeEncoder,
         encoded_filter_expr::EncodedFilterExpr,
     },
-    inline_beta_search::predicate_evaluator::PredicateEvaluator,
     set::{roaring_set_provider::RoaringTreemapSetProvider, SetProvider},
     traits::attribute_store::AttributeStore,
 };
 use diskann::{utils::VectorId, ANNError, ANNErrorKind, ANNResult};
 use diskann_utils::future::AsyncFriendly;
+use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 
 pub struct RoaringAttributeStore<IT>
@@ -22,29 +37,27 @@ where
     IT: VectorId + AsyncFriendly,
 {
     attribute_map: Arc<RwLock<AttributeEncoder>>,
-    index: Arc<RwLock<RoaringTreemapSetProvider<IT>>>,
+    /// Compact forward index: per-point sorted slice of u32 attr_ids,
+    /// indexed directly by `(*vec_id).into() as usize`. Built by
+    /// `bulk_insert_encoded` and kept in sync by `set_element` / `delete`.
+    index: Arc<RwLock<Vec<Box<[u32]>>>>,
+    /// Inverse index: attr_id -> set of doc_ids. Roaring is well-suited
+    /// here because individual posting lists can be large.
     inv_index: Arc<RwLock<RoaringTreemapSetProvider<u64>>>,
+    _phantom: PhantomData<IT>,
 }
 
 impl<IT> RoaringAttributeStore<IT>
 where
     IT: VectorId,
 {
-    #[allow(
-        dead_code,
-        reason = "This will be invoked by callers when they create a document provider."
-    )]
     pub fn new() -> Self {
         Self {
             attribute_map: Arc::new(RwLock::new(AttributeEncoder::new())),
-            index: Arc::new(RwLock::new(RoaringTreemapSetProvider::<IT>::new())),
+            index: Arc::new(RwLock::new(Vec::new())),
             inv_index: Arc::new(RwLock::new(RoaringTreemapSetProvider::<u64>::new())),
+            _phantom: PhantomData,
         }
-    }
-
-    #[cfg(test)]
-    pub fn get_index(&self) -> Arc<RwLock<RoaringTreemapSetProvider<IT>>> {
-        self.index.clone()
     }
 
     pub fn attribute_map(&self) -> Arc<RwLock<AttributeEncoder>> {
@@ -52,20 +65,28 @@ where
     }
 
     /// Check if a point's encoded attributes satisfy the given encoded filter.
-    /// Returns `true` if the point matches, `false` if it doesn't match or has no attributes.
-    /// This performs an efficient roaring bitmap lookup + integer predicate evaluation.
+    /// Returns `true` if the point matches, `false` if `vec_id` is out of
+    /// range, has no attributes, or the filter does not match.
+    ///
+    /// Fast path: direct `Vec` index into the compact forward index, then a
+    /// tight `SlicePredicateEvaluator` walk over the AST. Each terminal does
+    /// one `contains` probe (linear scan for small sets, binary search above
+    /// `SlicePredicateEvaluator::LINEAR_SCAN_THRESHOLD`).
     pub fn matches_filter(&self, vec_id: &IT, filter: &EncodedFilterExpr) -> bool {
-        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
-        match index.get(vec_id) {
-            Ok(Some(set)) => {
-                let evaluator = PredicateEvaluator::new(set.as_ref());
-                filter
-                    .encoded_filter_expr()
-                    .accept(&evaluator)
-                    .unwrap_or(false)
-            }
-            _ => false,
+        let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
+        let i = (*vec_id).into() as usize;
+        if i >= idx.len() {
+            return false;
         }
+        let slice: &[u32] = &idx[i];
+        if slice.is_empty() {
+            return false;
+        }
+        let evaluator = SlicePredicateEvaluator::new(slice);
+        filter
+            .encoded_filter_expr()
+            .accept(&evaluator)
+            .unwrap_or(false)
     }
 
     /// Bulk-load pre-encoded attributes in one shot. Intended for benchmark
@@ -82,15 +103,9 @@ where
     /// per-doc attr_id lists need not be sorted.
     ///
     /// Build strategy: stream once, bucketing each (vec_id, attr_id) pair into
-    /// a per-attr_id posting list while building per-doc treemaps inline. At
-    /// the end, each per-attr_id bucket is consumed in one shot via
-    /// `RoaringTreemap::from_sorted_iter`. This avoids the per-pair
-    /// `RoaringTreemap::insert` overhead that dominates the naive loop.
-    ///
-    /// Transient memory cost is `O(num_attribute_pairs)` u64s for the inverse
-    /// buckets; the final structures replace the empty placeholders held by
-    /// the store. All three internal write locks are taken once for the
-    /// duration of the load.
+    /// a per-attr_id posting list while building per-doc compact slices
+    /// inline. At the end, each per-attr_id bucket is consumed in one shot via
+    /// `RoaringTreemap::from_sorted_iter`.
     pub fn bulk_insert_encoded<I>(
         &self,
         attribute_strings: &[Attribute],
@@ -132,9 +147,9 @@ where
         // Inverse-index buckets: posting list of doc_ids per attr_id.
         let mut inv_buckets: Vec<Vec<u64>> = (0..num_attrs).map(|_| Vec::new()).collect();
 
-        // Single pass: for each doc, build the forward treemap immediately and
-        // append the doc_id to each touched attr_id's bucket.
-        let mut sort_buf: Vec<u64> = Vec::with_capacity(16);
+        // Single pass: for each doc, build the forward compact slice
+        // immediately and append the doc_id to each touched attr_id's bucket.
+        let mut sort_buf: Vec<u32> = Vec::with_capacity(16);
         for (doc_id, attr_ids) in docs_iter {
             if attr_ids.is_empty() {
                 continue;
@@ -148,17 +163,15 @@ where
                 inv_buckets[aid as usize].push(doc_id_u64);
             }
 
-            // Forward: build a sorted RoaringTreemap of attr_ids for this doc.
+            // Forward (compact): build a sorted Box<[u32]> of attr_ids.
             sort_buf.clear();
-            sort_buf.extend_from_slice(&attr_ids);
+            sort_buf.extend(attr_ids.iter().map(|&v| v as u32));
             sort_buf.sort_unstable();
-            let tm = RoaringTreemap::from_sorted_iter(sort_buf.iter().copied()).map_err(|e| {
-                ANNError::message(
-                    ANNErrorKind::Opaque,
-                    format!("Forward treemap construction failed: {}", e),
-                )
-            })?;
-            index.install_for_key(doc_id, tm);
+            let slot = doc_id_u64 as usize;
+            if slot >= index.len() {
+                index.resize(slot + 1, Box::<[u32]>::default());
+            }
+            index[slot] = sort_buf.as_slice().into();
         }
 
         // Build each inverse-index treemap from its (already-sorted) bucket.
@@ -169,10 +182,7 @@ where
             let tm = RoaringTreemap::from_sorted_iter(doc_ids.iter().copied()).map_err(|e| {
                 ANNError::message(
                     ANNErrorKind::Opaque,
-                    format!(
-                        "Inverse treemap for attr_id {} failed: {}",
-                        attr_id, e
-                    ),
+                    format!("Inverse treemap for attr_id {} failed: {}", attr_id, e),
                 )
             })?;
             inv_index.install_for_key(attr_id as u64, tm);
@@ -187,25 +197,16 @@ where
     IT: VectorId,
 {
     type AT = u64;
-    type Accessor = EncodedAttributeAccessor<RoaringTreemapSetProvider<IT>>;
     type StoreError = ANNError;
 
-    fn attribute_accessor(&self) -> Result<Self::Accessor, Self::StoreError> {
-        Ok(EncodedAttributeAccessor::new(self.index.clone()))
-    }
-
-    /// Delete the attributes of a vector represented by the vec_id from the store.
-    /// Returns "Result" because we may make this a trait going forward, so even
-    /// though this implementation will simply return Ok().
-    ///
+    /// Delete the attributes of a vector from the store.
     fn delete(&self, vec_id: &IT) -> ANNResult<bool>
     where
         IT: VectorId,
     {
-        let vec_id_u64 = (*vec_id).into();
-        let mut deleted = true;
+        let vec_id_u64: u64 = (*vec_id).into();
 
-        // Acquire locks in consistent order: index first, then inv_index
+        // Acquire locks in consistent order: index first, then inv_index.
         let mut index_guard = self.index.write().map_err(|_| {
             ANNError::message(
                 ANNErrorKind::LockPoisonError,
@@ -219,38 +220,21 @@ where
             )
         })?;
 
-        let existing_set = match index_guard.get(vec_id)? {
-            Some(set) => set,
-            None => {
-                return Ok(false);
-            } //we are in good shape even if the vector id doesn't exist.
-        };
-
-        // At this point we have already checked that the id exists in the index.
-        // Therefore any failures in delete_from_set() or delete() are logical errors.
-        // So we will flag them as such.
-
-        // delete the id from the inverted index.
-        for attr_id in existing_set.iter() {
-            deleted = deleted && inv_index_guard.delete_from_set(&attr_id, &vec_id_u64)?;
-        }
-        if !deleted {
-            return Err(ANNError::message(
-                ANNErrorKind::IndexError,
-                "Failed to delete id from the inverted index.",
-            ));
+        let slot = vec_id_u64 as usize;
+        if slot >= index_guard.len() || index_guard[slot].is_empty() {
+            return Ok(false);
         }
 
-        //delete the id from the index.
-        deleted = index_guard.delete(vec_id)?; //we know deleted is true so far.
-        if deleted {
-            Ok(true)
-        } else {
-            Err(ANNError::message(
-                ANNErrorKind::IndexError,
-                "Failed to delete id from the index.",
-            ))
+        // Remove the id from each per-attr posting list in the inverse index.
+        for &attr_id in index_guard[slot].iter() {
+            // Ignore the "value not present" return: the doc may already
+            // have been removed from a bucket if state was inconsistent.
+            let _ = inv_index_guard.delete_from_set(&(attr_id as u64), &vec_id_u64)?;
         }
+
+        // Clear the forward slot.
+        index_guard[slot] = Box::<[u32]>::default();
+        Ok(true)
     }
 
     fn id_exists(&self, vec_id: &IT) -> ANNResult<bool> {
@@ -260,7 +244,8 @@ where
                 "Failed to acquire read lock on the label index.",
             )
         })?;
-        index_guard.exists(vec_id)
+        let slot = (*vec_id).into() as usize;
+        Ok(slot < index_guard.len() && !index_guard[slot].is_empty())
     }
 
     fn set_element(&self, vec_id: &IT, attributes: &[Attribute]) -> ANNResult<bool>
@@ -269,7 +254,7 @@ where
     {
         let id_u64: u64 = (*vec_id).into();
 
-        //For now, we assume that it is an error if a point has zero attributes.
+        // For now, we assume that it is an error if a point has zero attributes.
         if attributes.is_empty() {
             return Err(ANNError::message(
                 ANNErrorKind::Opaque,
@@ -277,7 +262,7 @@ where
             ));
         }
 
-        // Acquire locks in consistent order: attribute_map, index, inv_index
+        // Acquire locks in consistent order: attribute_map, index, inv_index.
         let mut attr_map_guard = self.attribute_map.write().map_err(|_| {
             ANNError::message(
                 ANNErrorKind::LockPoisonError,
@@ -297,25 +282,97 @@ where
             )
         })?;
 
-        // Update the inverted index.
-        // Delete all instances of id from the inv_index for the old labels.
-        if let Some(set) = index_guard.get(vec_id)? {
-            for attr_id in set.iter() {
-                //delete_from_set() returns false if the attr_id or id_u64 don't exist. It
-                //doesn't make a difference, so we ignore the return value.
-                let _ = inv_index_guard.delete_from_set(&attr_id, &id_u64)?;
+        // Decrement inverse index for any previously-set attrs on this id.
+        let slot = id_u64 as usize;
+        if slot < index_guard.len() {
+            for &attr_id in index_guard[slot].iter() {
+                let _ = inv_index_guard.delete_from_set(&(attr_id as u64), &id_u64)?;
             }
-        };
+        }
 
-        // Delete existing entries in the label index
-        index_guard.delete(vec_id)?; //returns false if vec_id doesn't exist, but that don't matter to us.
-
-        // Insert entries for the new attributes in the inv_index and index
+        // Encode new attrs, insert into inverse index, and build sorted u32 slice.
+        let mut new_attr_ids: Vec<u32> = Vec::with_capacity(attributes.len());
         for attr in attributes {
             let attr_id = attr_map_guard.insert(attr);
             inv_index_guard.insert(&attr_id, &id_u64)?;
-            index_guard.insert(vec_id, &attr_id)?;
+            new_attr_ids.push(attr_id as u32);
+        }
+        new_attr_ids.sort_unstable();
+
+        if slot >= index_guard.len() {
+            index_guard.resize(slot + 1, Box::<[u32]>::default());
+        }
+        index_guard[slot] = new_attr_ids.as_slice().into();
+
+        Ok(true)
+    }
+}
+
+/// Predicate evaluator that operates on a **sorted** `&[u32]` of attr_ids
+/// (the compact forward-index representation).
+///
+/// `contains` uses a tight linear scan for small slices (cache-friendly,
+/// branch-predictor-friendly, autovectorizable) and switches to binary
+/// search above a small threshold. Threshold chosen so that linear scan
+/// stays within roughly one cache line of work.
+struct SlicePredicateEvaluator<'a> {
+    labels: &'a [u32],
+}
+
+impl<'a> SlicePredicateEvaluator<'a> {
+    const LINEAR_SCAN_THRESHOLD: usize = 32;
+
+    fn new(labels: &'a [u32]) -> Self {
+        Self { labels }
+    }
+
+    #[inline(always)]
+    fn contains_id(&self, id: u32) -> bool {
+        let s = self.labels;
+        if s.len() <= Self::LINEAR_SCAN_THRESHOLD {
+            for &v in s {
+                if v == id {
+                    return true;
+                }
+            }
+            false
+        } else {
+            s.binary_search(&id).is_ok()
+        }
+    }
+}
+
+impl<'a> ASTIdExprVisitor<u64> for SlicePredicateEvaluator<'a> {
+    type Output = ANNResult<bool>;
+
+    fn visit_and(&self, exprs: &[ASTIdExpr<u64>]) -> Self::Output {
+        for expr in exprs {
+            if !self.visit(expr)? {
+                return Ok(false);
+            }
         }
         Ok(true)
+    }
+
+    fn visit_or(&self, exprs: &[ASTIdExpr<u64>]) -> Self::Output {
+        for expr in exprs {
+            if self.visit(expr)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn visit_not(&self, expr: &ASTIdExpr<u64>) -> Self::Output {
+        Ok(!self.visit(expr)?)
+    }
+
+    fn visit_terminal(&self, label_id: &u64) -> Self::Output {
+        // attr_ids are assigned sequentially from 0 by the encoder and fit in
+        // u32 in practice. Out-of-range ids cannot be present in the slice.
+        if *label_id > u32::MAX as u64 {
+            return Ok(false);
+        }
+        Ok(self.contains_id(*label_id as u32))
     }
 }

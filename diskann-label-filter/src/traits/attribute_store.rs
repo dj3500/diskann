@@ -5,17 +5,13 @@
 
 use diskann::{error::StandardError, utils::VectorId};
 
-use crate::{
-    attribute::{Attribute, AttributeType},
-    traits::attribute_accessor::AttributeAccessor,
-};
+use crate::attribute::{Attribute, AttributeType};
 
 pub trait AttributeStore<IdType>: Send + Sync
 where
     IdType: VectorId,
 {
     type AT: AttributeType;
-    type Accessor: AttributeAccessor<IdType, AT = Self::AT>;
     type StoreError: StandardError;
 
     /// Delete the attributes of a vector represented by the vec_id from the store.
@@ -40,9 +36,4 @@ where
         vec_id: &IdType,
         attributes: &[Attribute],
     ) -> Result<bool, Self::StoreError>;
-
-    /// Get the Accessor for reading the data in the index.
-    /// Returns ANNError if for instance we have lock poisoning
-    /// in the case of multi-threaded access.
-    fn attribute_accessor(&self) -> Result<Self::Accessor, Self::StoreError>;
 }

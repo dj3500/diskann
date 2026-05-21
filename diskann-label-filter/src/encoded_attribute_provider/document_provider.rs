@@ -29,14 +29,6 @@ impl<DP, AS> DocumentProvider<DP, AS> {
         }
     }
 
-    pub fn attribute_accessor(&self) -> Result<AS::Accessor, AS::StoreError>
-    where
-        DP: DataProvider,
-        AS: AttributeStore<DP::InternalId>,
-    {
-        self.attribute_store.attribute_accessor()
-    }
-
     pub fn inner_provider(&self) -> &DP {
         &self.inner_provider
     }
