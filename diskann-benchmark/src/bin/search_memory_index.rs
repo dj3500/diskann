@@ -82,6 +82,7 @@ use diskann::utils::{IntoUsize, VectorRepr};
 use diskann_label_filter::attribute::Attribute;
 use diskann_label_filter::encoded_attribute_provider::attribute_encoder::AttributeEncoder;
 use diskann_label_filter::encoded_attribute_provider::encoded_filter_expr::EncodedFilterExpr;
+use diskann_label_filter::encoded_attribute_provider::ast_id_expr::ASTIdExpr;
 use diskann_label_filter::encoded_attribute_provider::roaring_attribute_store::RoaringAttributeStore;
 use diskann_label_filter::parser::ast::{ASTExpr, CompareOp};
 use diskann_label_filter::read_and_parse_queries;
@@ -171,6 +172,17 @@ enum FilterStrategy {
     /// evaluation cost is included in the reported latency.
     #[value(alias("inline_beta"))]
     InlineBeta,
+    /// InlineBetaBf (V1): inline-beta hybrid that routes a query to a brute-force scan
+    /// over the per-category posting-list union when the AND-of-ORs upper-bound on the
+    /// candidate count is below `--brute_force_threshold`. Falls back to plain inline-beta
+    /// for non-AND-of-ORs queries or when the bound is above the threshold.
+    #[value(alias("inline_beta_bf"))]
+    InlineBetaBf,
+    /// InlineBetaBfx (V2): same UB<=T brute-force routing as V1, but for queries above the
+    /// threshold also augments the graph search by brute-forcing a "rare label" set
+    /// (greedy: cheapest m(l) labels until their cardinality sum would exceed T).
+    #[value(alias("inline_beta_bfx"))]
+    InlineBetaBfx,
 }
 
 #[derive(Debug, Parser)]
@@ -1059,7 +1071,10 @@ where
         + 'static,
     [T]: Send + Sync,
 {
-    if matches!(args.filter_strategy, FilterStrategy::InlineBeta) {
+    if matches!(
+        args.filter_strategy,
+        FilterStrategy::InlineBeta | FilterStrategy::InlineBetaBf | FilterStrategy::InlineBetaBfx
+    ) {
         return search_inline_beta::<T>(args);
     }
 
@@ -1212,7 +1227,9 @@ where
         }
         FilterStrategy::Beta => "beta-filter",
         FilterStrategy::Multihop => "multihop",
-        FilterStrategy::InlineBeta => unreachable!("handled by search_inline_beta"),
+        FilterStrategy::InlineBeta
+        | FilterStrategy::InlineBetaBf
+        | FilterStrategy::InlineBetaBfx => unreachable!("handled by search_inline_beta"),
     };
 
     // Print table header
@@ -1467,10 +1484,151 @@ where
     Ok(())
 }
 
+/// Runtime variant of the inline-beta family.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum InlineBetaMode {
+    /// Plain inline-beta: graph search for every query.
+    Plain,
+    /// V1 (`inline_beta_bf`): brute force iff query is AND-of-ORs and the
+    /// UB on candidate count is below the threshold. Otherwise graph search.
+    Bf,
+    /// V2 (`inline_beta_bfx`): same UB<=T BF routing as V1, plus a graph +
+    /// rare-label-BF augmentation for queries above the threshold.
+    Bfx,
+}
+
+/// Per-query routing decision for the inline-beta BF hybrids. Computed once
+/// up front so the L_search loop just branches.
+#[allow(dead_code, reason = "ub/rare_sum kept for printing/diagnostics")]
+enum QueryRouting {
+    /// `encoded_filters[q]` is None: filter is unsatisfiable, return empty.
+    Unsatisfiable,
+    /// Graph-only inline-beta search (the default / fallback path).
+    Graph,
+    /// V1: brute-force scan over the minimising category's posting-list union.
+    /// `ub` is the AND-of-ORs upper bound (sum of m(l) over the cheapest cat).
+    BfV1 { candidates: roaring::RoaringTreemap, ub: usize },
+    /// V2: run graph search AND brute-force a rare-label set.
+    BfxAugment {
+        rare_set: roaring::RoaringTreemap,
+        rare_sum: usize,
+        ub: usize,
+    },
+}
+
+/// Analyse an encoded filter expression. Returns `Some(categories)` if the
+/// expression is canonical AND-of-ORs with no NOTs (each category is a
+/// non-empty Vec of label-IDs); else `None`. Single-OR or single-Terminal
+/// at top level is treated as AND-of-one-Or.
+fn analyze_and_of_ors(expr: &ASTIdExpr<u64>) -> Option<Vec<Vec<u64>>> {
+    fn collect_or(node: &ASTIdExpr<u64>, out: &mut Vec<u64>) -> bool {
+        match node {
+            ASTIdExpr::Terminal(id) => {
+                out.push(*id);
+                true
+            }
+            ASTIdExpr::Or(children) => {
+                for c in children {
+                    if !collect_or(c, out) {
+                        return false;
+                    }
+                }
+                true
+            }
+            ASTIdExpr::And(_) | ASTIdExpr::Not(_) => false,
+        }
+    }
+
+    let top_categories: Vec<&ASTIdExpr<u64>> = match expr {
+        ASTIdExpr::And(children) => children.iter().collect(),
+        ASTIdExpr::Or(_) | ASTIdExpr::Terminal(_) => vec![expr],
+        ASTIdExpr::Not(_) => return None,
+    };
+
+    let mut out: Vec<Vec<u64>> = Vec::with_capacity(top_categories.len());
+    for cat in top_categories {
+        let mut labels = Vec::new();
+        if !collect_or(cat, &mut labels) {
+            return None;
+        }
+        if labels.is_empty() {
+            return None;
+        }
+        out.push(labels);
+    }
+    Some(out)
+}
+
+/// Brute-force top-K over a candidate set drawn from a roaring treemap,
+/// applying `keep` as the final correctness predicate. Returns (id, distance)
+/// pairs sorted ascending by distance.
+fn brute_force_topk<T, F>(
+    query: &[T],
+    base_data: &Matrix<T>,
+    candidates: &roaring::RoaringTreemap,
+    keep: F,
+    k: usize,
+    metric: Metric,
+) -> Vec<(u32, f32)>
+where
+    T: DistanceProvider<T> + Copy + bytemuck::Pod + 'static,
+    F: Fn(u32) -> bool,
+{
+    let dim = base_data.ncols();
+    let dist_fn = T::distance_comparer(metric, Some(dim));
+    let mut heap: BinaryHeap<Neighbor<u32>> = BinaryHeap::new();
+    let nrows = base_data.nrows();
+    for doc_id_u64 in candidates.iter() {
+        if doc_id_u64 >= nrows as u64 {
+            continue;
+        }
+        let doc_id = doc_id_u64 as u32;
+        if !keep(doc_id) {
+            continue;
+        }
+        let vec = base_data.row(doc_id as usize);
+        let d = dist_fn.call(query, vec);
+        let n = Neighbor::new(doc_id, d);
+        if heap.len() < k {
+            heap.push(n);
+        } else if let Some(worst) = heap.peek() {
+            if d < worst.distance {
+                heap.pop();
+                heap.push(n);
+            }
+        }
+    }
+    let mut results: Vec<Neighbor<u32>> = heap.into_vec();
+    results.sort_unstable_by(|a, b| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.into_iter().map(|n| (n.id, n.distance)).collect()
+}
+
+/// Merge two (id, dist) lists into top-K by distance, deduping by id.
+fn merge_topk(graph: &[(u32, f32)], bf: &[(u32, f32)], k: usize) -> Vec<u32> {
+    let mut combined: Vec<(u32, f32)> = Vec::with_capacity(graph.len() + bf.len());
+    let mut seen: HashSet<u32> = HashSet::with_capacity(graph.len() + bf.len());
+    for &(id, d) in graph.iter().chain(bf.iter()) {
+        if seen.insert(id) {
+            combined.push((id, d));
+        }
+    }
+    combined.sort_unstable_by(|a, b| {
+        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    combined.into_iter().take(k).map(|(id, _)| id).collect()
+}
+
 /// Inline-beta search path: loads labels into RoaringAttributeStore and encodes
 /// query predicates into EncodedFilterExpr. During graph traversal, each node's
 /// labels are looked up via efficient roaring bitmap operations (no JSON parsing).
 /// Label lookup cost is included in per-query latency.
+///
+/// This function also handles the two hybrid modes `inline_beta_bf` (V1) and
+/// `inline_beta_bfx` (V2); see [`InlineBetaMode`].
 fn search_inline_beta<T>(args: &Args) -> Result<()>
 where
     T: VectorRepr
@@ -1492,6 +1650,26 @@ where
     })?;
     if args.beta <= 0.0 || args.beta > 1.0 {
         anyhow::bail!("--beta must be in (0.0, 1.0], got {}", args.beta);
+    }
+
+    let mode = match args.filter_strategy {
+        FilterStrategy::InlineBeta => InlineBetaMode::Plain,
+        FilterStrategy::InlineBetaBf => InlineBetaMode::Bf,
+        FilterStrategy::InlineBetaBfx => InlineBetaMode::Bfx,
+        other => anyhow::bail!("search_inline_beta dispatched with non-inline strategy {:?}", other),
+    };
+    let bf_threshold = args.brute_force_threshold;
+    if mode != InlineBetaMode::Plain && bf_threshold == 0 {
+        anyhow::bail!(
+            "--filter_strategy {:?} requires --brute_force_threshold > 0",
+            args.filter_strategy
+        );
+    }
+    if mode != InlineBetaMode::Plain && args.data_path.is_none() {
+        anyhow::bail!(
+            "--filter_strategy {:?} requires --data_path (base vectors for brute force)",
+            args.filter_strategy
+        );
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1609,6 +1787,21 @@ where
     );
     let roaring_store = Arc::new(roaring_store);
 
+    // Optionally load base vectors for brute-force fallback (BF / BFX modes).
+    let base_data: Option<Arc<Matrix<T>>> = if mode != InlineBetaMode::Plain {
+        let dp = args.data_path.as_ref().expect("data_path required, validated above");
+        println!("Loading base vectors from {} ...", dp);
+        let bd = load_data::<T>(dp)?;
+        println!(
+            "  Loaded base vectors: {} rows × {} cols",
+            bd.nrows(),
+            bd.ncols()
+        );
+        Some(Arc::new(bd))
+    } else {
+        None
+    };
+
     // Parse query predicates into ASTExpr, then encode into EncodedFilterExpr
     println!("Parsing query predicates from {} ...", ql);
     let query_exprs = read_and_parse_queries(ql)
@@ -1648,6 +1841,127 @@ where
         pruned_filter_count,
         empty_filter_count
     );
+
+    // ---- Per-query routing analysis for the BF / BFX hybrids ----
+    // Computed once outside the L_search loop: the routing decision is
+    // independent of L (the brute-force candidate set comes from the
+    // inverse index, not from L). For Plain mode every query just goes
+    // to the graph path.
+    let mut routings: Vec<QueryRouting> = Vec::with_capacity(encoded_filters.len());
+    let mut stat_unsat = 0usize;
+    let mut stat_graph = 0usize;
+    let mut stat_non_canonical = 0usize;
+    let mut stat_bf_v1 = 0usize;
+    let mut stat_bfx_aug = 0usize;
+    let mut sum_v1_candidates: u64 = 0;
+    let mut sum_v1_ub: u64 = 0;
+    let mut sum_bfx_rare_size: u64 = 0;
+    let mut sum_bfx_rare_sum: u64 = 0;
+    let mut sum_bfx_ub: u64 = 0;
+
+    for ef_opt in encoded_filters.iter() {
+        let ef = match ef_opt {
+            None => {
+                routings.push(QueryRouting::Unsatisfiable);
+                stat_unsat += 1;
+                continue;
+            }
+            Some(ef) => ef,
+        };
+
+        if mode == InlineBetaMode::Plain {
+            routings.push(QueryRouting::Graph);
+            stat_graph += 1;
+            continue;
+        }
+
+        let categories = match analyze_and_of_ors(ef.encoded_filter_expr()) {
+            Some(c) => c,
+            None => {
+                routings.push(QueryRouting::Graph);
+                stat_non_canonical += 1;
+                stat_graph += 1;
+                continue;
+            }
+        };
+
+        // Compute UB and minimising category in one pass.
+        let mut ub = usize::MAX;
+        let mut min_idx = 0usize;
+        for (i, cat) in categories.iter().enumerate() {
+            let s: usize = cat
+                .iter()
+                .map(|&l| roaring_store.posting_list_len(l))
+                .sum();
+            if s < ub {
+                ub = s;
+                min_idx = i;
+            }
+        }
+
+        if ub == 0 {
+            // The cheapest category has no satisfying points -> unsatisfiable.
+            routings.push(QueryRouting::Unsatisfiable);
+            stat_unsat += 1;
+            continue;
+        }
+
+        if ub <= bf_threshold {
+            // Both V1 and V2: brute force on minimising category's union.
+            let cand = roaring_store.union_posting_lists(&categories[min_idx]);
+            sum_v1_candidates += cand.len();
+            sum_v1_ub += ub as u64;
+            routings.push(QueryRouting::BfV1 {
+                candidates: cand,
+                ub,
+            });
+            stat_bf_v1 += 1;
+            continue;
+        }
+
+        // UB > T.
+        if mode == InlineBetaMode::Bf {
+            routings.push(QueryRouting::Graph);
+            stat_graph += 1;
+            continue;
+        }
+
+        // V2 augmentation: greedily collect cheapest labels while
+        // sum-of-cardinalities + m(next) <= T.
+        let mut all_pairs: Vec<(usize, u64)> = categories
+            .iter()
+            .flatten()
+            .map(|&l| (roaring_store.posting_list_len(l), l))
+            .collect();
+        all_pairs.sort_unstable_by_key(|(m, _)| *m);
+        let mut rare_labels: Vec<u64> = Vec::new();
+        let mut rare_sum: usize = 0;
+        for (m, l) in all_pairs {
+            if rare_sum + m <= bf_threshold {
+                rare_sum += m;
+                rare_labels.push(l);
+            } else {
+                break;
+            }
+        }
+        if rare_labels.is_empty() {
+            // No rare labels fit; nothing to brute force. Pure graph search.
+            routings.push(QueryRouting::Graph);
+            stat_graph += 1;
+            continue;
+        }
+        let rare_set = roaring_store.union_posting_lists(&rare_labels);
+        sum_bfx_rare_size += rare_set.len();
+        sum_bfx_rare_sum += rare_sum as u64;
+        sum_bfx_ub += ub as u64;
+        routings.push(QueryRouting::BfxAugment {
+            rare_set,
+            rare_sum,
+            ub,
+        });
+        stat_bfx_aug += 1;
+        stat_graph += 1; // BFX also runs the graph path
+    }
 
     // Load queries
     println!("Loading queries from {} ...", args.query_file);
@@ -1690,9 +2004,52 @@ where
 
     // Print table header
     println!();
-    println!("Strategy: inline-beta");
+    let strategy_name = match mode {
+        InlineBetaMode::Plain => "inline-beta".to_string(),
+        InlineBetaMode::Bf => format!("inline-beta-bf (V1, T={})", bf_threshold),
+        InlineBetaMode::Bfx => format!("inline-beta-bfx (V2, T={})", bf_threshold),
+    };
+    println!("Strategy: {}", strategy_name);
     println!("Beta: {}", args.beta);
     println!("Label load time: {:.2} ms", label_load_ms);
+    if mode != InlineBetaMode::Plain {
+        let nq = encoded_filters.len().max(1);
+        println!();
+        println!("Routing summary ({} queries):", nq);
+        println!(
+            "  Unsatisfiable:                   {:6} ({:5.1}%)",
+            stat_unsat,
+            100.0 * stat_unsat as f64 / nq as f64
+        );
+        println!(
+            "  Non-canonical (fallback->graph): {:6} ({:5.1}%)",
+            stat_non_canonical,
+            100.0 * stat_non_canonical as f64 / nq as f64
+        );
+        println!(
+            "  Brute force V1 (UB<=T):          {:6} ({:5.1}%)  mean UB={:.0}  mean |C|={:.0}",
+            stat_bf_v1,
+            100.0 * stat_bf_v1 as f64 / nq as f64,
+            if stat_bf_v1 > 0 { sum_v1_ub as f64 / stat_bf_v1 as f64 } else { 0.0 },
+            if stat_bf_v1 > 0 { sum_v1_candidates as f64 / stat_bf_v1 as f64 } else { 0.0 }
+        );
+        if mode == InlineBetaMode::Bfx {
+            println!(
+                "  Graph + BFX rare-label aug:      {:6} ({:5.1}%)  mean UB={:.0}  mean rare_sum={:.0}  mean |S|={:.0}",
+                stat_bfx_aug,
+                100.0 * stat_bfx_aug as f64 / nq as f64,
+                if stat_bfx_aug > 0 { sum_bfx_ub as f64 / stat_bfx_aug as f64 } else { 0.0 },
+                if stat_bfx_aug > 0 { sum_bfx_rare_sum as f64 / stat_bfx_aug as f64 } else { 0.0 },
+                if stat_bfx_aug > 0 { sum_bfx_rare_size as f64 / stat_bfx_aug as f64 } else { 0.0 }
+            );
+        }
+        let graph_only = stat_graph - stat_bfx_aug;
+        println!(
+            "  Graph only:                      {:6} ({:5.1}%)",
+            graph_only,
+            100.0 * graph_only as f64 / nq as f64
+        );
+    }
     println!();
     println!(
         "{:>8}  {:>10}  {:>12}  {:>14}  {:>10}",
@@ -1721,50 +2078,137 @@ where
 
                 for q in 0..num_queries {
                     let query_vec = queries.row(q);
-
-                    // Build inline label provider for this query (cheap: just Arc clones).
-                    // Queries whose predicate references attributes absent from the base
-                    // dataset get an always-false provider so they match nothing.
-                    let label_provider: Arc<dyn QueryLabelProvider<u32>> =
-                        match &encoded_filters[q] {
-                            Some(ef) => Arc::new(InlineLabelProvider {
-                                store: roaring_store.clone(),
-                                encoded_filter: ef.clone(),
-                            }),
-                            None => Arc::new(AlwaysFalseLabelProvider),
-                        };
-                    let beta_strategy =
-                        BetaFilter::new(FullPrecision, label_provider, args.beta);
+                    let routing = &routings[q];
+                    let metric = args.dist_fn;
 
                     let q_start = Instant::now();
 
-                    let mut ids = vec![0u32; k];
-                    let mut dists = vec![0.0f32; k];
-                    let mut output =
-                        search_output_buffer::IdDistance::new(&mut ids, &mut dists);
+                    let final_ids: Vec<u32> = match routing {
+                        QueryRouting::Unsatisfiable => {
+                            // No graph search, no BF. Pad with sentinel 0s.
+                            vec![0u32; k]
+                        }
+                        QueryRouting::BfV1 { candidates, .. } => {
+                            // Pure brute force on the minimising category's union,
+                            // re-checking the full filter for each candidate (so that
+                            // the other AND categories are honoured).
+                            let ef = encoded_filters[q]
+                                .as_ref()
+                                .expect("BfV1 requires Some(ef)");
+                            let store = roaring_store.clone();
+                            let ef_for_pred = ef.clone();
+                            let bf = brute_force_topk::<T, _>(
+                                query_vec,
+                                base_data
+                                    .as_ref()
+                                    .expect("base_data required for BF")
+                                    .as_ref(),
+                                candidates,
+                                |id| store.matches_filter(&id, &ef_for_pred),
+                                k,
+                                metric,
+                            );
+                            let mut out = vec![0u32; k];
+                            for (i, (id, _)) in bf.iter().enumerate().take(k) {
+                                out[i] = *id;
+                            }
+                            out
+                        }
+                        QueryRouting::Graph | QueryRouting::BfxAugment { .. } => {
+                            // Run the graph search (inline-beta).
+                            let label_provider: Arc<dyn QueryLabelProvider<u32>> =
+                                match &encoded_filters[q] {
+                                    Some(ef) => Arc::new(InlineLabelProvider {
+                                        store: roaring_store.clone(),
+                                        encoded_filter: ef.clone(),
+                                    }),
+                                    None => Arc::new(AlwaysFalseLabelProvider),
+                                };
+                            let beta_strategy =
+                                BetaFilter::new(FullPrecision, label_provider, args.beta);
 
-                    let _stats = index
-                        .search(
-                            graph_search,
-                            &beta_strategy,
-                            &context,
-                            query_vec,
-                            &mut output,
-                        )
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "InlineBeta search failed for query {}: {}",
-                                q,
-                                e
-                            )
-                        })?;
+                            let mut ids = vec![0u32; k];
+                            let mut dists = vec![0.0f32; k];
+                            let mut output =
+                                search_output_buffer::IdDistance::new(&mut ids, &mut dists);
+
+                            let _stats = index
+                                .search(
+                                    graph_search,
+                                    &beta_strategy,
+                                    &context,
+                                    query_vec,
+                                    &mut output,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "InlineBeta search failed for query {}: {}",
+                                        q,
+                                        e
+                                    )
+                                })?;
+
+                            // For BFX: also brute-force the rare-label set, then merge.
+                            if let QueryRouting::BfxAugment { rare_set, .. } = routing {
+                                let ef = encoded_filters[q]
+                                    .as_ref()
+                                    .expect("BfxAugment requires Some(ef)");
+                                let store = roaring_store.clone();
+                                let ef_for_pred = ef.clone();
+                                let base = base_data
+                                    .as_ref()
+                                    .expect("base_data required for BFX")
+                                    .as_ref();
+                                let bf = brute_force_topk::<T, _>(
+                                    query_vec,
+                                    base,
+                                    rare_set,
+                                    |id| store.matches_filter(&id, &ef_for_pred),
+                                    k,
+                                    metric,
+                                );
+                                // The graph search uses BetaFilter, which multiplies
+                                // distances by `beta` for matching docs (and leaves
+                                // non-matching docs at raw distance — soft filter).
+                                // To merge against BF results (which are raw L2 over
+                                // strictly-matching docs), we must (a) drop any graph
+                                // candidates that don't actually satisfy the predicate
+                                // and (b) recompute raw distances so both sides of the
+                                // merge are on the same scale.
+                                let dim = base.ncols();
+                                let dist_fn = T::distance_comparer(metric, Some(dim));
+                                let nrows = base.nrows() as u32;
+                                let mut graph_pairs: Vec<(u32, f32)> =
+                                    Vec::with_capacity(ids.len());
+                                for &id in ids.iter() {
+                                    if id >= nrows {
+                                        continue;
+                                    }
+                                    if !store.matches_filter(&id, &ef_for_pred) {
+                                        continue;
+                                    }
+                                    let vec = base.row(id as usize);
+                                    let raw_d = dist_fn.call(query_vec, vec);
+                                    graph_pairs.push((id, raw_d));
+                                }
+                                let merged = merge_topk(&graph_pairs, &bf, k);
+                                let mut out = vec![0u32; k];
+                                for (i, id) in merged.iter().enumerate().take(k) {
+                                    out[i] = *id;
+                                }
+                                out
+                            } else {
+                                ids
+                            }
+                        }
+                    };
 
                     let q_elapsed = q_start.elapsed();
                     rep_latencies.push(q_elapsed.as_micros() as f64);
 
                     if rep == 0 {
-                        all_ids[q * k..q * k + k].copy_from_slice(&ids[..k]);
+                        all_ids[q * k..q * k + k].copy_from_slice(&final_ids[..k]);
                     }
                 }
                 Ok::<(), anyhow::Error>(())

@@ -100,10 +100,10 @@ search_memory_index [OPTIONS] \
 | `--result_path` | *(none)* | Prefix for result output files |
 | `--data_labels` | *(none)* | Base vector labels JSONL file |
 | `--query_labels` | *(none)* | Query predicates JSONL file |
-| `--filter_strategy` | `none` | `none`, `beta`, `multihop`, or `inline_beta` |
-| `--beta` | `0.5` | Beta factor for `beta` strategy (0, 1] |
-| `--data_path` | *(none)* | Base vectors for brute-force fallback |
-| `--brute_force_threshold` | `0` | Match count below which brute-force is used |
+| `--filter_strategy` | `none` | `none`, `beta`, `multihop`, `inline_beta`, `inline_beta_bf`, or `inline_beta_bfx` |
+| `--beta` | `0.5` | Beta factor for `beta`/`inline_beta*` strategies (0, 1] |
+| `--data_path` | *(none)* | Base vectors for brute-force (required for `inline_beta_bf` / `inline_beta_bfx`) |
+| `--brute_force_threshold` | `0` | Threshold *T* on candidate count: when (or how much) brute-force is used; required > 0 for `inline_beta_bf` / `inline_beta_bfx` |
 
 ### Output
 
@@ -165,6 +165,87 @@ extra hop) to discover matching vectors reachable through non-matching
 intermediaries. Only matching vectors enter the result set (hard filter).
 
 **Parameters:** None beyond the standard search parameters.
+
+#### `--filter_strategy inline_beta`
+
+Same as `inline_beta` documented in the [Filter strategies](#filter-strategies-detail)
+section below: BetaFilter graph search using the `RoaringAttributeStore` for
+per-node predicate evaluation (no per-query bitmap precomputation).
+
+#### `--filter_strategy inline_beta_bf` (V1: bf-or-graph hybrid)
+
+Hybrid of `inline_beta` and pure brute-force, dispatched per query based on a
+static analysis of the query's encoded predicate AST. Requires `--data_path`
+and `--brute_force_threshold T` (T > 0).
+
+**Per-query routing:**
+
+1. **AST shape check.** Walk the encoded AST. Accept only *AND-of-ORs* form
+   (top-level `AND` of OR sub-expressions, each OR being a flat disjunction of
+   terminal label literals; bare `OR` and single terminals also count). Any
+   `NOT` or non-flat shape disqualifies the query — it falls back to plain
+   graph search.
+2. **Upper-bound (UB) on the result set.** For each AND-conjunct
+   *Cᵢ = (lᵢ,₁ OR lᵢ,₂ OR …)*, compute the *literal sum*
+   *mᵢ = Σⱼ |posting_list(lᵢ,ⱼ)|* (cheap O(num_categories_in_OR) lookup —
+   no bitmap union). The intersection size is bounded by *UB = minᵢ mᵢ*.
+   * **UB = 0** → query is *unsatisfiable*: skip search, return sentinel IDs.
+   * **UB ≤ T** → take the minimising conjunct *C\**, union its posting
+     lists into a candidate set, and brute-force top-K over that set,
+     **re-checking the full filter** for each candidate so other conjuncts
+     are honoured. Path: **BfV1**.
+   * **UB > T** → run normal `inline_beta` graph search. Path: **Graph**.
+3. Latency is dominated by either graph search or by the candidate-set scan,
+   never both.
+
+**Parameters:**
+- `--beta` ∈ (0, 1]: passed through to the graph-path BetaFilter.
+- `--data_path`: full base-vector matrix; loaded once.
+- `--brute_force_threshold T`: routing threshold (in candidate count).
+
+**When it helps:** queries whose minimising category is small (e.g. a rare
+geolocation in conjunction with a common date range). For those queries
+brute-force is both faster than the graph search and gives perfect recall.
+Non-canonical AST shapes are silently routed through the graph path, so this
+mode is safe to enable on mixed workloads.
+
+#### `--filter_strategy inline_beta_bfx` (V2: bfx-augmented graph)
+
+Graph + brute-force augmentation. Same prelude as V1 (AND-of-ORs analysis,
+UB, unsatisfiable detection). When UB > T, instead of giving up on
+brute-force, V2 *augments* the graph search with a partial brute-force scan
+over a carefully chosen subset of *rare* labels.
+
+**Per-query routing:**
+
+1. **Unsatisfiable / BfV1 / non-canonical:** same as V1.
+2. **UB > T (graph path):** sort all OR-literals across all AND-conjuncts by
+   ascending posting-list size *m*. Greedily accumulate the rarest labels
+   into a set *R* while the running literal sum stays ≤ *T*. If at least one
+   label fits, take their roaring union *S = ⋃_{l∈R} posting_list(l)* and:
+   * Run the normal `inline_beta` graph search → top-K.
+   * Brute-force top-K over *S* (re-checking the full filter).
+   * Merge the two top-K lists (dedup, sort, take K). Path: **BfxAugment**.
+3. If even the rarest label exceeds *T*, fall through to plain graph search.
+
+**Why:** the brute-force pass guarantees that any true neighbour matching one
+of the rare labels is found, plugging the recall gap that graph-only search
+leaves on highly selective conjuncts. The graph pass still covers the bulk of
+the predicate. *T* directly bounds the extra BF work per query.
+
+**Parameters:** same as `inline_beta_bf`.
+
+**Routing summary.** Both V1 and V2 print a one-shot summary after parsing
+queries, e.g.:
+
+```
+Routing summary (9976 queries):
+  Unsatisfiable:                        1 (  0.0%)
+  Non-canonical (fallback->graph):      0 (  0.0%)
+  Brute force V1 (UB<=T):             428 (  4.3%)  mean UB=989  mean |C|=989
+  Graph + BFX rare-label aug:        7084 ( 71.0%)  mean UB=678516  mean rare_sum=486  mean |S|=478
+  Graph only:                        2463 ( 24.7%)
+```
 
 ### Brute-force fallback
 
@@ -234,6 +315,36 @@ search_memory_index \
   --data_labels siftsmall/base_labels.jsonl \
   --query_labels siftsmall/query_labels.jsonl \
   --filter_strategy inline_beta --beta 0.5 \
+  -K 10 -L 10 20 50 100
+```
+
+**Inline beta + brute-force hybrid (V1):**
+```bash
+search_memory_index \
+  --data_type uint8 --dist_fn l2 \
+  --index_path_prefix siftsmall/index_R32_L50 \
+  --query_file siftsmall/siftsmall_query.fbin \
+  --gt_file siftsmall/gt_filtered.bin \
+  --data_labels siftsmall/base_labels.jsonl \
+  --query_labels siftsmall/query_labels.jsonl \
+  --filter_strategy inline_beta_bf --beta 0.5 \
+  --data_path siftsmall/siftsmall_base.fbin \
+  --brute_force_threshold 2000 \
+  -K 10 -L 10 20 50 100
+```
+
+**Inline beta + bfx graph-augmenting brute-force (V2):**
+```bash
+search_memory_index \
+  --data_type uint8 --dist_fn l2 \
+  --index_path_prefix siftsmall/index_R32_L50 \
+  --query_file siftsmall/siftsmall_query.fbin \
+  --gt_file siftsmall/gt_filtered.bin \
+  --data_labels siftsmall/base_labels.jsonl \
+  --query_labels siftsmall/query_labels.jsonl \
+  --filter_strategy inline_beta_bfx --beta 0.5 \
+  --data_path siftsmall/siftsmall_base.fbin \
+  --brute_force_threshold 2000 \
   -K 10 -L 10 20 50 100
 ```
 
@@ -402,6 +513,111 @@ roaring store.
 - Slightly higher per-query cost than bitmap BetaFilter (roaring lookup vs
   BitSet membership test), but avoids the O(queries × points) bitmap
   precomputation.
+
+#### 4. InlineBetaBf (V1: inline_beta + brute-force routing)
+
+**Crate:** `diskann-label-filter` + `diskann-benchmark` (routing logic lives in
+the binary)
+**CLI:** `--filter_strategy inline_beta_bf --beta 0.5 --brute_force_threshold T --data_path ...`
+
+A static, per-query dispatcher: each query is routed *either* to brute-force
+*or* to the `inline_beta` graph search, based on a cheap upper-bound estimate
+of its result-set size derived from the inverse index.
+
+**How it works:**
+
+1. **AST canonicalisation.** Walk the encoded predicate AST (`ASTIdExpr<u64>`).
+   Accept only AND-of-OR-of-literal expressions (i.e. CNF where every clause
+   is a disjunction of label terminals). Nested `OR` is flattened. `NOT` or
+   any other shape disqualifies the query from BF routing — it goes to the
+   graph path unchanged.
+2. **Cheap UB.** For each AND-conjunct *Cᵢ*, look up posting-list lengths of
+   its literals on `RoaringAttributeStore::posting_list_len()` (an O(1)
+   `len()` on a treemap) and sum them: *mᵢ = Σⱼ |posting_list(lᵢ,ⱼ)|*. The
+   *literal sum* `mᵢ` is an upper bound on `|Cᵢ|` (union ≤ sum) and therefore
+   `min_i mᵢ` is an upper bound on the intersection. No actual bitmap union
+   is computed.
+3. **Dispatch.**
+   * `UB == 0`: query is unsatisfiable — return sentinel IDs, skip all work.
+   * `UB ≤ T`: take the minimising conjunct *C\**, union its posting lists
+     into a `RoaringTreemap` (`union_posting_lists()`), and brute-force
+     top-K over that set with `matches_filter()` re-checking the full
+     predicate. **Path: BfV1.**
+   * `UB > T`: standard `inline_beta` graph search. **Path: Graph.**
+4. **Brute force.** `brute_force_topk` iterates the treemap, computes raw
+   distances via `T::distance_comparer` against `Matrix<T>::row()`, and
+   maintains a size-K max-heap.
+
+**Characteristics:**
+- BF gives perfect recall on the routed queries — strictly improves recall vs
+  `inline_beta` whenever the routed queries had non-trivial recall loss.
+- At low *L*, BF often *also* improves latency: skipping graph navigation for
+  a small candidate set is faster than running the full graph search.
+- *T* controls the recall/QPS trade-off: larger *T* routes more queries to BF
+  (more recall gain, but each BF query is more expensive).
+- The UB is loose (sum, not union), so some BF-eligible queries are sent to
+  graph search. That's acceptable: the goal is a cheap gate, not a tight
+  one.
+- Routing decisions and means are printed once at startup.
+
+#### 5. InlineBetaBfx (V2: inline_beta with rare-label augmentation)
+
+**Crate:** `diskann-label-filter` + `diskann-benchmark`
+**CLI:** `--filter_strategy inline_beta_bfx --beta 0.5 --brute_force_threshold T --data_path ...`
+
+Same prelude as V1 — AND-of-OR canonicalisation, UB, unsatisfiable
+detection, BfV1 routing for `UB ≤ T`. The difference is on the `UB > T`
+branch: instead of giving up entirely on brute-force, V2 *augments* the
+graph search with a partial BF scan over the **rarest labels in the
+predicate**, then merges the two top-K result lists.
+
+**How it works (for `UB > T` queries):**
+
+1. **Rare-label selection.** Collect every literal across every AND-conjunct
+   into a list of `(m_l, label_id)` pairs (m_l = `posting_list_len(label_id)`).
+   Sort ascending by *m_l*. Greedily accumulate the rarest labels into *R*
+   while the running literal sum stays ≤ *T*. If at least one label fits,
+   take their roaring union *S* via `union_posting_lists(R)`.
+2. **Graph search.** Run `inline_beta` exactly as `--filter_strategy
+   inline_beta` would.
+3. **Augmenting brute-force.** Run `brute_force_topk` over *S* (re-checking
+   the full filter on each member). This guarantees every true neighbour
+   matching one of the rare labels is found.
+4. **Merge.** Dedup by ID, sort by distance, take the top-K from the union of
+   the two result lists. Latency = graph search + BF over *S* (bounded by
+   *T*).
+
+> **Note on distance scaling.** The graph traversal uses `BetaFilter`, which
+> multiplies the inner L2 distance by `beta` for documents matching the
+> predicate (and leaves non-matching docs at raw distance — soft filtering).
+> To merge safely against BF results (raw L2 over strictly-matching docs),
+> V2 (a) re-checks each graph candidate against the filter and drops
+> non-matches, and (b) recomputes raw L2 distances for the surviving
+> candidates so both sides of the merge are on the same scale. Without
+> this, the beta-scaled graph distances would always sort ahead of the
+> raw BF distances, defeating the merge.
+
+**Trade-off:**
+- Strictly ≥ `inline_beta` recall on routed queries (BF is exhaustive over
+  *S*). Adds extra recall over V1 by also catching the rare-label intersections
+  that V1's UB skipped past.
+- Costs an extra BF pass per `UB > T` query — typically most of the workload —
+  so QPS is *lower* than plain `inline_beta` and lower than V1 at the same *T*.
+- Pay this when recall is the priority and you can afford the cost.
+
+**Helpers introduced for V1/V2:**
+
+```rust
+// On RoaringAttributeStore
+pub fn posting_list_len(&self, label_id: u64) -> usize;
+pub fn union_posting_lists(&self, label_ids: &[u64]) -> RoaringTreemap;
+
+// In search_memory_index.rs
+fn analyze_and_of_ors(expr: &ASTIdExpr<u64>) -> Option<Vec<Vec<u64>>>;
+fn brute_force_topk<T, F>(query, base_data, candidates, keep, k, metric)
+    -> Vec<(u32, f32)>;
+fn merge_topk(graph: &[(u32, f32)], bf: &[(u32, f32)], k: usize) -> Vec<u32>;
+```
 
 ### Bitmap computation
 

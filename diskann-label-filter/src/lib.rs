@@ -30,7 +30,7 @@ pub mod traits {
 //Modules that  handle predicates by mapping them
 // to integers.
 pub mod encoded_attribute_provider {
-    pub(crate) mod ast_id_expr;
+    pub mod ast_id_expr;
     pub(crate) mod ast_label_id_mapper;
     pub mod attribute_encoder;
     pub mod document_provider;

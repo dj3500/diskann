@@ -64,6 +64,35 @@ where
         self.attribute_map.clone()
     }
 
+    /// Number of points carrying `label_id` (i.e. the size of the inverse-index
+    /// posting list for that label). Returns 0 if the label is absent. O(1)
+    /// (well, O(number of roaring containers), which is small in practice).
+    pub fn posting_list_len(&self, label_id: u64) -> usize {
+        let inv = self.inv_index.read().unwrap_or_else(|e| e.into_inner());
+        match inv.get(&label_id) {
+            Ok(Some(set)) => set.len() as usize,
+            _ => 0,
+        }
+    }
+
+    /// Union of the inverse-index posting lists for the given label_ids,
+    /// materialised as a `RoaringTreemap` of u64 vec_ids.
+    ///
+    /// Used by the inline-beta brute-force hybrids to materialise the candidate
+    /// set for a category (V1) or the rare-label set (V2) without having to
+    /// scan the whole base.
+    pub fn union_posting_lists(&self, label_ids: &[u64]) -> roaring::RoaringTreemap {
+        use roaring::RoaringTreemap;
+        let inv = self.inv_index.read().unwrap_or_else(|e| e.into_inner());
+        let mut out = RoaringTreemap::new();
+        for &lid in label_ids {
+            if let Ok(Some(set)) = inv.get(&lid) {
+                out |= set.as_ref();
+            }
+        }
+        out
+    }
+
     /// Check if a point's encoded attributes satisfy the given encoded filter.
     /// Returns `true` if the point matches, `false` if `vec_id` is out of
     /// range, has no attributes, or the filter does not match.
