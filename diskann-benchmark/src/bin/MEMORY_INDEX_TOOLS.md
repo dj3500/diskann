@@ -102,8 +102,8 @@ search_memory_index [OPTIONS] \
 | `--query_labels` | *(none)* | Query predicates JSONL file |
 | `--filter_strategy` | `none` | `none`, `beta`, `multihop`, `inline_beta`, `inline_beta_bf`, or `inline_beta_bfx` |
 | `--beta` | `0.5` | Beta factor for `beta`/`inline_beta*` strategies (0, 1] |
-| `--data_path` | *(none)* | Base vectors for brute-force (required for `inline_beta_bf` / `inline_beta_bfx`) |
-| `--brute_force_threshold` | `0` | Threshold *T* on candidate count: when (or how much) brute-force is used; required > 0 for `inline_beta_bf` / `inline_beta_bfx` |
+| `--data_path` | *(none)* | Base vectors for brute-force; required whenever `--brute_force_threshold > 0` uses a BF path |
+| `--brute_force_threshold` | `0` | Exact-match-count fallback threshold for non-inline strategies; routing/augmentation budget for `inline_beta_bf` / `inline_beta_bfx` |
 
 ### Output
 
@@ -125,8 +125,9 @@ Then a table with one row per L value:
       20    40000.00         25.00         37.00      100.00
 ```
 
-When `--brute_force_threshold > 0`, an extra **BF Qrys** column shows how many
-queries used brute-force.
+For non-inline strategies, when `--brute_force_threshold > 0`, an extra
+**BF Qrys** column shows how many queries used brute-force. The inline hybrids
+report their BF decisions in the routing summary instead.
 
 ### Filter strategies
 
@@ -169,8 +170,9 @@ intermediaries. Only matching vectors enter the result set (hard filter).
 #### `--filter_strategy inline_beta`
 
 Same as `inline_beta` documented in the [Filter strategies](#filter-strategies-detail)
-section below: BetaFilter graph search using the `RoaringAttributeStore` for
-per-node predicate evaluation (no per-query bitmap precomputation).
+section below: BetaFilter graph search using the compact, vector-backed forward
+index in `RoaringAttributeStore` for per-node predicate evaluation (no
+per-query bitmap precomputation).
 
 #### `--filter_strategy inline_beta_bf` (V1: bf-or-graph hybrid)
 
@@ -247,7 +249,7 @@ Routing summary (9976 queries):
   Graph only:                        2463 ( 24.7%)
 ```
 
-### Brute-force fallback
+### Brute-force fallback for non-inline strategies
 
 When `--brute_force_threshold N` is set (N > 0) and `--data_path` is provided:
 
@@ -257,6 +259,17 @@ When `--brute_force_threshold N` is set (N > 0) and `--data_path` is provided:
    the matching points instead of using the graph index.
 3. Otherwise, the graph search proceeds normally with the selected filter
    strategy.
+
+This check happens before dispatching the graph strategy, so it applies to all
+three non-inline filtered modes: `none`, `beta`, and `multihop`. In filtered
+`none` mode it replaces the usual unfiltered graph search plus post-filtering
+for sufficiently small matching sets. It does not apply to unfiltered `none`
+(there is no filter bitmap to count) or plain `inline_beta`.
+
+The benchmark name `beta_bf` refers to regular `beta` invoked with this generic
+fallback enabled. `inline_beta_bf` and `inline_beta_bfx` instead use the
+upper-bound routing and augmentation algorithms described in their own
+sections above; they do not use this exact-bitmap fallback.
 
 This is useful for highly selective queries where the matching set is tiny. For
 such queries, brute-force is both faster (no graph navigation overhead) and
@@ -479,25 +492,27 @@ Combines beta-weighted scoring with per-node predicate evaluation against a
 `RoaringAttributeStore`. Unlike BetaFilter (which uses precomputed per-query
 bitmaps), InlineBeta evaluates the query's encoded filter expression inline
 during graph traversal by looking up each candidate's encoded attributes in the
-roaring store.
+store's compact, vector-backed forward index. Despite the store's name, Roaring
+is used only for its inverse posting lists, not for this per-node lookup.
 
 **How it works:**
 
 1. **Precomputation (before search):** Base labels are loaded from the JSONL
-   file and inserted into a `RoaringAttributeStore`, which encodes
-   attribute field+value pairs as integer IDs in roaring bitmaps. Each query's
-   `ASTExpr` is then encoded into an `EncodedFilterExpr` using the store's
-   attribute map — this converts string field+value comparisons into integer
-   lookups.
+   file and inserted into a `RoaringAttributeStore`, which stores each point's
+   encoded attribute IDs as a sorted `Box<[u32]>` in a vector-backed forward
+   index. It also maintains Roaring inverse posting lists for bulk set
+   operations. Each query's `ASTExpr` is then encoded into an
+   `EncodedFilterExpr` using the store's attribute map — this converts string
+   field+value comparisons into integer lookups.
 2. **Per query:** An `InlineLabelProvider` is created, wrapping a reference to
    the `RoaringAttributeStore` and the query's `EncodedFilterExpr`. This
    implements `QueryLabelProvider<u32>` and is passed to `BetaFilter::new()`.
 3. **During search:** For each candidate node visited, `is_match(vec_id)`
    calls `RoaringAttributeStore::matches_filter()`, which reads the point's
-   encoded attribute set (a `RoaringTreemap`) and evaluates the encoded
-   predicate against it using `PredicateEvaluator`. This is an efficient
-   integer-level roaring bitmap operation — no JSON parsing occurs during
-   search.
+   encoded attribute slice by directly indexing the forward `Vec`, then
+   evaluates the predicate with `SlicePredicateEvaluator`. Terminal checks use
+   a linear scan for small slices and binary search for larger slices — no
+   Roaring operation or JSON parsing occurs during search.
 4. **Post-filter:** Same as BetaFilter — non-matching candidates removed.
 
 **Parameters:**
@@ -510,8 +525,9 @@ roaring store.
 - Attribute store construction is a one-time cost reported separately.
 - Uses the same `FPIndex<T>` (plain `DiskANNIndex<FullPrecisionProvider<T>>`)
   as all other strategies — no `DocumentProvider` wrapper needed.
-- Slightly higher per-query cost than bitmap BetaFilter (roaring lookup vs
-  BitSet membership test), but avoids the O(queries × points) bitmap
+- Slightly higher per-query cost than bitmap BetaFilter (predicate evaluation
+   over a small sorted slice vs BitSet membership test), but avoids the
+   O(queries × points) bitmap
   precomputation.
 
 #### 4. InlineBetaBf (V1: inline_beta + brute-force routing)
@@ -649,7 +665,7 @@ populating the inverted index first, which the CLI tool does not do. The
 bitmap approach is simpler and sufficient for datasets up to a few million
 points.
 
-### Brute-force fallback
+### Non-inline fallback implementation
 
 When a query's filter matches very few points (below `--brute_force_threshold`),
 no graph navigation is needed. The tool performs a linear scan over only the
@@ -715,7 +731,7 @@ distance. For datasets with highly selective filters:
 | `QueryLabelProvider<V>` | `diskann::graph::index` | Trait for per-query label matching |
 | `ASTExpr` | `diskann_label_filter::parser::ast` | Parsed filter expression tree |
 | `FilteredQuery<V>` | `diskann_label_filter::query` | Query vector + filter expression wrapper |
-| `RoaringAttributeStore` | `diskann_label_filter::encoded_attribute_provider` | Forward + inverted index for attributes |
+| `RoaringAttributeStore` | `diskann_label_filter::encoded_attribute_provider` | Vector-backed forward index + Roaring inverted index for attributes |
 
 ### Benchmark JSON configuration
 
