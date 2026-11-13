@@ -619,6 +619,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "diskann-filter-lab"
+version = "0.62.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "clap",
+ "diskann-vector",
+ "hashbrown 0.16.1",
+ "serde_json",
+]
+
+[[package]]
 name = "diskann-garnet"
 version = "9.0.0"
 dependencies = [

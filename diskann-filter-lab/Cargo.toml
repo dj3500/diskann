@@ -1,0 +1,26 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+[package]
+name = "diskann-filter-lab"
+description = "Research lab for filtered approximate nearest neighbor search: label stores, AND-of-OR predicates and exact filtered ground truth."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "flab"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytemuck = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
+diskann-vector.workspace = true
+hashbrown.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

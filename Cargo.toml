@@ -27,6 +27,8 @@ members = [
     "diskann-record",
     "diskann-tools",
     "diskann-bftree",
+    # Research
+    "diskann-filter-lab",
 ]
 
 default-members = [
