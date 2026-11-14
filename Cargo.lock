@@ -625,9 +625,13 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
+ "diskann",
+ "diskann-providers",
  "diskann-vector",
  "hashbrown 0.16.1",
+ "libc",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -18,4 +18,5 @@ pub mod labels;
 pub mod parallel;
 pub mod predicate;
 pub mod text;
+pub mod upstream;
 pub mod vectors;

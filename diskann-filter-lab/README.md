@@ -162,3 +162,58 @@ def section(i, dtype):
 ```
 
 (`hdr[0]` is the magic, `hdr[1]` packs the version and `S`, `hdr[2:10]` are the parameters.)
+
+## Upstream adapter (`flab-upstream`)
+
+Runs upstream DiskANN's unmodified filtered searches on an index saved by upstream (for example
+by the `diskann-benchmark` `graph-index-build` job with `save_path`), with the lab's predicate
+providers, a per-query timer and the lab's run outputs (module `upstream`).
+
+| `--algorithms` | upstream code | output |
+|---|---|---|
+| `knn-postfilter` | `Knn` (unfiltered), list size L | best K matches of the L candidates (post-filter) |
+| `inline` | `InlineFilterSearch`, fixed L | best K matches |
+| `inline-adaptive` | `InlineFilterSearch` + `AdaptiveL` (`--adaptive-samples`, `--adaptive-scale`) | best K matches |
+| `multihop` | `MultihopFilterSearch` | best K matches |
+| `beta` | `BetaFilter` layer over `Knn` (`--beta`) | L candidates post-filtered to the best K matches, with recomputed true distances |
+
+Predicate providers (`--providers`) implement upstream's `QueryLabelProvider`:
+
+- `forward`: evaluates the CNF on the point's sorted label row, clauses in ascending order of
+  total posting length (most selective first), with early exit;
+- `bitmap`: builds a dense match bitmap over the data points from the postings of every query
+  (per clause the union, across clauses the intersection), then tests one bit.
+
+Ids at or above the number of data points (frozen start points) never match, and they are never
+used to index label rows or bitmaps.
+
+**Timing.** Single-threaded on the calling thread (pin it with `taskset`, and bind memory with
+`numactl` if needed). Every configuration (algorithm × provider × K) and effort L gets one untimed
+warm-up pass (its results are the reference), then `--reps` timed passes interleaved over all
+configurations of the invocation. Each query is timed end to end: predicate compilation (and
+the bitmap construction), the upstream search with the strategy's default post-processing, the
+adapter's post-filter and the result copy. Wall time (monotonic clock) and thread CPU time are
+recorded per query.
+
+**Outputs.** One directory per configuration under `--runs-dir`, plus one line appended to
+`--ledger` (JSON lines, also on failure):
+
+- `run.json`: tool, commit, dataset, query source (query set, files or panel with its hash),
+  index, resolved configuration and its hash, host (CPU, NUMA node, affinity, memory policy),
+  load averages and a CPU calibration at start and end, per-effort summaries;
+- `res_<L>.bin`: DiskANN truthset layout (`u32` nq, `u32` K, ids padded with `u32::MAX`, true
+  squared-L2 distances padded with `f32::MAX`), rows in query order;
+- `perquery.tsv`: `effort, rep, row, wall_ns, cpu_ns, n_dist, n_pred, n_expand, n_hops,
+  n_match_seen, n_out, route`, then upstream's raw `up_cmps, up_hops, up_results`, `n_start`,
+  `post_pred`, `extra_dist`, `prep_ns`, `prep_entries` (definitions in `run.json`).
+
+```sh
+taskset -c 8 numactl --membind=0 flab-upstream run --index graphs/ds/index --dataset ds \
+    --qset 10K --algorithms inline,multihop --providers forward,bitmap -k 10,100 \
+    --efforts 10,20,50,100,200,500 --runs-dir runs --ledger ledger.jsonl
+flab-upstream info --index graphs/ds/index --dtype u8
+```
+
+Queries come from `--qset S` (`qS.{u8bin,fbin}` and `qS.fpred` in the dataset directory),
+explicit `--queries`/`--predicates`, or `--panel` (TSV with columns `qset`, `qidx` and optionally
+`split`; rows in panel order). Efforts below K are skipped for that K.
