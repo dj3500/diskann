@@ -3,80 +3,82 @@
  * Licensed under the MIT license.
  */
 
-//! Epoch-stamped visited set over node ids (no per-query clearing).
+//! Visited set over node ids: a bitset with a list of the words in use, emptied in time
+//! proportional to the number of words touched (no per-query clearing of the whole set).
 
-/// A visited set over `0..n` that is emptied in O(1) by starting a new epoch.
-#[derive(Debug, Clone)]
+/// A visited set over `0..n`. One bit per node keeps the set small enough to stay in the
+/// private cache (125 KiB per million nodes), unlike a 4-byte stamp per node; the words that
+/// became non-zero are listed, so that emptying the set only rewrites those.
+#[derive(Debug, Clone, Default)]
 pub struct Visited {
-    stamps: Vec<u32>,
-    epoch: u32,
-}
-
-impl Default for Visited {
-    /// The empty set over no ids.
-    fn default() -> Self {
-        Self {
-            stamps: Vec::new(),
-            epoch: 1,
-        }
-    }
+    bits: Vec<u64>,
+    /// Indices of the non-zero words of `bits` (capacity for all words: never reallocates).
+    touched: Vec<u32>,
+    n: usize,
 }
 
 impl Visited {
-    /// A set over `0..n`. The stamp array is written element by element (not allocated as
-    /// lazily mapped zero pages), so no page fault happens during a search.
+    /// A set over `0..n`. The arrays are written element by element (not allocated as lazily
+    /// mapped zero pages), so no page fault happens during a search.
     #[expect(
         clippy::slow_vector_initialization,
         reason = "writes every page now, so that no page fault happens during a timed search"
     )]
     pub fn new(n: usize) -> Self {
-        let mut stamps = Vec::with_capacity(n);
-        stamps.resize(n, 0);
-        Self { stamps, epoch: 1 }
+        let words = n.div_ceil(64);
+        let mut bits = Vec::with_capacity(words);
+        bits.resize(words, 0);
+        let mut touched = Vec::with_capacity(words);
+        touched.resize(words, 0);
+        touched.clear();
+        Self { bits, touched, n }
     }
 
     /// Number of ids covered.
     pub fn len(&self) -> usize {
-        self.stamps.len()
+        self.n
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stamps.is_empty()
+        self.n == 0
     }
 
     /// Empties the set.
     #[inline]
     pub fn clear(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.stamps.fill(0);
-            self.epoch = 1;
+        for &w in &self.touched {
+            self.bits[w as usize] = 0;
         }
+        self.touched.clear();
     }
 
     /// Whether `v` is in the set.
     #[inline(always)]
     pub fn contains(&self, v: u32) -> bool {
-        self.stamps[v as usize] == self.epoch
+        self.bits[(v >> 6) as usize] & (1 << (v & 63)) != 0
     }
 
     /// Inserts `v`.
     #[inline(always)]
     pub fn insert(&mut self, v: u32) {
-        self.stamps[v as usize] = self.epoch;
+        self.test_and_set(v);
     }
 
     /// Inserts `v` and returns whether it was already present.
     #[inline(always)]
     pub fn test_and_set(&mut self, v: u32) -> bool {
-        let epoch = self.epoch;
-        let s = &mut self.stamps[v as usize];
-        if *s == epoch {
-            true
-        } else {
-            *s = epoch;
-            false
+        let i = (v >> 6) as usize;
+        let m = 1u64 << (v & 63);
+        let w = self.bits[i];
+        if w & m != 0 {
+            return true;
         }
+        if w == 0 {
+            // At most one push per word: `touched` was allocated for all of them.
+            self.touched.push(i as u32);
+        }
+        self.bits[i] = w | m;
+        false
     }
 }
 
@@ -85,19 +87,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn epochs_empty_the_set() {
-        let mut v = Visited::new(10);
+    fn clearing_empties_the_set() {
+        let mut v = Visited::new(200);
         assert!(!v.test_and_set(3));
         assert!(v.test_and_set(3) && v.contains(3) && !v.contains(4));
-        v.clear();
-        assert!(!v.contains(3));
         v.insert(4);
-        assert!(v.contains(4));
-        // Wrap-around of the epoch counter clears all stamps.
-        v.epoch = u32::MAX;
-        v.insert(5);
+        v.insert(130);
+        v.insert(199);
+        assert!(v.contains(4) && v.contains(130) && v.contains(199));
+        assert_eq!(v.touched.len(), 3, "one entry per word in use");
         v.clear();
-        assert_eq!(v.epoch, 1);
-        assert!(!v.contains(5) && !v.contains(4));
+        assert!((0..200).all(|i| !v.contains(i)));
+        assert!(v.touched.is_empty() && v.bits.iter().all(|&w| w == 0));
+        for i in 0..200 {
+            assert!(!v.test_and_set(i));
+        }
+        assert_eq!(v.touched.len(), 4);
+        v.clear();
+        assert!(!v.contains(64));
     }
 }
