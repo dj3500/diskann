@@ -14,6 +14,13 @@
 //!
 //! In resizable mode (the reference executor) nothing is evicted and every entry is
 //! expandable.
+//!
+//! Layout: keys (`u32` for scores that are one `f32`, `u64` for lexicographic keys), slots
+//! `(id, state, expanded)` of 8 bytes, and the true distances only when they differ from the
+//! key (with distance keys the distance is the key), so an insertion moves 12 bytes per entry
+//! behind it for distance keys, as upstream's queue does.
+
+use super::funkey;
 
 /// What is known about an entry's predicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -31,15 +38,42 @@ pub enum State {
     Aux = 4,
 }
 
-/// A beam entry (the key is stored separately).
+/// A beam entry.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(C)]
 pub struct Entry {
     pub id: u32,
     /// True squared distance to the query.
     pub d: f32,
     pub state: State,
     pub expanded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(C)]
+struct Slot {
+    id: u32,
+    state: State,
+    expanded: bool,
+}
+
+/// Key types of the beam.
+pub trait BeamKey: Copy + Ord + Send + Sync + std::fmt::Debug + 'static {
+    /// The key as a `u64` (order preserving).
+    fn wide(self) -> u64;
+}
+
+impl BeamKey for u32 {
+    #[inline(always)]
+    fn wide(self) -> u64 {
+        u64::from(self)
+    }
+}
+
+impl BeamKey for u64 {
+    #[inline(always)]
+    fn wide(self) -> u64 {
+        self
+    }
 }
 
 /// Result of [`Beam::insert`].
@@ -52,35 +86,56 @@ pub enum Inserted {
 }
 
 /// Sorted candidate list with expanded flags (see the module documentation).
-#[derive(Debug, Clone, Default)]
-pub struct Beam {
-    keys: Vec<u64>,
-    entries: Vec<Entry>,
+#[derive(Debug, Clone)]
+pub struct Beam<K> {
+    keys: Vec<K>,
+    slots: Vec<Slot>,
+    dists: Vec<f32>,
+    store_d: bool,
     capacity: usize,
     search_l: usize,
     cursor: usize,
     resizable: bool,
 }
 
-impl Beam {
+impl<K: BeamKey> Default for Beam<K> {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            slots: Vec::new(),
+            dists: Vec::new(),
+            store_d: true,
+            capacity: 0,
+            search_l: 0,
+            cursor: 0,
+            resizable: false,
+        }
+    }
+}
+
+impl<K: BeamKey> Beam<K> {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Empties the beam and sets its capacity and expandable prefix. With `resizable`, the
-    /// beam grows without bound, every entry is expandable and nothing is evicted.
-    pub fn reset(&mut self, capacity: usize, search_l: usize, resizable: bool) {
+    /// beam grows without bound, every entry is expandable and nothing is evicted. Without
+    /// `store_d`, the true distance of an entry is the `f32` encoded by its key.
+    pub fn reset(&mut self, capacity: usize, search_l: usize, resizable: bool, store_d: bool) {
         assert!(capacity > 0, "the beam capacity must be positive");
         self.keys.clear();
-        self.entries.clear();
+        self.slots.clear();
+        self.dists.clear();
+        self.store_d = store_d;
         self.capacity = capacity;
         self.search_l = if resizable { usize::MAX } else { search_l };
         self.resizable = resizable;
         self.cursor = 0;
         let reserve = capacity.min(1 << 20);
         if self.keys.capacity() < reserve {
-            self.keys.reserve(reserve - self.keys.len());
-            self.entries.reserve(reserve - self.entries.len());
+            self.keys.reserve(reserve);
+            self.slots.reserve(reserve);
+            self.dists.reserve(reserve);
         }
     }
 
@@ -115,13 +170,13 @@ impl Beam {
 
     /// Key of the last entry.
     #[inline(always)]
-    pub fn worst_key(&self) -> Option<u64> {
+    pub fn worst_key(&self) -> Option<K> {
         self.keys.last().copied()
     }
 
     /// Inserts an entry (see the module documentation for the rules).
-    #[inline]
-    pub fn insert(&mut self, key: u64, d: f32, id: u32, state: State) -> Inserted {
+    #[inline(always)]
+    pub fn insert(&mut self, key: K, d: f32, id: u32, state: State) -> Inserted {
         let size = self.keys.len();
         let full = size == self.capacity;
         if full {
@@ -135,18 +190,23 @@ impl Beam {
         let mut evicted = None;
         if full && !self.resizable {
             self.keys.pop();
-            evicted = self.entries.pop().map(|e| e.id);
+            evicted = self.slots.pop().map(|e| e.id);
+            if self.store_d {
+                self.dists.pop();
+            }
         }
         self.keys.insert(rank, key);
-        self.entries.insert(
+        self.slots.insert(
             rank,
-            Entry {
+            Slot {
                 id,
-                d,
                 state,
                 expanded: false,
             },
         );
+        if self.store_d {
+            self.dists.insert(rank, d);
+        }
         if rank < self.cursor {
             self.cursor = rank;
         }
@@ -161,37 +221,37 @@ impl Beam {
 
     /// Key of the closest unexpanded entry.
     #[inline(always)]
-    pub fn peek_key(&self) -> Option<u64> {
+    pub fn peek_key(&self) -> Option<K> {
         self.has_unexpanded().then(|| self.keys[self.cursor])
     }
 
-    /// Marks the closest unexpanded entry as expanded and returns it.
+    /// Marks the closest unexpanded entry as expanded and returns its id.
     #[inline]
-    pub fn pop(&mut self) -> Option<Entry> {
+    pub fn pop(&mut self) -> Option<u32> {
         if !self.has_unexpanded() {
             return None;
         }
         let at = self.cursor;
-        self.entries[at].expanded = true;
+        self.slots[at].expanded = true;
         self.cursor += 1;
-        while self.cursor < self.keys.len() && self.entries[self.cursor].expanded {
+        while self.cursor < self.keys.len() && self.slots[self.cursor].expanded {
             self.cursor += 1;
         }
-        Some(self.entries[at])
+        Some(self.slots[at].id)
     }
 
     /// Marks the entry of node `id`, if present, as expanded (e.g. a node whose neighbours were
     /// already offered); returns whether it was found unexpanded.
     pub fn mark_expanded(&mut self, id: u32) -> bool {
-        let Some(at) = self.entries.iter().position(|e| e.id == id) else {
+        let Some(at) = self.slots.iter().position(|e| e.id == id) else {
             return false;
         };
-        if self.entries[at].expanded {
+        if self.slots[at].expanded {
             return false;
         }
-        self.entries[at].expanded = true;
+        self.slots[at].expanded = true;
         if at == self.cursor {
-            while self.cursor < self.keys.len() && self.entries[self.cursor].expanded {
+            while self.cursor < self.keys.len() && self.slots[self.cursor].expanded {
                 self.cursor += 1;
             }
         }
@@ -207,25 +267,43 @@ impl Beam {
         self.search_l = l;
         self.capacity = l.max(self.keys.len());
         if self.keys.capacity() < self.capacity {
-            self.keys.reserve(self.capacity - self.keys.len());
-            self.entries.reserve(self.capacity - self.entries.len());
+            let more = self.capacity - self.keys.len();
+            self.keys.reserve(more);
+            self.slots.reserve(more);
+            self.dists.reserve(more);
         }
     }
 
     /// Keys in beam order.
-    pub fn keys(&self) -> &[u64] {
+    pub fn keys(&self) -> &[K] {
         &self.keys
     }
 
+    /// Entry at position `i`.
+    #[inline]
+    pub fn entry(&self, i: usize) -> Entry {
+        let s = self.slots[i];
+        Entry {
+            id: s.id,
+            d: if self.store_d {
+                self.dists[i]
+            } else {
+                funkey(self.keys[i].wide() as u32)
+            },
+            state: s.state,
+            expanded: s.expanded,
+        }
+    }
+
     /// Entries in beam order.
-    pub fn entries(&self) -> &[Entry] {
-        &self.entries
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = Entry> + '_ {
+        (0..self.keys.len()).map(|i| self.entry(i))
     }
 }
 
 /// Index of the first key `>= key`.
 #[inline(always)]
-fn lower_bound(keys: &[u64], key: u64) -> usize {
+fn lower_bound<K: BeamKey>(keys: &[K], key: K) -> usize {
     // Branchless binary search.
     let mut base = 0usize;
     let mut size = keys.len();
@@ -248,9 +326,10 @@ fn lower_bound(keys: &[u64], key: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::fkey;
 
-    fn ids(b: &Beam) -> Vec<u32> {
-        b.entries().iter().map(|e| e.id).collect()
+    fn ids<K: BeamKey>(b: &Beam<K>) -> Vec<u32> {
+        b.entries().map(|e| e.id).collect()
     }
 
     #[test]
@@ -263,15 +342,15 @@ mod tests {
                 "{key}"
             );
         }
-        assert_eq!(lower_bound(&[], 5), 0);
-        assert_eq!(lower_bound(&[5], 5), 0);
-        assert_eq!(lower_bound(&[5], 6), 1);
+        assert_eq!(lower_bound::<u32>(&[], 5), 0);
+        assert_eq!(lower_bound(&[5u32], 5), 0);
+        assert_eq!(lower_bound(&[5u32], 6), 1);
     }
 
     #[test]
     fn ties_go_first_and_full_beam_evicts() {
-        let mut b = Beam::new();
-        b.reset(3, 3, false);
+        let mut b = Beam::<u64>::new();
+        b.reset(3, 3, false, true);
         assert_eq!(
             b.insert(5, 5.0, 1, State::Match),
             Inserted::At {
@@ -286,7 +365,7 @@ mod tests {
         assert_eq!(b.insert(8, 8.0, 4, State::Match), Inserted::Dropped);
         // Equal to the last key: inserted, the old last entry is evicted.
         assert_eq!(
-            b.insert(7, 7.0, 5, State::Match),
+            b.insert(7, 7.5, 5, State::Match),
             Inserted::At {
                 rank: 2,
                 evicted: Some(3)
@@ -294,52 +373,63 @@ mod tests {
         );
         assert_eq!(ids(&b), [2, 1, 5]);
         assert_eq!(b.worst_key(), Some(7));
+        assert_eq!(b.entry(2).d, 7.5);
+    }
+
+    #[test]
+    fn distances_from_keys() {
+        let mut b = Beam::<u32>::new();
+        b.reset(4, 4, false, false);
+        b.insert(fkey(2.5), 2.5, 1, State::Unknown);
+        b.insert(fkey(0.5), 0.5, 2, State::Unknown);
+        let d: Vec<f32> = b.entries().map(|e| e.d).collect();
+        assert_eq!(d, [0.5, 2.5]);
     }
 
     #[test]
     fn cursor_follows_insertions_and_search_l() {
-        let mut b = Beam::new();
-        b.reset(4, 2, false);
+        let mut b = Beam::<u32>::new();
+        b.reset(4, 2, false, true);
         b.insert(10, 10.0, 1, State::Match);
         b.insert(20, 20.0, 2, State::Match);
         b.insert(30, 30.0, 3, State::Match);
-        assert_eq!(b.pop().map(|e| e.id), Some(1));
-        assert_eq!(b.pop().map(|e| e.id), Some(2));
+        assert_eq!(b.pop(), Some(1));
+        assert_eq!(b.pop(), Some(2));
         // Position 2 is outside the expandable prefix.
         assert!(!b.has_unexpanded() && b.pop().is_none());
         b.insert(15, 15.0, 4, State::Match);
         assert_eq!(b.peek_key(), Some(15));
-        assert_eq!(b.pop().map(|e| e.id), Some(4));
+        assert_eq!(b.pop(), Some(4));
         b.resize(4);
-        assert_eq!(b.pop().map(|e| e.id), Some(3));
+        assert_eq!(b.pop(), Some(3));
         assert!(b.pop().is_none());
-        assert!(b.entries().iter().all(|e| e.expanded));
+        assert!(b.entries().all(|e| e.expanded));
     }
 
     #[test]
     fn resizable_beam_never_evicts() {
-        let mut b = Beam::new();
-        b.reset(2, 2, true);
+        let mut b = Beam::<u32>::new();
+        b.reset(2, 2, true, true);
         for i in 0..10u32 {
-            b.insert(u64::from(100 - i), 0.0, i, State::Unknown);
+            b.insert(100 - i, 0.0, i, State::Unknown);
         }
         assert_eq!(b.len(), 10);
         assert!(!b.is_full());
         let mut popped = Vec::new();
-        while let Some(e) = b.pop() {
-            popped.push(e.id);
+        while let Some(id) = b.pop() {
+            popped.push(id);
         }
         assert_eq!(popped, (0..10).rev().collect::<Vec<_>>());
     }
 
     #[test]
     fn mark_expanded_advances_the_cursor() {
-        let mut b = Beam::new();
-        b.reset(4, 4, false);
+        let mut b = Beam::<u32>::new();
+        b.reset(4, 4, false, true);
         b.insert(1, 1.0, 7, State::Match);
         b.insert(2, 2.0, 8, State::Match);
         assert!(b.mark_expanded(7));
         assert!(!b.mark_expanded(7) && !b.mark_expanded(99));
-        assert_eq!(b.pop().map(|e| e.id), Some(8));
+        assert_eq!(b.pop(), Some(8));
     }
 }

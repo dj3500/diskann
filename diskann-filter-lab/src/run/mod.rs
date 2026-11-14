@@ -18,7 +18,11 @@
 //!   (re-shuffled per (repetition, effort)), the queries in panel order;
 //! - per query: `cpu_t0 → wall_t0 → search (predicate compilation, routing, starts, pilot,
 //!   materialization, the loop, collection, scratch resets, output copy) → wall_t1 →
-//!   cpu_t1`, with `CLOCK_THREAD_CPUTIME_ID` read outside the wall-clock interval.
+//!   cpu_t1`, with `CLOCK_THREAD_CPUTIME_ID` read outside the wall-clock interval;
+//! - configurations that are exactly the `postfilter` or `upstream-inline` preset run their
+//!   hand-specialized loop (same answers and counters, a few percent faster than the
+//!   configurable loop); `fast_paths = false` runs everything in the configurable loop, and
+//!   `run.json` records the loop used (`config.fast_path`).
 //!
 //! Outputs per run directory: `run.json` (tool, dataset, panel, index, the resolved
 //! configuration, K, efforts, mode, host, placement, load, calibration, per-effort summary),
@@ -49,7 +53,7 @@ use crate::{
     kernel::{
         config::StartSource,
         entry::SampleIndex,
-        search::{Counters, Index, Plan, Query, Searcher},
+        search::{Counters, FastPath, Index, Plan, Query, Searcher},
         trace::Trace,
     },
     vectors::{DType, Element},
@@ -370,7 +374,10 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             view_postings,
             eps_min: eps,
         };
-        let plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
+        let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
+        if !exp.fast_paths {
+            plan = plan.generic();
+        }
         indices.push(ix);
         plans.push(plan);
     }
@@ -463,6 +470,11 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "kernel": cx.plans[ci].kernel.to_json(),
                 "two_hop_cap": cx.plans[ci].two_hop_cap(),
                 "view": c.view,
+                // Trace and reference searches always run the configurable loop.
+                "fast_path": match exp.mode {
+                    Mode::Timed => cx.plans[ci].fast_path().name(),
+                    Mode::Trace | Mode::Reference => FastPath::None.name(),
+                },
             });
             let hash_input = json!({
                 "experiment": exp.name, "config": config_json, "K": k, "efforts": out.efforts,

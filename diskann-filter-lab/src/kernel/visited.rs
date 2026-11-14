@@ -12,6 +12,16 @@ pub struct Visited {
     epoch: u32,
 }
 
+impl Default for Visited {
+    /// The empty set over no ids.
+    fn default() -> Self {
+        Self {
+            stamps: Vec::new(),
+            epoch: 1,
+        }
+    }
+}
+
 impl Visited {
     /// A set over `0..n`. The stamp array is written element by element (not allocated as
     /// lazily mapped zero pages), so no page fault happens during a search.

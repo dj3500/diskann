@@ -10,9 +10,11 @@ use std::marker::PhantomData;
 use anyhow::{bail, ensure, Result};
 
 use super::{
-    beam::{Beam, Inserted, State},
+    beam::{Beam, BeamKey, Inserted, State},
     collect::{Answers, Collector},
-    config::{Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Scorer},
+    config::{
+        Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
+    },
     config::{StartAdmission, StartSource, Terminator},
     entry::{self, SampleIndex, StartPredicate},
     eval::{ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList},
@@ -32,6 +34,10 @@ use crate::{
     starts::Starts,
     vectors::Element,
 };
+
+mod special;
+
+pub use special::FastPath;
 
 /// Vectors prefetched ahead of their distance computation.
 const LOOKAHEAD: usize = 8;
@@ -125,6 +131,22 @@ pub struct Counters {
 }
 
 impl Counters {
+    /// Adds the event counts of `o` (not `n_out`, `n_start`, `final_l` or the route).
+    #[inline(always)]
+    pub fn add(&mut self, o: &Counters) {
+        self.n_dist += o.n_dist;
+        self.n_aux_dist += o.n_aux_dist;
+        self.n_pred += o.n_pred;
+        self.n_lazy += o.n_lazy;
+        self.n_expand += o.n_expand;
+        self.n_hops += o.n_hops;
+        self.n_aux_expand += o.n_aux_expand;
+        self.n_two_hop += o.n_two_hop;
+        self.n_match_seen += o.n_match_seen;
+        self.n_evict += o.n_evict;
+        self.n_exact_cand += o.n_exact_cand;
+    }
+
     /// Names of the numeric counters, in [`Self::values`] order.
     pub const NAMES: [&'static str; 14] = [
         "n_dist",
@@ -184,6 +206,7 @@ pub struct Plan {
     pilot: bool,
     complete: bool,
     n_aux: usize,
+    fast: FastPath,
 }
 
 impl Plan {
@@ -254,6 +277,15 @@ impl Plan {
                 "adaptive_l counts matches, which deferred evaluation does not see"
             );
         }
+        let fast = if eval != EvalMode::RowScan {
+            FastPath::None
+        } else if *kernel == Preset::Postfilter.kernel() {
+            FastPath::Postfilter
+        } else if *kernel == Preset::UpstreamInline.kernel() {
+            FastPath::Inline
+        } else {
+            FastPath::None
+        };
         Ok(Self {
             kernel: kernel.clone(),
             projection,
@@ -263,7 +295,20 @@ impl Plan {
             pilot: kernel.scorer.needs_pilot(),
             complete: kernel.needs_g(),
             n_aux: ix.graph.n_aux(),
+            fast,
         })
+    }
+
+    /// The same plan without its hand-specialized fast path (every query runs the
+    /// configurable loop).
+    pub fn generic(mut self) -> Self {
+        self.fast = FastPath::None;
+        self
+    }
+
+    /// The fast path this plan uses for graph searches (see [`FastPath`]).
+    pub fn fast_path(&self) -> FastPath {
+        self.fast
     }
 
     /// The two-hop truncation used by this plan.
@@ -371,7 +416,8 @@ pub(crate) struct Cand {
 /// Reusable per-run scratch and the per-query flow.
 #[derive(Debug)]
 pub struct Searcher {
-    beam: Beam,
+    beam32: Beam<u32>,
+    beam64: Beam<u64>,
     visited: Visited,
     bits: Vec<u64>,
     compiled: Compiled,
@@ -401,7 +447,8 @@ impl Searcher {
         let mut bits = Vec::with_capacity(n_labels);
         bits.resize(n_labels, 0);
         Self {
-            beam: Beam::new(),
+            beam32: Beam::new(),
+            beam64: Beam::new(),
             visited: Visited::new(n_nodes),
             bits,
             compiled: Compiled::new(),
@@ -433,9 +480,9 @@ impl Searcher {
         )
     }
 
-    /// The final beam of the last graph search (diagnostics).
-    pub fn beam(&self) -> &Beam {
-        &self.beam
+    /// The final beam of the last graph search with `f32` keys (diagnostics).
+    pub fn beam(&self) -> &Beam<u32> {
+        &self.beam32
     }
 
     /// Answers query `q` with list size `l`, writing `ids.len()` = K results (ids and true
@@ -478,13 +525,7 @@ impl Searcher {
             0
         } else if exact_threshold.is_some_and(|t| self.compiled.min_upper_bound() <= t) {
             ctr.route = Route::Exact;
-            let cx = EvalCtx {
-                labels: ix.labels,
-                q: &self.compiled,
-                bits: &self.bits,
-                dense: &[],
-                sparse: &[],
-            };
+            let cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
             exact::run(
                 kernel.exact,
                 plan.eval == EvalMode::ClauseSearch,
@@ -522,13 +563,7 @@ impl Searcher {
                 n_data: ix.graph.n_data() as u32,
                 n_nodes: ix.graph.n_nodes() as u32,
             };
-            let cx = EvalCtx {
-                labels: ix.labels,
-                q: &self.compiled,
-                bits: &self.bits,
-                dense: &[],
-                sparse: &[],
-            };
+            let cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
             entry::select(
                 &inputs,
                 &cx,
@@ -539,19 +574,27 @@ impl Searcher {
                 &mut ctr,
             );
             ctr.n_start = self.starts.len() as u64;
-            dispatch(
-                plan.eval,
-                plan.family,
-                self,
-                plan,
-                ix,
-                q,
-                l,
-                reference,
-                &mut ctr,
-                ids,
-                dists,
-            )
+            match plan.fast {
+                FastPath::Postfilter if reference.is_none() && self.trace.is_none() => {
+                    self.fast_postfilter(ix, q, l, &mut ctr, ids, dists)
+                }
+                FastPath::Inline if reference.is_none() && self.trace.is_none() => {
+                    self.fast_inline(ix, q, l, &mut ctr, ids, dists)
+                }
+                _ => dispatch(
+                    plan.eval,
+                    plan.family,
+                    self,
+                    plan,
+                    ix,
+                    q,
+                    l,
+                    reference,
+                    &mut ctr,
+                    ids,
+                    dists,
+                ),
+            }
         };
         self.compiled.clear_bits(&mut self.bits);
         ids[n..].fill(u32::MAX);
@@ -653,14 +696,8 @@ impl Adaptive {
         self.on && self.next.is_some()
     }
 
-    #[inline(always)]
-    fn count(&mut self, m: bool) {
-        self.visited += 1;
-        self.matched += usize::from(m);
-    }
-
     /// End of a step: resizes the beam when the sample count is reached (upstream).
-    fn end_of_step(&mut self, beam: &mut Beam, view: &mut usize) {
+    fn end_of_step<K: BeamKey>(&mut self, beam: &mut Beam<K>, view: &mut usize) {
         let Some(next) = self.next else { return };
         if !self.on || self.visited < next {
             return;
@@ -715,10 +752,13 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     aux_g: f32,
     n_data: u32,
     lazy_ok: bool,
-    beam: &'r mut Beam,
-    visited: &'r mut Visited,
-    answers: &'r mut Answers,
-    ctr: &'r mut Counters,
+    // The beam, the visited set, the answers and the counters are held by value (moved out of
+    // the `Searcher` for the query), so that the hot loop, which takes `&mut self`, knows that
+    // nothing else aliases them and keeps their state in registers.
+    beam: Beam<S::Key>,
+    visited: Visited,
+    answers: Answers,
+    ctr: Counters,
     trace: Option<&'r mut Trace>,
     _p: PhantomData<P>,
 }
@@ -731,21 +771,108 @@ enum AdmissionRule {
     Cutoff(u32),
 }
 
+/// Laziness codes of the per-expansion neighbour loops.
+const EAGER: u8 = 0;
+const DEFERRED: u8 = 1;
+const PREDICATE_FIRST: u8 = 2;
+const DISTANCE_FIRST: u8 = 3;
+
+/// Records an insertion (trace mode; kept out of the hot loop).
+#[cold]
+#[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "trace columns")]
+fn trace_insert<S: Score>(
+    t: &mut Trace,
+    sc: S,
+    res: Inserted,
+    key: S::Key,
+    d: f32,
+    v: u32,
+    source: Option<u32>,
+    p: Option<PredOut>,
+    complete: bool,
+    outcome: &'static str,
+) {
+    let (rank, evicted) = match res {
+        Inserted::Dropped => (None, None),
+        Inserted::At { rank, evicted } => (Some(rank), evicted),
+    };
+    t.offer(
+        v,
+        source,
+        Some(d),
+        Some(sc.describe(key)),
+        p.map(|p| p.m),
+        p.filter(|_| complete).map(|p| p.g),
+        outcome,
+        rank,
+        evicted,
+    );
+}
+
+/// Records a node that did not enter the beam (trace mode).
+#[cold]
+#[inline(never)]
+fn trace_note(
+    t: &mut Trace,
+    v: u32,
+    source: Option<u32>,
+    d: Option<f32>,
+    p: Option<PredOut>,
+    complete: bool,
+    outcome: &'static str,
+) {
+    t.offer(
+        v,
+        source,
+        d,
+        None,
+        p.map(|p| p.m),
+        p.filter(|_| complete).map(|p| p.g),
+        outcome,
+        None,
+        None,
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn trace_answer(t: &mut Trace, v: u32, d: f32, evicted: Option<u32>) {
+    t.answer(v, d, evicted);
+}
+
+#[cold]
+#[inline(never)]
+fn trace_expand(t: &mut Trace, id: u32, new_step: bool) {
+    t.expand(id, new_step);
+}
+
+#[cold]
+#[inline(never)]
+fn trace_two_hop(t: &mut Trace, cands: &[Cand], cap: usize) {
+    for (rank, c) in cands.iter().enumerate() {
+        t.two_hop(c.id, c.d, rank, rank < cap);
+    }
+}
+
 impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
+    // The per-node methods count into `c`, a local of the caller (merged into `self.ctr` once
+    // per expansion), so that the counters live in registers in the hot loop.
+
     #[inline(always)]
-    fn distance(&mut self, v: u32, cached: Option<f32>) -> f32 {
+    fn distance(&self, v: u32, cached: Option<f32>, c: &mut Counters) -> f32 {
         match cached {
             Some(d) => d,
             None => {
-                self.ctr.n_dist += 1;
+                c.n_dist += 1;
                 T::squared_l2(self.qv, self.vectors.get(v))
             }
         }
     }
 
     #[inline(always)]
-    fn pred(&mut self, v: u32) -> PredOut {
-        self.ctr.n_pred += 1;
+    fn pred(&self, v: u32, c: &mut Counters) -> PredOut {
+        c.n_pred += 1;
         P::eval(&self.cx, v, self.complete)
     }
 
@@ -774,25 +901,31 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
     /// Collects a navigation match (completing the full predicate under a projection) and
     /// returns the beam state of the node.
     #[inline(always)]
-    fn collect(&mut self, v: u32, d: f32, p: PredOut) -> State {
+    fn collect<const TRACE: bool>(
+        &mut self,
+        v: u32,
+        d: f32,
+        p: PredOut,
+        c: &mut Counters,
+    ) -> State {
         if !p.m {
             return State::NoMatch;
         }
-        self.ctr.n_match_seen += 1;
+        c.n_match_seen += 1;
         if self.projected {
             if self.collector == Collector::FinalBeam {
                 return State::Partial;
             }
-            self.ctr.n_pred += 1;
+            c.n_pred += 1;
             if !P::full(&self.cx, v) {
                 return State::NoMatch;
             }
         }
         if self.collector != Collector::FinalBeam {
             let (inserted, evicted) = self.answers.offer(d, v);
-            if inserted {
+            if TRACE && inserted {
                 if let Some(t) = self.trace.as_deref_mut() {
-                    t.answer(v, d, evicted);
+                    trace_answer(t, v, d, evicted);
                 }
             }
         }
@@ -801,44 +934,44 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
 
     #[inline(always)]
     #[expect(clippy::too_many_arguments, reason = "trace columns")]
-    fn insert(
+    fn insert<const TRACE: bool>(
         &mut self,
-        key: u64,
+        key: S::Key,
         d: f32,
         v: u32,
         state: State,
         source: Option<u32>,
         p: Option<PredOut>,
         outcome: &'static str,
+        c: &mut Counters,
     ) {
         let res = self.beam.insert(key, d, v, state);
         if let Inserted::At {
             evicted: Some(_), ..
         } = res
         {
-            self.ctr.n_evict += 1;
+            c.n_evict += 1;
         }
-        if let Some(t) = self.trace.as_deref_mut() {
-            let (rank, evicted) = match res {
-                Inserted::Dropped => (None, None),
-                Inserted::At { rank, evicted } => (Some(rank), evicted),
-            };
-            t.offer(
-                v,
-                source,
-                Some(d),
-                Some(self.sc.describe(key)),
-                p.map(|p| p.m),
-                p.filter(|_| self.complete).map(|p| p.g),
-                outcome,
-                rank,
-                evicted,
-            );
+        if TRACE {
+            if let Some(t) = self.trace.as_deref_mut() {
+                trace_insert(
+                    t,
+                    self.sc,
+                    res,
+                    key,
+                    d,
+                    v,
+                    source,
+                    p,
+                    self.complete,
+                    outcome,
+                );
+            }
         }
     }
 
     #[inline(always)]
-    fn trace_only(
+    fn trace_only<const TRACE: bool>(
         &mut self,
         v: u32,
         source: Option<u32>,
@@ -846,123 +979,148 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
         p: Option<PredOut>,
         outcome: &'static str,
     ) {
-        if let Some(t) = self.trace.as_deref_mut() {
-            t.offer(
-                v,
-                source,
-                d,
-                None,
-                p.map(|p| p.m),
-                p.filter(|_| self.complete).map(|p| p.g),
-                outcome,
-                None,
-                None,
-            );
+        if TRACE {
+            if let Some(t) = self.trace.as_deref_mut() {
+                trace_note(t, v, source, d, p, self.complete, outcome);
+            }
         }
     }
 
     /// Places an evaluated node: collection, then admission to the beam.
     #[inline(always)]
-    fn place(&mut self, v: u32, d: f32, p: PredOut, source: Option<u32>) -> Outcome {
-        let state = self.collect(v, d, p);
+    fn place<const TRACE: bool>(
+        &mut self,
+        v: u32,
+        d: f32,
+        p: PredOut,
+        source: Option<u32>,
+        c: &mut Counters,
+    ) -> Outcome {
+        let state = self.collect::<TRACE>(v, d, p, c);
         if self.admits(p) {
             let key = self.sc.key(d, p.m, p.g);
-            self.insert(key, d, v, state, source, Some(p), "admitted");
+            self.insert::<TRACE>(key, d, v, state, source, Some(p), "admitted", c);
             Outcome::Admitted
         } else {
-            self.trace_only(v, source, Some(d), Some(p), "rejected");
+            self.trace_only::<TRACE>(v, source, Some(d), Some(p), "rejected");
             Outcome::Rejected(d)
         }
     }
 
     #[inline(always)]
-    fn navigate_aux(&mut self, v: u32, source: Option<u32>, cached: Option<f32>) {
-        let d = match cached {
-            Some(d) => d,
-            None => {
-                self.ctr.n_aux_dist += 1;
-                self.distance(v, None)
-            }
-        };
+    fn navigate_aux<const TRACE: bool>(
+        &mut self,
+        v: u32,
+        source: Option<u32>,
+        cached: Option<f32>,
+        c: &mut Counters,
+    ) {
+        if cached.is_none() {
+            c.n_aux_dist += 1;
+        }
+        let d = self.distance(v, cached, c);
         let key = self.sc.key(d, false, self.aux_g);
-        self.insert(key, d, v, State::Aux, source, None, "navigated");
+        self.insert::<TRACE>(key, d, v, State::Aux, source, None, "navigated", c);
     }
 
-    /// Offers a newly visited node; returns the outcome and the navigation match bit.
+    /// Offers a newly visited node with laziness `LZ`; returns the outcome.
     #[inline(always)]
-    fn offer(&mut self, v: u32, source: u32, cached: Option<f32>) -> (Outcome, bool) {
+    fn offer<const LZ: u8, const TRACE: bool>(
+        &mut self,
+        v: u32,
+        source: u32,
+        cached: Option<f32>,
+        c: &mut Counters,
+    ) -> Outcome {
         if v >= self.n_data {
-            self.navigate_aux(v, Some(source), cached);
-            return (Outcome::Navigated, false);
+            self.navigate_aux::<TRACE>(v, Some(source), cached, c);
+            return Outcome::Navigated;
         }
         let src = Some(source);
-        match self.laziness {
-            Laziness::Deferred => {
-                let d = self.distance(v, cached);
+        match LZ {
+            DEFERRED => {
+                let d = self.distance(v, cached, c);
                 let key = self.sc.key(d, false, 0.0);
-                self.insert(key, d, v, State::Unknown, src, None, "admitted");
-                (Outcome::Admitted, false)
+                self.insert::<TRACE>(key, d, v, State::Unknown, src, None, "admitted", c);
+                Outcome::Admitted
             }
-            Laziness::PredicateFirst => {
-                let p = self.pred(v);
+            PREDICATE_FIRST => {
+                let p = self.pred(v, c);
                 if !self.admits(p) {
-                    self.trace_only(v, src, None, Some(p), "rejected");
-                    return (Outcome::Rejected(f32::NAN), p.m);
+                    self.trace_only::<TRACE>(v, src, None, Some(p), "rejected");
+                    return Outcome::Rejected(f32::NAN);
                 }
-                let d = self.distance(v, cached);
-                (self.place(v, d, p, src), p.m)
+                let d = self.distance(v, cached, c);
+                self.place::<TRACE>(v, d, p, src, c)
             }
-            Laziness::DistanceFirst => {
-                let d = self.distance(v, cached);
+            DISTANCE_FIRST => {
+                let d = self.distance(v, cached, c);
                 if self.lazy_ok && self.skip_safe(d) {
-                    self.ctr.n_lazy += 1;
-                    self.trace_only(v, src, Some(d), None, "lazily_skipped");
-                    return (Outcome::Skipped, false);
+                    c.n_lazy += 1;
+                    self.trace_only::<TRACE>(v, src, Some(d), None, "lazily_skipped");
+                    return Outcome::Skipped;
                 }
-                let p = self.pred(v);
-                (self.place(v, d, p, src), p.m)
+                let p = self.pred(v, c);
+                self.place::<TRACE>(v, d, p, src, c)
             }
-            Laziness::Eager => {
-                let d = self.distance(v, cached);
-                let p = self.pred(v);
-                (self.place(v, d, p, src), p.m)
+            _ => {
+                let d = self.distance(v, cached, c);
+                let p = self.pred(v, c);
+                self.place::<TRACE>(v, d, p, src, c)
             }
+        }
+    }
+
+    /// [`Self::offer`] with the run's laziness (dispatched per node: for the pilot only).
+    fn offer_any(&mut self, v: u32, source: u32, cached: Option<f32>, c: &mut Counters) -> Outcome {
+        match self.laziness {
+            Laziness::Eager => self.offer::<EAGER, true>(v, source, cached, c),
+            Laziness::Deferred => self.offer::<DEFERRED, true>(v, source, cached, c),
+            Laziness::PredicateFirst => self.offer::<PREDICATE_FIRST, true>(v, source, cached, c),
+            Laziness::DistanceFirst => self.offer::<DISTANCE_FIRST, true>(v, source, cached, c),
         }
     }
 
     /// Offers a start (marked visited by the selection).
     fn offer_start(&mut self, s: u32, cached: Option<f32>) {
+        let mut c = Counters::default();
+        self.offer_start_into(s, cached, &mut c);
+        self.ctr.add(&c);
+    }
+
+    #[inline(always)]
+    fn offer_start_into(&mut self, s: u32, cached: Option<f32>, c: &mut Counters) {
         if s >= self.n_data {
-            self.navigate_aux(s, None, cached);
+            self.navigate_aux::<true>(s, None, cached, c);
             return;
         }
         match (self.start_admission, self.laziness) {
             (_, Laziness::Deferred) => {
-                let d = self.distance(s, cached);
+                let d = self.distance(s, cached, c);
                 let key = self.sc.key(d, false, 0.0);
-                self.insert(key, d, s, State::Unknown, None, None, "admitted");
+                self.insert::<true>(key, d, s, State::Unknown, None, None, "admitted", c);
             }
             (StartAdmission::Force, _) => {
-                let p = self.pred(s);
-                let d = self.distance(s, cached);
-                let state = self.collect(s, d, p);
+                let p = self.pred(s, c);
+                let d = self.distance(s, cached, c);
+                let state = self.collect::<true>(s, d, p, c);
                 let key = self.sc.key(d, p.m, p.g);
                 let outcome = if self.admits(p) { "admitted" } else { "forced" };
-                self.insert(key, d, s, state, None, Some(p), outcome);
+                self.insert::<true>(key, d, s, state, None, Some(p), outcome, c);
             }
             (StartAdmission::Obey, Laziness::PredicateFirst) => {
-                let p = self.pred(s);
+                let p = self.pred(s, c);
                 if !self.admits(p) {
-                    self.trace_only(s, None, cached, Some(p), "rejected");
+                    self.trace_only::<true>(s, None, cached, Some(p), "rejected");
                     return;
                 }
-                let d = self.distance(s, cached);
-                self.place(s, d, p, None);
+                let d = self.distance(s, cached, c);
+                self.place::<true>(s, d, p, None, c);
             }
             (StartAdmission::Obey, _) => {
-                let d = self.distance(s, cached);
-                let p = self.pred(s);
-                self.place(s, d, p, None);
+                let d = self.distance(s, cached, c);
+                let p = self.pred(s, c);
+                self.place::<true>(s, d, p, None, c);
             }
         }
     }
@@ -975,22 +1133,23 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
         }
     }
 
-    /// Expands node `n`: offers its unvisited neighbours.
+    /// Expands node `n`: offers its unvisited neighbours (collecting the rejected ones for a
+    /// second hop with `TWO_HOP`).
     #[inline(always)]
-    fn expand(
+    fn expand<const LZ: u8, const TWO_HOP: bool, const TRACE: bool>(
         &mut self,
         n: u32,
         nbrs: &mut Vec<u32>,
         rejected: &mut Vec<Cand>,
-        two_hop: bool,
         adaptive: &mut Adaptive,
+        c: &mut Counters,
     ) {
         let graph = self.graph;
-        self.ctr.n_hops += 1;
+        c.n_hops += 1;
         if n >= self.n_data {
-            self.ctr.n_aux_expand += 1;
+            c.n_aux_expand += 1;
         }
-        let rows = P::ROWS && self.laziness != Laziness::Deferred;
+        let rows = P::ROWS && LZ != DEFERRED;
         nbrs.clear();
         for &v in graph.neighbors(n) {
             if !self.visited.test_and_set(v) {
@@ -1005,50 +1164,189 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
         for &v in &nbrs[..la] {
             self.prefetch(v, rows);
         }
+        let matched = c.n_match_seen;
         for i in 0..len {
             if i + la < len {
                 self.prefetch(nbrs[i + la], rows);
             }
             let v = nbrs[i];
-            let (outcome, m) = self.offer(v, n, None);
-            if adaptive.on {
-                adaptive.count(m);
-            }
-            if two_hop {
+            let outcome = self.offer::<LZ, TRACE>(v, n, None, c);
+            if TWO_HOP {
                 if let Outcome::Rejected(d) = outcome {
                     rejected.push(Cand { id: v, d });
                 }
             }
         }
+        if adaptive.on {
+            // Upstream counts every evaluated one-hop neighbour and its matches.
+            adaptive.visited += len;
+            adaptive.matched += (c.n_match_seen - matched) as usize;
+        }
+    }
+
+    /// The search loop: until the beam has no unexpanded node or the terminator stops, expand
+    /// the `W` closest unexpanded nodes (then the second hop, then adaptive resizing). Not
+    /// inlined, and monomorphized over the laziness and the expander (dispatched once per
+    /// query): as a function of its own, `self` is a non-aliased argument and the whole loop
+    /// keeps the search state and the counters in registers.
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the loop's scratch and parameters"
+    )]
+    fn search_loop<const LZ: u8, const TWO_HOP: bool, const TRACE: bool>(
+        &mut self,
+        terminator: Terminator,
+        beam_width: usize,
+        two_hop_cap: usize,
+        frontier: &mut Vec<u32>,
+        nbrs: &mut Vec<u32>,
+        rejected: &mut Vec<Cand>,
+        adaptive: &mut Adaptive,
+        view: &mut usize,
+    ) {
+        let mut c = Counters::default();
+        let base_dist = self.ctr.n_dist;
+        loop {
+            if !self.beam.has_unexpanded() {
+                break;
+            }
+            match terminator {
+                Terminator::Budget(w) => {
+                    if base_dist + c.n_dist >= w {
+                        break;
+                    }
+                }
+                Terminator::MatchAware => {
+                    if self.answers.is_full() {
+                        if let Some(kmin) = self.beam.peek_key() {
+                            if self.sc.dist_lower_bound(kmin) > self.answers.worst() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Terminator::Exhaust | Terminator::AdaptiveL { .. } => {}
+            }
+            frontier.clear();
+            while frontier.len() < beam_width {
+                match self.beam.pop() {
+                    Some(id) => {
+                        if TRACE {
+                            if let Some(t) = self.trace.as_deref_mut() {
+                                trace_expand(t, id, frontier.is_empty());
+                            }
+                        }
+                        frontier.push(id);
+                    }
+                    None => break,
+                }
+            }
+            c.n_expand += frontier.len() as u64;
+            if TWO_HOP {
+                rejected.clear();
+            }
+            for &n in frontier.iter() {
+                self.expand::<LZ, TWO_HOP, TRACE>(n, nbrs, rejected, adaptive, &mut c);
+            }
+            if TWO_HOP {
+                self.two_hop::<TRACE>(rejected, two_hop_cap, &mut c);
+            }
+            if adaptive.on {
+                adaptive.end_of_step(&mut self.beam, view);
+                self.lazy_ok = !adaptive.sampling();
+            }
+        }
+        self.ctr.add(&c);
+    }
+
+    /// [`Self::search_loop`] for the run's laziness and expander.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the loop's scratch and parameters"
+    )]
+    fn search(
+        &mut self,
+        two_hop: bool,
+        terminator: Terminator,
+        beam_width: usize,
+        two_hop_cap: usize,
+        frontier: &mut Vec<u32>,
+        nbrs: &mut Vec<u32>,
+        rejected: &mut Vec<Cand>,
+        adaptive: &mut Adaptive,
+        view: &mut usize,
+    ) {
+        let traced = self.trace.is_some();
+        macro_rules! go {
+            ($lz:expr, $th:expr) => {
+                if traced {
+                    self.search_loop::<{ $lz }, { $th }, true>(
+                        terminator,
+                        beam_width,
+                        two_hop_cap,
+                        frontier,
+                        nbrs,
+                        rejected,
+                        adaptive,
+                        view,
+                    )
+                } else {
+                    self.search_loop::<{ $lz }, { $th }, false>(
+                        terminator,
+                        beam_width,
+                        two_hop_cap,
+                        frontier,
+                        nbrs,
+                        rejected,
+                        adaptive,
+                        view,
+                    )
+                }
+            };
+        }
+        match (self.laziness, two_hop) {
+            (Laziness::Eager, true) => go!(EAGER, true),
+            (Laziness::Eager, false) => go!(EAGER, false),
+            (Laziness::Deferred, _) => go!(DEFERRED, false),
+            (Laziness::PredicateFirst, _) => go!(PREDICATE_FIRST, false),
+            (Laziness::DistanceFirst, _) => go!(DISTANCE_FIRST, false),
+        }
     }
 
     /// Upstream multihop's second hop over the step's rejected neighbours.
-    fn two_hop(&mut self, rejected: &mut Vec<Cand>, cap: usize) {
+    #[inline(always)]
+    fn two_hop<const TRACE: bool>(
+        &mut self,
+        rejected: &mut Vec<Cand>,
+        cap: usize,
+        c: &mut Counters,
+    ) {
         rejected
             .sort_unstable_by(|a, b| a.d.partial_cmp(&b.d).unwrap_or(std::cmp::Ordering::Equal));
-        if let Some(t) = self.trace.as_deref_mut() {
-            for (rank, c) in rejected.iter().enumerate() {
-                t.two_hop(c.id, c.d, rank, rank < cap);
+        if TRACE {
+            if let Some(t) = self.trace.as_deref_mut() {
+                trace_two_hop(t, rejected, cap);
             }
         }
         rejected.truncate(cap);
         let graph = self.graph;
-        for c in rejected.iter() {
-            self.ctr.n_hops += 1;
-            for &u in graph.neighbors(c.id) {
+        for cand in rejected.iter() {
+            c.n_hops += 1;
+            for &u in graph.neighbors(cand.id) {
                 if u >= self.n_data || self.visited.contains(u) {
                     continue;
                 }
-                let p = self.pred(u);
+                let p = self.pred(u, c);
                 if !self.admits(p) {
                     continue;
                 }
                 self.visited.insert(u);
-                let d = self.distance(u, None);
-                let state = self.collect(u, d, p);
+                let d = self.distance(u, None, c);
+                let state = self.collect::<TRACE>(u, d, p, c);
                 let key = self.sc.key(d, p.m, p.g);
-                self.insert(key, d, u, state, Some(c.id), Some(p), "admitted");
-                self.ctr.n_two_hop += 1;
+                self.insert::<TRACE>(key, d, u, state, Some(cand.id), Some(p), "admitted", c);
+                c.n_two_hop += 1;
             }
         }
     }
@@ -1068,7 +1366,8 @@ fn run<T: Element, P: Eval, S: Score>(
     dists: &mut [f32],
 ) -> usize {
     let Searcher {
-        beam,
+        beam32,
+        beam64,
         visited,
         bits,
         compiled,
@@ -1134,14 +1433,9 @@ fn run<T: Element, P: Eval, S: Score>(
         }
         Materializer::None => {}
     }
-    let cx = EvalCtx {
-        labels: ix.labels,
-        q: compiled,
-        bits,
-        dense: &mat.dense,
-        sparse: &mat.sparse,
-    };
+    let cx = EvalCtx::new(ix.labels, compiled, bits, &mat.dense, &mat.sparse);
     let sc = S::new(&plan.score_params(compiled, &scales));
+    let mut beam = std::mem::take(S::beam(beam32, beam64));
 
     let n_starts = starts.len();
     let (capacity, mut view) = match (reference, kernel.padding) {
@@ -1149,7 +1443,7 @@ fn run<T: Element, P: Eval, S: Score>(
         (None, Padding::Upstream) => (l + n_starts, l),
         (None, Padding::Cxx) => (l.max(n_starts).max(1), usize::MAX),
     };
-    beam.reset(capacity, capacity, reference.is_some());
+    beam.reset(capacity, capacity, reference.is_some(), S::STORE_D);
     answers.reset(kernel.collector, k, l);
     let terminator = match reference {
         Some(w) => Terminator::Budget(w),
@@ -1179,9 +1473,9 @@ fn run<T: Element, P: Eval, S: Score>(
         n_data,
         lazy_ok: !adaptive.sampling(),
         beam,
-        visited,
-        answers,
-        ctr,
+        visited: std::mem::take(visited),
+        answers: std::mem::take(answers),
+        ctr: *ctr,
         trace: trace.as_mut(),
         _p: PhantomData,
     };
@@ -1204,75 +1498,46 @@ fn run<T: Element, P: Eval, S: Score>(
             r.ctr.n_aux_expand += 1;
         }
         rejected.clear();
+        let mut c = Counters::default();
         for &(v, d) in &pilot[pilot_starts..] {
-            let (outcome, m) = r.offer(v, g0, Some(d));
-            if adaptive.on {
-                adaptive.count(m);
-            }
+            let outcome = r.offer_any(v, g0, Some(d), &mut c);
             if let (true, Outcome::Rejected(d)) = (two_hop, outcome) {
                 rejected.push(Cand { id: v, d });
             }
         }
-        if two_hop {
-            r.two_hop(rejected, plan.two_hop_cap);
+        if adaptive.on {
+            adaptive.visited += pilot.len() - pilot_starts;
+            adaptive.matched += c.n_match_seen as usize;
         }
-        adaptive.end_of_step(r.beam, &mut view);
+        r.ctr.add(&c);
+        if two_hop {
+            let mut c = Counters::default();
+            r.two_hop::<true>(rejected, plan.two_hop_cap, &mut c);
+            r.ctr.add(&c);
+        }
+        adaptive.end_of_step(&mut r.beam, &mut view);
         r.lazy_ok = !adaptive.sampling();
     }
 
     // The loop.
-    loop {
-        if !r.beam.has_unexpanded() {
-            break;
-        }
-        match terminator {
-            Terminator::Budget(w) => {
-                if r.ctr.n_dist >= w {
-                    break;
-                }
-            }
-            Terminator::MatchAware => {
-                if r.answers.is_full() {
-                    if let Some(kmin) = r.beam.peek_key() {
-                        if r.sc.dist_lower_bound(kmin) > r.answers.worst() {
-                            break;
-                        }
-                    }
-                }
-            }
-            Terminator::Exhaust | Terminator::AdaptiveL { .. } => {}
-        }
-        frontier.clear();
-        while frontier.len() < kernel.beam_width {
-            match r.beam.pop() {
-                Some(e) => {
-                    if let Some(t) = r.trace.as_deref_mut() {
-                        t.expand(e.id, frontier.is_empty());
-                    }
-                    frontier.push(e.id);
-                }
-                None => break,
-            }
-        }
-        r.ctr.n_expand += frontier.len() as u64;
-        rejected.clear();
-        for &n in frontier.iter() {
-            r.expand(n, nbrs, rejected, two_hop, &mut adaptive);
-        }
-        if two_hop {
-            r.two_hop(rejected, plan.two_hop_cap);
-        }
-        if adaptive.on {
-            adaptive.end_of_step(r.beam, &mut view);
-            r.lazy_ok = !adaptive.sampling();
-        }
-    }
+    r.search(
+        two_hop,
+        terminator,
+        kernel.beam_width,
+        plan.two_hop_cap,
+        frontier,
+        nbrs,
+        rejected,
+        &mut adaptive,
+        &mut view,
+    );
 
     // 6. Collection.
     if kernel.collector == Collector::FinalBeam {
         let mut taken = 0;
         let cx = r.cx;
-        for e in r.beam.entries() {
+        for i in 0..r.beam.len() {
+            let e = r.beam.entry(i);
             if e.state == State::Aux {
                 continue;
             }
@@ -1294,7 +1559,18 @@ fn run<T: Element, P: Eval, S: Score>(
         }
     }
     r.ctr.final_l = r.beam.search_l() as u64;
-    r.answers.finish(ids, dists)
+    *ctr = r.ctr;
+    let n = r.answers.finish(ids, dists);
+    let Run {
+        beam: b,
+        visited: v,
+        answers: a,
+        ..
+    } = r;
+    *S::beam(beam32, beam64) = b;
+    *visited = v;
+    *answers = a;
+    n
 }
 
 #[cfg(test)]

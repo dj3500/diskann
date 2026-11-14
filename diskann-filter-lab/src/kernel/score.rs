@@ -17,11 +17,15 @@
 //! | `shell_adaptive(κ)` | `(d + ε_q)·(1 + ρ_q)^{κ·F}`, `F = g / Σw` | [`MultiplicativeScore`] |
 //! | `lexicographic` | `(g, d)` | [`LexicographicScore`] |
 //!
-//! Keys are `u64` whose unsigned order is the order of the scores ([`super::fkey`] of the
-//! `f32` score; `(fkey(g), fkey(d))` for the lexicographic key), so ties are exact `f32` ties.
+//! Keys are unsigned integers whose order is the order of the scores: `u32` [`super::fkey`] of
+//! the `f32` score, or the `u64` `(fkey(g), fkey(d))` for the lexicographic key; ties are exact
+//! `f32` ties.
 //! `s`, `ε_q` and `ρ_q` come from the pilot.
 
-use super::{fkey, funkey};
+use super::{
+    beam::{Beam, BeamKey},
+    fkey, funkey,
+};
 
 /// Per-query parameters of a scorer.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -42,25 +46,48 @@ pub struct Params {
 
 /// A scorer family; a compile-time parameter of the hot loop.
 pub trait Score: Copy + Send + Sync + 'static {
+    /// Beam key type.
+    type Key: BeamKey;
     /// Whether keys depend on `g`.
     const USES_G: bool;
     /// Whether keys depend on the match bit.
     const USES_MATCH: bool;
+    /// Whether the beam must store true distances (they are not the keys).
+    const STORE_D: bool;
     fn new(p: &Params) -> Self;
     /// Key of a node.
-    fn key(&self, d: f32, m: bool, g: f32) -> u64;
+    fn key(&self, d: f32, m: bool, g: f32) -> Self::Key;
     /// The smallest key a node at distance `d` can get (its most favourable outcome).
-    fn key_lower_bound(&self, d: f32) -> u64;
+    fn key_lower_bound(&self, d: f32) -> Self::Key;
     /// `inf {d ≥ 0 : key(d, m, g) ≥ k for some (m, g) that may be in the beam}`: a lower bound
     /// on the true distance of any node with key `≥ k`.
-    fn dist_lower_bound(&self, k: u64) -> f32;
+    fn dist_lower_bound(&self, k: Self::Key) -> f32;
     /// Human-readable value of a key (traces).
-    fn describe(&self, k: u64) -> String;
+    fn describe(&self, k: Self::Key) -> String;
+    /// The beam of this key type.
+    fn beam<'a>(b32: &'a mut Beam<u32>, b64: &'a mut Beam<u64>) -> &'a mut Beam<Self::Key>;
 }
 
 #[inline(always)]
-fn f(k: u64) -> f32 {
-    funkey(k as u32)
+fn f(k: u32) -> f32 {
+    funkey(k)
+}
+
+/// Implements the key type, distance storage and beam selection of an `f32`-keyed family.
+macro_rules! f32_keys {
+    ($store_d:expr) => {
+        type Key = u32;
+        const STORE_D: bool = $store_d;
+
+        fn describe(&self, k: u32) -> String {
+            f(k).to_string()
+        }
+
+        #[inline(always)]
+        fn beam<'a>(b32: &'a mut Beam<u32>, _b64: &'a mut Beam<u64>) -> &'a mut Beam<u32> {
+            b32
+        }
+    };
 }
 
 /// `d`.
@@ -68,6 +95,7 @@ fn f(k: u64) -> f32 {
 pub struct DistanceScore;
 
 impl Score for DistanceScore {
+    f32_keys!(false);
     const USES_G: bool = false;
     const USES_MATCH: bool = false;
 
@@ -76,22 +104,18 @@ impl Score for DistanceScore {
     }
 
     #[inline(always)]
-    fn key(&self, d: f32, _m: bool, _g: f32) -> u64 {
-        u64::from(fkey(d))
+    fn key(&self, d: f32, _m: bool, _g: f32) -> u32 {
+        fkey(d)
     }
 
     #[inline(always)]
-    fn key_lower_bound(&self, d: f32) -> u64 {
-        u64::from(fkey(d))
+    fn key_lower_bound(&self, d: f32) -> u32 {
+        fkey(d)
     }
 
     #[inline(always)]
-    fn dist_lower_bound(&self, k: u64) -> f32 {
+    fn dist_lower_bound(&self, k: u32) -> f32 {
         f(k).max(0.0)
-    }
-
-    fn describe(&self, k: u64) -> String {
-        f(k).to_string()
     }
 }
 
@@ -103,6 +127,7 @@ pub struct BonusScore {
 }
 
 impl Score for BonusScore {
+    f32_keys!(true);
     const USES_G: bool = false;
     const USES_MATCH: bool = true;
 
@@ -114,17 +139,17 @@ impl Score for BonusScore {
     }
 
     #[inline(always)]
-    fn key(&self, d: f32, m: bool, _g: f32) -> u64 {
-        u64::from(fkey(if m { d * self.beta } else { d }))
+    fn key(&self, d: f32, m: bool, _g: f32) -> u32 {
+        fkey(if m { d * self.beta } else { d })
     }
 
     #[inline(always)]
-    fn key_lower_bound(&self, d: f32) -> u64 {
-        u64::from(fkey(d * self.beta.min(1.0)))
+    fn key_lower_bound(&self, d: f32) -> u32 {
+        fkey(d * self.beta.min(1.0))
     }
 
     #[inline(always)]
-    fn dist_lower_bound(&self, k: u64) -> f32 {
+    fn dist_lower_bound(&self, k: u32) -> f32 {
         let k = f(k).max(0.0);
         let as_match = k / self.beta;
         if self.nonmatch_in_beam {
@@ -132,10 +157,6 @@ impl Score for BonusScore {
         } else {
             as_match
         }
-    }
-
-    fn describe(&self, k: u64) -> String {
-        f(k).to_string()
     }
 }
 
@@ -147,6 +168,7 @@ pub struct AdditiveScore {
 }
 
 impl Score for AdditiveScore {
+    f32_keys!(true);
     const USES_G: bool = true;
     const USES_MATCH: bool = false;
 
@@ -158,22 +180,18 @@ impl Score for AdditiveScore {
     }
 
     #[inline(always)]
-    fn key(&self, d: f32, _m: bool, g: f32) -> u64 {
-        u64::from(fkey(d + self.c * g))
+    fn key(&self, d: f32, _m: bool, g: f32) -> u32 {
+        fkey(d + self.c * g)
     }
 
     #[inline(always)]
-    fn key_lower_bound(&self, d: f32) -> u64 {
-        u64::from(fkey(d + self.c.min(0.0) * self.g_max))
+    fn key_lower_bound(&self, d: f32) -> u32 {
+        fkey(d + self.c.min(0.0) * self.g_max)
     }
 
     #[inline(always)]
-    fn dist_lower_bound(&self, k: u64) -> f32 {
+    fn dist_lower_bound(&self, k: u32) -> f32 {
         (f(k) - self.c.max(0.0) * self.g_max).max(0.0)
-    }
-
-    fn describe(&self, k: u64) -> String {
-        f(k).to_string()
     }
 }
 
@@ -187,6 +205,7 @@ pub struct MultiplicativeScore {
 }
 
 impl Score for MultiplicativeScore {
+    f32_keys!(true);
     const USES_G: bool = true;
     const USES_MATCH: bool = false;
 
@@ -199,33 +218,29 @@ impl Score for MultiplicativeScore {
     }
 
     #[inline(always)]
-    fn key(&self, d: f32, _m: bool, g: f32) -> u64 {
+    fn key(&self, d: f32, _m: bool, g: f32) -> u32 {
         let base = d + self.eps;
-        u64::from(fkey(if g == 0.0 {
+        fkey(if g == 0.0 {
             base
         } else {
             base * (self.eta * g).exp()
-        }))
+        })
     }
 
     #[inline(always)]
-    fn key_lower_bound(&self, d: f32) -> u64 {
+    fn key_lower_bound(&self, d: f32) -> u32 {
         let base = d + self.eps;
-        u64::from(fkey(if self.eta >= 0.0 {
+        fkey(if self.eta >= 0.0 {
             base
         } else {
             base * (self.eta * self.g_max).exp()
-        }))
+        })
     }
 
     #[inline(always)]
-    fn dist_lower_bound(&self, k: u64) -> f32 {
+    fn dist_lower_bound(&self, k: u32) -> f32 {
         let worst = (-self.eta.max(0.0) * self.g_max).exp();
         (f(k) * worst - self.eps).max(0.0)
-    }
-
-    fn describe(&self, k: u64) -> String {
-        f(k).to_string()
     }
 }
 
@@ -236,8 +251,15 @@ pub struct LexicographicScore {
 }
 
 impl Score for LexicographicScore {
+    type Key = u64;
     const USES_G: bool = true;
     const USES_MATCH: bool = false;
+    const STORE_D: bool = true;
+
+    #[inline(always)]
+    fn beam<'a>(_b32: &'a mut Beam<u32>, b64: &'a mut Beam<u64>) -> &'a mut Beam<u64> {
+        b64
+    }
 
     fn new(p: &Params) -> Self {
         Self { g_max: p.g_max }
@@ -259,12 +281,12 @@ impl Score for LexicographicScore {
         if self.g_max > g {
             0.0
         } else {
-            f(k).max(0.0)
+            f(k as u32).max(0.0)
         }
     }
 
     fn describe(&self, k: u64) -> String {
-        format!("{}|{}", funkey((k >> 32) as u32), f(k))
+        format!("{}|{}", funkey((k >> 32) as u32), f(k as u32))
     }
 }
 
@@ -331,7 +353,7 @@ mod tests {
         assert_eq!(l.dist_lower_bound(l.key(9.0, false, 2.0)), 9.0);
 
         let m = MultiplicativeScore::new(&p);
-        assert_eq!(m.key(1.0, true, 0.0), u64::from(fkey(3.0)));
+        assert_eq!(m.key(1.0, true, 0.0), fkey(3.0));
         assert!(
             m.key(0.0, false, 1.0) > m.key(0.0, true, 0.0),
             "ε penalizes duplicates"

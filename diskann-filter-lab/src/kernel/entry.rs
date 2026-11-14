@@ -278,13 +278,7 @@ mod tests {
         let mut bits = vec![0u64; labels.n_labels()];
         let mut q = Compiled::new();
         q.compile(&labels, preds.get(0), Weights::Unit, None, &mut bits);
-        let cx = EvalCtx {
-            labels: &labels,
-            q: &q,
-            bits: &bits,
-            dense: &[],
-            sparse: &[],
-        };
+        let cx = EvalCtx::new(&labels, &q, &bits, &[], &[]);
         let run = |k: usize, mode: SampleStart| {
             let inp = Inputs {
                 sources: &[StartSource::Sample(k), StartSource::Global],

@@ -23,8 +23,10 @@
 //! Roles ([`config::Kernel`]): `PredicateEval` (mode 1 row scan, mode 2 per-clause search, a
 //! materialized bitmap), `Materializer`, `Admission`, `Laziness`, `Scorer`, `Collector`,
 //! `Expander`, `Terminator`, `Starts` (with a start-admission policy) and `ExactPath`.
-//! Only the element type, the predicate mode and the scorer family are compile-time
-//! parameters of the hot loop; the other per-neighbour roles are enums matched in the loop.
+//! The element type, the predicate mode and the scorer family are compile-time parameters
+//! (dispatched once per plan), and so are the laziness, the expander and tracing (dispatched
+//! once per query); the other roles are enums matched in the loop. The `postfilter` and
+//! `upstream-inline` presets also have hand-specialized loops ([`search::FastPath`]).
 //!
 //! The beam keeps upstream DiskANN's tie rule (a new entry goes before existing entries with
 //! an equal key) and stores `(key, true distance, id)`. Auxiliary nodes (ids `≥ n_data`) are

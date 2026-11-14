@@ -667,7 +667,7 @@ fn exact_duplicates_follow_the_upstream_tie_rule() {
         &mut d,
         None,
     );
-    let order: Vec<u32> = st.beam().entries().iter().map(|e| e.id).collect();
+    let order: Vec<u32> = st.beam().entries().map(|e| e.id).collect();
     assert_eq!(order, [2, 1, 0], "the later duplicate goes first");
 }
 
@@ -757,4 +757,29 @@ fn adaptive_l_grows_the_beam_for_rare_matches() {
         }
     }
     assert!(grew > 0);
+}
+
+#[test]
+fn fast_paths_agree_with_the_configurable_loop() {
+    for aux in [false, true] {
+        let f = fixture(300, 21 + u64::from(aux), aux);
+        let ix = f.index();
+        for (preset, fast) in [
+            ("postfilter", super::search::FastPath::Postfilter),
+            ("upstream-inline", super::search::FastPath::Inline),
+        ] {
+            let plan = Plan::new(&Preset::parse(preset).unwrap().kernel(), &ix).unwrap();
+            assert_eq!(plan.fast_path(), fast);
+            let generic = plan.clone().generic();
+            let mut st = Searcher::for_index(&ix, &[&plan]);
+            for q in 0..f.preds.len() {
+                for l in [10, 40] {
+                    let (a, ca) = search(&f, &mut st, &plan, q, l, 10, None);
+                    let (b, cb) = search(&f, &mut st, &generic, q, l, 10, None);
+                    assert_eq!(a, b, "{preset} q={q} L={l}");
+                    assert_eq!(ca, cb, "{preset} counters q={q} L={l}");
+                }
+            }
+        }
+    }
 }

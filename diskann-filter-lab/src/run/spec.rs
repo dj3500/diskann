@@ -95,6 +95,7 @@ struct RawExperiment {
     reference_factor: Option<f64>,
     reference_min: Option<u64>,
     eps_min: Option<f32>,
+    fast_paths: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,6 +150,9 @@ pub struct Experiment {
     pub reference_factor: f64,
     pub reference_min: u64,
     pub eps_min: Option<f32>,
+    /// Whether configurations that are exactly a preset with a hand-specialized loop use it
+    /// (default); `false` runs every configuration in the configurable loop.
+    pub fast_paths: bool,
     pub configs: Vec<ConfigSpec>,
 }
 
@@ -313,6 +317,7 @@ impl Experiment {
             reference_factor: e.reference_factor.unwrap_or(20.0),
             reference_min: e.reference_min.unwrap_or(1000),
             eps_min: e.eps_min,
+            fast_paths: e.fast_paths.unwrap_or(true),
             configs,
         })
     }

@@ -11,6 +11,8 @@ normal form (an AND of ORs over Boolean labels). The crate provides:
 - graphs over data points and auxiliary nodes (`Graph::neighbors`, `NodeLabels`, `NodeVectors`)
   with start-node tables, and an importer of saved DiskANN in-memory indices (C++ library and
   Rust `diskann-providers`);
+- a configurable filtered graph-search kernel (`kernel`) with reference presets of known
+  filtered-search algorithms, and `flab run`, a timed experiment driver (`run`);
 - the `flab` command-line tool.
 
 ## Concepts
@@ -68,6 +70,9 @@ flab import-starts --graph graph.flab --labels labels.flab \
         --sample <prefix>_sample_ids.bin --sample-map <prefix>_sample_labels.txt_map.bin \
         -o starts.flab --report starts.json
 
+# Experiments with the lab search kernel (pinned to one CPU; see below)
+taskset -c 7 flab run experiment.toml --commit <sha>
+
 # Summaries
 flab info labels.flab
 flab info queries.fpred
@@ -90,6 +95,119 @@ The element type of vector files is inferred from the extension (`.u8bin` = `u8`
   `false` and `null` values are skipped.
 - JSONL predicates: `{"query_id": i, "filter": F}` with `F` = `{"$and": [C, ...]}` or `C`, `C` =
   `{"$or": [A, ...]}` or `A`, `A` = `{"<label>": {"$eq": true}}`.
+
+## Lab search kernel
+
+`kernel::search::Searcher::search` answers one query (a vector and a predicate) on a graph
+with a configuration (`kernel::config::Kernel`) that fixes one implementation per role. Per
+query: the predicate is compiled (clause upper bounds `U_c` = sums of posting lengths, clause
+order, a clause-bit table, weights); a query with an empty clause has no answers; optional
+exact-path routing answers queries with `min_c U_c ≤ T` from the postings; then start
+selection, a pilot (scorers with per-query scales), an optional materialization of the match
+set, the loop (expand the `W` closest unexpanded beam nodes, *offer* every unvisited
+neighbour: distance and predicate in the order of the laziness role, admission to the beam,
+collection of matches), and collection of at most `K` matching data points sorted by (true
+squared-L2 distance, id). The beam keeps upstream DiskANN's tie rule (a new entry goes before
+existing entries with an equal key) and entries `(key, true distance, id)`. Auxiliary nodes
+are navigated, never evaluated against the predicate and never returned.
+
+| Role key | Values (default first) |
+|---|---|
+| `starts` | `+`-joined sources: `global`, `label(c*)` (the smallest clause's per-label starts), `label(all)` (alias `product`), `sample(k)`, `aux` |
+| `start_admission` | `force`, `obey` (starts must pass admission) |
+| `sample_start` | `intended` (sample points that match fully, via per-label sample postings), `recorded` (the sample ids stored in the start table) |
+| `admission` | `all`, `strict`, `projection(<category>, ...)` (navigate on the clauses of these categories), `cutoff(τ)` (at most `τ` failed clauses) |
+| `laziness` | `eager`, `deferred` (predicate only at collection), `predicate_first`, `distance_first` (skips nodes that can enter neither the beam nor the answers) |
+| `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
+| `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
+| `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
+| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector) |
+| `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer) |
+| `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list) |
+| `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)` |
+| `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
+| `beam_width` | `W` (1) |
+| `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`) |
+| `aux_g` | penalty of auxiliary nodes in graded keys (0) |
+
+Illegal combinations are rejected when the configuration is validated (for example `deferred`
+needs `all` / `distance` / `final_beam`; `match_aware` needs `heap`; `bitmap` needs a
+materializer and no projection).
+
+Presets (`kernel::Preset`): `postfilter`, `upstream-inline`, `upstream-inline-adaptive` /
+`upstream-inline-adaptive(sample, scale)`, `upstream-multihop`, `upstream-beta(β)` (alias
+`inline-beta`), `bf(T)` / `inline-beta-bf(β, T)` (beta search with an exact posting scan),
+`filt(λ, τ)` (C++ multi-filter search: sample and global starts, `cutoff(τ)`, additive
+penalty), `sfmarket(<categories>)` (C++ OR-filtered search with navigation on a projection)
+and `cp` (C++ OR-filtered search on a product-label graph). The `upstream-*` presets reproduce
+upstream DiskANN's answers on unambiguous slots and its counters
+(`tests/kernel_vs_upstream.rs`).
+
+Compile-time parameters: the element type, the predicate mode and the scorer family (once per
+plan), and the laziness, the expander and tracing (once per query); the other roles are enums
+matched in the loop. The `postfilter` and `upstream-inline` presets also have
+hand-specialized loops (`search::FastPath`, same answers and counters), used unless the plan
+is made generic (`Plan::generic`). `examples/kernel_overhead.rs` measures the configurable
+loop against them.
+
+Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
+route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
+`n_start` and the final list size. A trace mode records per-node events (offers with keys,
+predicate results and outcomes, expansions, answers), and a reference mode runs with a
+resizable candidate list until a distance budget is spent.
+
+## Experiments: `flab run`
+
+`flab run experiment.toml` runs the configurations of an experiment over a query panel and an
+effort grid (`L`), one run per `K`, and writes one run directory per (configuration, `K`).
+
+```toml
+[experiment]
+name = "smoke"
+dataset = "/path/to/dataset"     # base.<u8bin|fbin>, labels.flab, q<set>.<ext>, q<set>.fpred
+graph = "/path/to/graph"         # default graph: a directory with graph.flab, a graph.flab, or a DiskANN index prefix
+# starts_sidecar = "/path/to/starts.flab"  # default: starts.flab next to graph.flab
+# view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred
+queries = "q10K"                 # a whole query set, or:
+# panel = "panels/screen.tsv"    # TSV with columns qset, qidx (optional split); relative to the dataset
+# split = "discovery"            # panel filters
+# qsets = ["10K"]
+# limit = 500
+k = [10, 100]                    # or a single integer
+efforts = [10, 50, 200, 1000]    # L
+reps = 3
+mode = "timed"                   # timed | trace | reference
+seed = 0                         # configuration order per (repetition, effort)
+runs_dir = "/path/to/runs"
+ledger = "/path/to/ledger.jsonl"
+# warmup = true
+# fast_paths = true              # false: no hand-specialized preset loops
+# trace_rows = [0, 5]            # trace mode (or every trace_sample-th row)
+# reference_factor = 20.0        # reference mode: budget = max(factor × n_dist, reference_min)
+# reference_min = 1000
+
+[[config]]
+name = "inline"
+preset = "upstream-inline"
+
+[[config]]
+name = "inline-w4"
+preset = "upstream-inline"
+beam_width = 4                   # any role key of the table above
+# graph / starts_sidecar / view override the experiment's
+```
+
+Timed mode refuses to run unless the process is pinned to one CPU. It pre-faults the inputs,
+records the CPU, NUMA node, memory policy, niceness, load and a calibration at the start and
+the end, warms every configuration up at the median effort, then for each repetition and effort
+runs the configurations in a seeded shuffled order; each query is timed with the wall clock
+nested inside `CLOCK_THREAD_CPUTIME_ID` reads, including every per-query cost (predicate
+compilation, routing, starts, pilot, materialization, search, collection, resets).
+Repetitions must return identical results. Outputs per run directory: `run.json`,
+`res_<L>.bin` (DiskANN truthset layout: `u32 nq`, `u32 K`, ids padded with `u32::MAX`, true
+squared-L2 distances; rows in panel order), `perquery.tsv` (`effort rep row wall_ns cpu_ns`,
+then the counters), `panel.tsv` (the rows used), `trace/` (trace mode); one ledger line per
+run, failures included.
 
 ## Importing DiskANN indices
 

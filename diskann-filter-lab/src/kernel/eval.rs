@@ -265,13 +265,47 @@ pub struct PredOut {
 /// What an evaluator reads.
 #[derive(Debug, Clone, Copy)]
 pub struct EvalCtx<'a> {
-    pub labels: &'a LabelStore,
-    pub q: &'a Compiled,
-    pub bits: &'a [u64],
+    pub(crate) labels: &'a LabelStore,
+    pub(crate) q: &'a Compiled,
+    /// Clause bits by label id; covers every label id of `labels` (checked by [`Self::new`]).
+    bits: &'a [u64],
     /// Materialized dense match bitmap (over data points).
-    pub dense: &'a [u64],
+    pub(crate) dense: &'a [u64],
     /// Materialized sorted match list.
-    pub sparse: &'a [u32],
+    pub(crate) sparse: &'a [u32],
+}
+
+impl<'a> EvalCtx<'a> {
+    /// # Panics
+    ///
+    /// Panics if `bits` does not cover every label id of `labels`.
+    #[inline]
+    pub fn new(
+        labels: &'a LabelStore,
+        q: &'a Compiled,
+        bits: &'a [u64],
+        dense: &'a [u64],
+        sparse: &'a [u32],
+    ) -> Self {
+        assert!(
+            bits.len() >= labels.n_labels(),
+            "the clause-bit table has {} entries for {} labels",
+            bits.len(),
+            labels.n_labels()
+        );
+        Self {
+            labels,
+            q,
+            bits,
+            dense,
+            sparse,
+        }
+    }
+
+    /// The compiled query.
+    pub fn query(&self) -> &'a Compiled {
+        self.q
+    }
 }
 
 /// A predicate evaluator (`PredicateEval` role); a compile-time parameter of the hot loop.
@@ -325,12 +359,16 @@ fn from_failed(q: &Compiled, failed: u64, complete: bool) -> PredOut {
     }
 }
 
-/// ORs the clause bits of `row` until `mask` is covered; returns the uncovered bits.
+/// ORs the clause bits of `row` (a label row of the store `cx` was built for) until `mask`
+/// is covered; returns the uncovered bits.
 #[inline(always)]
-fn scan(row: &[u32], bits: &[u64], mask: u64) -> u64 {
+fn scan(cx: &EvalCtx<'_>, row: &[u32], mask: u64) -> u64 {
+    let bits = cx.bits;
     let mut sat = 0u64;
     for &l in row {
-        sat |= bits[l as usize];
+        // SAFETY: rows hold label ids `< labels.n_labels()` (validated when the store was
+        // loaded or built), and `EvalCtx::new` checked that `bits` covers them.
+        sat |= unsafe { *bits.get_unchecked(l as usize) };
         if sat & mask == mask {
             return 0;
         }
@@ -349,7 +387,7 @@ impl Eval for RowScan {
         if !q.use_bits || row.len() > 4 * q.labels.len() {
             return ClauseSearch::eval(cx, v, complete);
         }
-        from_failed(q, scan(row, cx.bits, q.nav_mask), complete)
+        from_failed(q, scan(cx, row, q.nav_mask), complete)
     }
 
     #[inline(always)]
@@ -359,7 +397,7 @@ impl Eval for RowScan {
         if !q.use_bits || row.len() > 4 * q.labels.len() {
             return ClauseSearch::full(cx, v);
         }
-        scan(row, cx.bits, q.full_mask) == 0
+        scan(cx, row, q.full_mask) == 0
     }
 
     #[inline(always)]
@@ -602,13 +640,7 @@ mod tests {
         assert!(!q.is_empty() && q.uses_bits());
         assert_eq!((q.original(0), q.original(1)), (1, 0), "smaller U first");
         assert_eq!((q.upper_bound(0), q.upper_bound(1)), (3, 5));
-        let cx = EvalCtx {
-            labels: &s,
-            q: &q,
-            bits: &bits,
-            dense: &[],
-            sparse: &[],
-        };
+        let cx = EvalCtx::new(&s, &q, &bits, &[], &[]);
         let expect = [
             (false, 1),
             (true, 0),
@@ -634,13 +666,7 @@ mod tests {
 
         // No clause: everything matches.
         q.compile(&s, preds.get(2), Weights::Unit, None, &mut bits);
-        let cx = EvalCtx {
-            labels: &s,
-            q: &q,
-            bits: &bits,
-            dense: &[],
-            sparse: &[],
-        };
+        let cx = EvalCtx::new(&s, &q, &bits, &[], &[]);
         assert_eq!(q.min_upper_bound(), u64::MAX);
         for v in 0..6 {
             assert!(all_modes(&cx, v, true).m && RowScan::full(&cx, v));
@@ -659,13 +685,7 @@ mod tests {
         let (w0, w1) = (q.weight(0), q.weight(1));
         assert!((w0 + w1 - 2.0).abs() < 1e-5, "mean 1");
         assert!(w0 > w1, "the rarer clause (U = 3) weighs more");
-        let cx = EvalCtx {
-            labels: &s,
-            q: &q,
-            bits: &bits,
-            dense: &[],
-            sparse: &[],
-        };
+        let cx = EvalCtx::new(&s, &q, &bits, &[], &[]);
         // Point 3 (a=3) fails only clause b=0, the first in Boolean order.
         let p = all_modes(&cx, 3, true);
         assert_eq!((p.unit, p.g), (1, w0));
@@ -676,13 +696,7 @@ mod tests {
         q.compile(&s, preds.get(0), Weights::Unit, Some(&[b]), &mut bits);
         assert!(q.is_projected());
         assert_eq!(q.nav(), &[0]);
-        let cx = EvalCtx {
-            labels: &s,
-            q: &q,
-            bits: &bits,
-            dense: &[],
-            sparse: &[],
-        };
+        let cx = EvalCtx::new(&s, &q, &bits, &[], &[]);
         // Point 0 (a=0, b=0) satisfies the projection but not the full predicate.
         assert!(all_modes(&cx, 0, true).m);
         assert!(!RowScan::full(&cx, 0) && !ClauseSearch::full(&cx, 0));
@@ -715,13 +729,7 @@ mod tests {
         let mut q = Compiled::new();
         q.compile(&s, preds.get(0), Weights::Unit, None, &mut bits);
         assert!(!q.uses_bits() && bits.iter().all(|&b| b == 0));
-        let cx = EvalCtx {
-            labels: &s,
-            q: &q,
-            bits: &bits,
-            dense: &[],
-            sparse: &[],
-        };
+        let cx = EvalCtx::new(&s, &q, &bits, &[], &[]);
         assert!(all_modes(&cx, 0, true).m && RowScan::full(&cx, 0));
         let p = all_modes(&cx, 1, true);
         assert_eq!((p.m, p.unit), (false, 1));
