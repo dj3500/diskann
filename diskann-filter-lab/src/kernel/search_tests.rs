@@ -188,6 +188,7 @@ impl Fixture {
             view_postings: None,
             eps_min: 1.0,
             bitsets: Some(&self.bitsets),
+            costs: None,
         }
     }
 
@@ -495,6 +496,7 @@ fn static_bits_do_not_change_answers_or_counters() {
     let high = LabelBitsets::build(&f.labels, 100);
     let ix_high = Index {
         bitsets: Some(&high),
+        costs: None,
         ..f.index()
     };
     let mut k = Kernel::default();
@@ -504,6 +506,7 @@ fn static_bits_do_not_change_answers_or_counters() {
         &k,
         &Index {
             bitsets: None,
+            costs: None,
             ..f.index()
         }
     )
@@ -618,6 +621,7 @@ fn run_line(
         view_postings: None,
         eps_min: 0.5,
         bitsets: None,
+        costs: None,
     };
     let plan = Plan::new(kernel, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -756,6 +760,7 @@ fn exact_duplicates_follow_the_upstream_tie_rule() {
         view_postings: None,
         eps_min: 0.5,
         bitsets: None,
+        costs: None,
     };
     let plan = Plan::new(&k, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -890,5 +895,195 @@ fn fast_paths_agree_with_the_configurable_loop() {
                 }
             }
         }
+    }
+}
+
+// ------------------------------------------------- exact path v2, laziness, crossovers (B6)
+
+fn search_ix(
+    f: &Fixture,
+    ix: &Index<'_, u8>,
+    st: &mut Searcher,
+    plan: &Plan,
+    q: usize,
+    l: usize,
+    k: usize,
+) -> (Vec<(f32, u32)>, Counters) {
+    let mut ids = vec![0u32; k];
+    let mut d = vec![0f32; k];
+    let ctr = st.search(plan, ix, &f.query(q), l, &mut ids, &mut d, None);
+    let out: Vec<(f32, u32)> = d
+        .iter()
+        .zip(&ids)
+        .take(ctr.n_out as usize)
+        .map(|(&d, &i)| (d, i))
+        .collect();
+    (out, ctr)
+}
+
+/// The k-hp-ad policy of the label-blind graph with role overrides.
+fn khpad(edits: &[(&str, &str)]) -> Kernel {
+    let mut k = kernel(&[
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("terminator", "adaptive_l(20, 4)"),
+        ("laziness", "distance_first"),
+    ]);
+    for (key, value) in edits {
+        k.set(key, value).unwrap();
+    }
+    k.validate().unwrap();
+    k
+}
+
+#[test]
+fn planned_exact_plans_are_exact() {
+    use super::cost::{ExactPlan, UnitCosts};
+    let f = fixture(300, 5, false);
+    let costs = UnitCosts::default();
+    for with_bits in [false, true] {
+        let ix = Index {
+            bitsets: with_bits.then_some(&f.bitsets),
+            costs: Some(&costs),
+            ..f.index()
+        };
+        for plans in ["scan", "df", "gallop", "bitmap", "scan+df+gallop+bitmap"] {
+            let k = kernel(&[
+                ("exact", "planned(18446744073709551615)"),
+                ("exact_plans", plans),
+            ]);
+            let plan = Plan::new(&k, &ix).unwrap();
+            let mut st = Searcher::for_index(&ix, &[&plan]);
+            for q in 0..f.preds.len() {
+                for kk in [1, 7, 10] {
+                    let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 10, kk);
+                    let what = format!("{plans} bits={with_bits} q={q} K={kk}");
+                    assert_eq!(out, f.truth(q, kk), "{what}");
+                    if q == 7 {
+                        continue;
+                    }
+                    assert_eq!(ctr.route, Route::Exact, "{what}");
+                    if !plans.contains('+') {
+                        assert_eq!(ctr.plan, ExactPlan::parse(plans).unwrap() as u64);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn seeded_exact_paths_exhaust_every_candidate() {
+    use super::{
+        collect::{Answers, Collector},
+        cost::ExactPlan,
+        eval::{Compiled, EvalCtx, Weights},
+        exact::{run_planned, ExactEval},
+        materialize::Materialized,
+    };
+    let f = fixture(300, 9, false);
+    let vectors = f.graph.vectors(&f.base).unwrap();
+    let mut bits = vec![0u64; f.labels.n_labels()];
+    let mut q = Compiled::new();
+    let mut mat = Materialized::new(300, true);
+    let mut answers = Answers::new();
+    for qi in 0..f.preds.len() {
+        q.compile(&f.labels, f.preds.get(qi), Weights::Unit, None, &mut bits);
+        if q.is_empty() {
+            q.clear_bits(&mut bits);
+            continue;
+        }
+        q.split_static(&f.labels, &f.bitsets, 1, false);
+        let all = f.truth(qi, 300);
+        for k in [1usize, 5, 10] {
+            // Seeds: the farthest matches (valid but wrong answers), and a mix with some of the
+            // true answers (which the exact path finds again and must not duplicate).
+            let far: Vec<(f32, u32)> = all.iter().rev().take(k).copied().collect();
+            let mixed: Vec<(f32, u32)> = all
+                .iter()
+                .step_by(2)
+                .take(k)
+                .chain(all.iter().rev().take(k))
+                .copied()
+                .collect();
+            for seed in [&far, &mixed] {
+                for plan in ExactPlan::ALL {
+                    for eval in [ExactEval::RowScan, ExactEval::StaticBits] {
+                        let mut cx = EvalCtx::new(&f.labels, &q, &bits, &[], &[]);
+                        if eval == ExactEval::StaticBits {
+                            cx = cx.with_static(&f.bitsets);
+                        }
+                        answers.reset(Collector::Heap, k, k);
+                        for &(d, id) in seed.iter() {
+                            answers.offer_unique(d, id);
+                        }
+                        let mut ctr = Counters::default();
+                        run_planned(
+                            plan,
+                            eval,
+                            &cx,
+                            &vectors,
+                            300,
+                            f.queries.row(qi),
+                            k,
+                            &mut mat,
+                            &mut answers,
+                            true,
+                            &mut ctr,
+                        );
+                        let mut ids = vec![0u32; k];
+                        let mut ds = vec![0f32; k];
+                        let n = answers.finish(&mut ids, &mut ds);
+                        let got: Vec<(f32, u32)> = ds[..n]
+                            .iter()
+                            .copied()
+                            .zip(ids[..n].iter().copied())
+                            .collect();
+                        assert_eq!(got, f.truth(qi, k), "q={qi} k={k} {plan:?} {eval:?}");
+                        assert!(ctr.n_exact_cand as usize >= all.len().min(1));
+                    }
+                }
+            }
+        }
+        q.clear_bits(&mut bits);
+    }
+}
+
+#[test]
+fn heap_bound_laziness_keeps_answers_and_skips_checks() {
+    let f = fixture(300, 17, true);
+    let ix = f.index();
+    for terminator in ["adaptive_l(20, 4)", "exhaust"] {
+        let base = Plan::new(&khpad(&[("terminator", terminator)]), &ix).unwrap();
+        let lazy = Plan::new(
+            &khpad(&[("terminator", terminator), ("laziness", "heap_bound")]),
+            &ix,
+        )
+        .unwrap();
+        let eager = Plan::new(
+            &khpad(&[("terminator", terminator), ("laziness", "eager")]),
+            &ix,
+        )
+        .unwrap();
+        let mut st = Searcher::for_index(&ix, &[&base]);
+        let (mut skipped, mut saved) = (0, 0i64);
+        for q in 0..f.preds.len() {
+            for l in [10, 40] {
+                for k in [3, 10] {
+                    let (a, ca) = search(&f, &mut st, &base, q, l, k, None);
+                    let (b, cb) = search(&f, &mut st, &lazy, q, l, k, None);
+                    let (c, cc) = search(&f, &mut st, &eager, q, l, k, None);
+                    let what = format!("{terminator} q={q} L={l} K={k}");
+                    assert_eq!(a, b, "{what}");
+                    assert_eq!(a, c, "{what}");
+                    assert_eq!(ca.n_expand, cb.n_expand, "{what}: same trajectory");
+                    assert_eq!(ca.n_dist, cb.n_dist, "{what}");
+                    assert!(cb.n_pred <= ca.n_pred && cb.n_pred <= cc.n_pred, "{what}");
+                    skipped += cb.n_lazy;
+                    saved += ca.n_pred as i64 - cb.n_pred as i64;
+                }
+            }
+        }
+        assert!(skipped > 0 && saved > 0, "{terminator}: nothing skipped");
     }
 }

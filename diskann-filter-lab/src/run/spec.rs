@@ -26,6 +26,8 @@
 //! ledger = "<file>"                # one JSON line per run
 //! bitsets_sidecar = "<bitsets.flab>" # optional static bitsets of `static_bits(θ)` configs
 //!                                  # (default: built in memory at the smallest θ, untimed)
+//! calibration = "<costs.json>"     # unit costs of the cost model (`flab calibrate`): needed by
+//!                                  # the planned exact path
 //!
 //! [[config]]
 //! name = "inline"
@@ -37,6 +39,8 @@
 //! starts = "label(c*)"             # any role override of `Kernel::set`
 //! collector = "heap"
 //! graph = "<other graph>"          # per-configuration graph, starts sidecar and view
+//! efforts = [100]                  # per-configuration subset of the efforts (e.g. one effort
+//!                                  # for an L-independent exact path)
 //! ```
 
 use std::{
@@ -99,6 +103,7 @@ struct RawExperiment {
     eps_min: Option<f32>,
     fast_paths: Option<bool>,
     bitsets_sidecar: Option<PathBuf>,
+    calibration: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,6 +129,8 @@ pub struct ConfigSpec {
     pub graph: PathBuf,
     pub starts_sidecar: Option<PathBuf>,
     pub view: Option<String>,
+    /// The efforts of this configuration (a subset of the experiment's; all if `None`).
+    pub efforts: Option<Vec<usize>>,
     /// The overrides as given (for the record).
     pub overrides: BTreeMap<String, String>,
 }
@@ -159,6 +166,8 @@ pub struct Experiment {
     /// Static per-label bitsets of the dataset's labels for `static_bits(θ)` configurations
     /// (built in memory when absent).
     pub bitsets_sidecar: Option<PathBuf>,
+    /// Unit costs of the cost model (`flab calibrate` output).
+    pub calibration: Option<PathBuf>,
     pub configs: Vec<ConfigSpec>,
 }
 
@@ -255,6 +264,24 @@ impl Experiment {
                 .map(PathBuf::from)
                 .or_else(|| e.starts_sidecar.clone());
             let view = text(&mut table, "view")?.or_else(|| e.view.clone());
+            let efforts = match table.remove("efforts") {
+                None => None,
+                Some(toml::Value::Array(items)) => {
+                    let mut v = Vec::new();
+                    for item in items {
+                        match item {
+                            toml::Value::Integer(l) if l > 0 => v.push(l as usize),
+                            _ => bail!("config {name:?}: efforts must be positive integers"),
+                        }
+                    }
+                    ensure!(
+                        !v.is_empty() && v.iter().all(|l| e.efforts.contains(l)),
+                        "config {name:?}: efforts must be a non-empty subset of the experiment's"
+                    );
+                    Some(v)
+                }
+                Some(_) => bail!("config {name:?}: efforts must be a list of integers"),
+            };
             let mut kernel = match &preset {
                 Some(p) => Preset::parse(p)
                     .with_context(|| format!("config {name:?}"))?
@@ -287,6 +314,7 @@ impl Experiment {
                 graph: resolve(dir, &graph),
                 starts_sidecar: starts_sidecar.map(|p| resolve(dir, &p)),
                 view,
+                efforts,
                 overrides,
             });
         }
@@ -325,6 +353,7 @@ impl Experiment {
             eps_min: e.eps_min,
             fast_paths: e.fast_paths.unwrap_or(true),
             bitsets_sidecar: e.bitsets_sidecar.map(|p| resolve(dir, &p)),
+            calibration: e.calibration.map(|p| resolve(dir, &p)),
             configs,
         })
     }
@@ -384,5 +413,11 @@ mod tests {
         assert!(bad("[[config]]\nname='a'\n[[config]]\nname='a'"));
         assert!(bad("[[config]]\nname='a'\npreset='cp'"), "cp needs a view");
         assert!(bad(""), "no configs");
+        assert!(!bad("[[config]]\nname='a'\nefforts=[10]"));
+        assert!(
+            bad("[[config]]\nname='a'\nefforts=[20]"),
+            "not an experiment effort"
+        );
+        assert!(bad("[[config]]\nname='a'\nefforts=[]"));
     }
 }

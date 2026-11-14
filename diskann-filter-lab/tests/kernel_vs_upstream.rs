@@ -195,6 +195,7 @@ fn presets_reproduce_upstream_search() {
         view_postings: None,
         eps_min: 1.0,
         bitsets: None,
+        costs: None,
     };
     let plan = |p: &str| Plan::new(&Preset::parse(p).unwrap().kernel(), &ix).unwrap();
     let postfilter = plan("postfilter");

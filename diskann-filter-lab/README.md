@@ -79,6 +79,9 @@ flab starts build --dataset <dir> --graph <graph> --strategy medoid,random,kmean
 flab bitsets build --labels labels.flab --theta 31250 -o bitsets.flab
 flab bitsets stats --labels labels.flab --theta 1000,10000,31250
 
+# Unit costs of the exact path's cost model on this machine and dataset (pinned like the runs)
+taskset -c 7 flab calibrate --dataset <dir> --graph <graph> -o costs.json
+
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
 
@@ -126,14 +129,15 @@ are navigated, never evaluated against the predicate and never returned.
 | `start_admission` | `force`, `obey` (starts must pass admission) |
 | `sample_start` | `intended` (sample points that match fully, via per-label sample postings), `recorded` (the sample ids stored in the start table) |
 | `admission` | `all`, `strict`, `projection(<category>, ...)` (navigate on the clauses of these categories), `cutoff(τ)` (at most `τ` failed clauses) |
-| `laziness` | `eager`, `deferred` (predicate only at collection), `predicate_first`, `distance_first` (skips nodes that can enter neither the beam nor the answers) |
+| `laziness` | `eager`, `deferred` (predicate only at collection), `predicate_first`, `distance_first` (skips nodes that can enter neither the beam nor the answers), `heap_bound` (skips the predicate of every node that cannot be an answer: `heap` collector full and distance beyond its K-th; the node still navigates; needs admission `all` and the `distance` scorer) |
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
 | `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
-| `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)` |
+| `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
+| `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap` (default) or any subset |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
 | `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`, C++ OR-filtered search), `exact` (capacity `L`, C++ multi-filter search) |
@@ -178,9 +182,23 @@ exceed the sidecar's.
 predicate check per evaluator, row length and access pattern; per-query materializations;
 exact paths per candidate; distances).
 
+**Exact path v2** (`exact = "planned(T)"`, module `kernel::exact`): for a query routed to the
+exact path, a cost model (`kernel::cost`) chooses the cheapest of four plans from the posting
+sizes, the estimated union of the smallest clause `A` and match count `M`, and calibrated unit
+costs: `scan` (candidates of the smallest clause, predicate first), `df` (distances first; the
+predicate only within the answer heap's K-th distance), `gallop` (galloping intersection of
+the clauses' postings) and `bitmap` (a dense match bitmap built with the static bitsets).
+Candidate rows and vectors are prefetched in a software pipeline, and checks use the static
+bitsets when the run has them. A *seeded* exact path keeps the answers of another search and
+still processes every candidate. The unit costs come from `flab calibrate` (module
+`calibrate`: memory-access costs as functions of the candidate density, merge, galloping and
+bitmap costs, graph-search costs per distance and per predicate; a few seconds to a minute per
+dataset) and are loaded with the experiment key `calibration`.
+
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
-`n_start` and the final list size. A trace mode records per-node events (offers with keys,
+`n_start`, the final list size, and for the planned exact path the plan, its estimated cost
+and the estimates of `A` and `M`. A trace mode records per-node events (offers with keys,
 predicate results and outcomes, expansions, answers), and a reference mode runs with a
 resizable candidate list until a distance budget is spent.
 
@@ -197,6 +215,8 @@ graph = "/path/to/graph"         # default graph: a directory with graph.flab, a
 # starts_sidecar = "/path/to/starts.flab"  # default: starts.flab next to graph.flab
 # bitsets_sidecar = "/path/to/bitsets.flab" # static_bits(θ) configs; default: built in memory
 #                                           # (untimed) at the smallest θ of the experiment
+#                                           # (θ = ⌈n/64⌉ for the planned exact path alone)
+# calibration = "/path/to/costs.json"       # unit costs (flab calibrate) of the planned exact path
 # view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred
 queries = "q10K"                 # a whole query set, or:
 # panel = "panels/screen.tsv"    # TSV with columns qset, qidx (optional split); relative to the dataset
@@ -225,6 +245,8 @@ name = "inline-w4"
 preset = "upstream-inline"
 beam_width = 4                   # any role key of the table above
 # graph / starts_sidecar / view override the experiment's
+# efforts = [100]                # a subset of the experiment's efforts (e.g. an L-independent
+#                                # exact path)
 ```
 
 Timed mode refuses to run unless the process is pinned to one CPU. It pre-faults the inputs,

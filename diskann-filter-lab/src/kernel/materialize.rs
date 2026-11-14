@@ -115,8 +115,12 @@ pub struct Materialized {
     pub sparse: Vec<u32>,
     tmp_sparse: Vec<u32>,
     cursors: Vec<usize>,
-    heap: Vec<(u32, u32)>,
-    pos: Vec<usize>,
+    pub(crate) heap: Vec<(u32, u32)>,
+    pub(crate) pos: Vec<usize>,
+    /// Candidates of the exact path v2 (merged postings).
+    pub(crate) cands: Vec<u32>,
+    /// Matches of the exact path v2 (filtered or enumerated candidates).
+    pub(crate) matches: Vec<u32>,
 }
 
 impl Materialized {
@@ -128,6 +132,16 @@ impl Materialized {
         m.dense.resize(words, 0);
         m.tmp.resize(words, 0);
         m
+    }
+
+    /// Allocates the dense buffers for `n_data` points if they are missing (normally done by
+    /// [`Self::new`], outside the timed path).
+    pub fn ensure_dense(&mut self, n_data: usize) {
+        let words = n_data.div_ceil(64);
+        if self.dense.len() < words {
+            self.dense.resize(words, 0);
+            self.tmp.resize(words, 0);
+        }
     }
 
     /// Builds the dense match bitmap of `q`; returns the number of posting entries read.

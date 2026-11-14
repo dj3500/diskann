@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use diskann_filter_lab::{
     bitsets::LabelBitsets,
     graph::{AuxNodes, Graph},
+    kernel::cost::UnitCosts,
     labels::{LabelStore, LabelStoreBuilder},
     predicate::{PredicateSet, PredicateSetBuilder},
     run,
@@ -427,6 +428,67 @@ materializer = "dense_static"
         let bits = &run["index"]["bitsets"];
         assert_eq!(bits["theta"], if extra.is_empty() { 60 } else { 40 });
         assert!(bits["n_bitsets"].as_u64().unwrap() >= 3, "{bits}");
+    }
+
+    // B6: unit costs sidecar and per-configuration efforts; the planned exact path returns the
+    // version-1 scan's answers.
+    let costs = d.dir.join("costs.json");
+    std::fs::write(
+        &costs,
+        serde_json::json!({"costs": UnitCosts::default()}).to_string(),
+    )
+    .unwrap();
+    let p = d.dir.join("b6.toml");
+    let text = format!(
+        r#"
+[experiment]
+name = "driver-b6"
+dataset = "{ds}"
+graph = "{ds}/graph"
+queries = "qa"
+k = 5
+efforts = [10, 30]
+mode = "trace"
+runs_dir = "{ds}/runs"
+ledger = "{ds}/ledger.jsonl"
+calibration = "{costs}"
+
+[[config]]
+name = "exact-v1"
+exact = "scan_smallest_clause(1000000)"
+efforts = [10]
+
+[[config]]
+name = "exact-v2"
+exact = "planned(1000000)"
+efforts = [10]
+
+[[config]]
+name = "lazy"
+starts = "label(c*)+global"
+collector = "heap"
+laziness = "heap_bound"
+"#,
+        ds = d.dir.display(),
+        costs = costs.display(),
+    );
+    std::fs::write(&p, text).unwrap();
+    let dirs = run::run(&p, &opts).unwrap();
+    assert_eq!(dirs.len(), 3);
+    assert_eq!(
+        read_res(&dirs[0].join("res_10.bin")),
+        read_res(&dirs[1].join("res_10.bin"))
+    );
+    assert!(!dirs[1].join("res_30.bin").exists(), "own efforts only");
+    assert!(dirs[2].join("res_30.bin").exists());
+    let run: Value =
+        serde_json::from_str(&std::fs::read_to_string(dirs[1].join("run.json")).unwrap()).unwrap();
+    assert!(run["index"]["calibration"]["costs"]["graph_alpha"].is_number());
+    assert_eq!(run["skipped_efforts"], serde_json::json!([30]));
+    let pq = std::fs::read_to_string(dirs[1].join("perquery.tsv")).unwrap();
+    let header: Vec<&str> = pq.lines().next().unwrap().split('\t').collect();
+    for col in ["plan", "est_exact_ns", "a_hat", "m_hat"] {
+        assert!(header.contains(&col), "{col} in {header:?}");
     }
 
     let ledger = std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap();

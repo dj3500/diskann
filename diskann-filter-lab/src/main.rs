@@ -14,7 +14,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskann_filter_lab::{
     bitsets::{self, LabelBitsets},
-    container, diskann_io,
+    calibrate, container, diskann_io,
     graph::{self, Graph, GraphStats},
     gt::{self, DiskannTruth, GroundTruth},
     jsonl, label_starts, labels,
@@ -58,6 +58,8 @@ enum Command {
     /// Static per-label bitsets (`bitsets.flab`, for the `static_bits(θ)` predicate mode).
     #[command(subcommand)]
     Bitsets(BitsetsCommand),
+    /// Measure the unit costs of the cost model on this machine and dataset (JSON).
+    Calibrate(CalibrateArgs),
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
     /// kernel and write run directories (see `run` in the crate documentation).
     Run(RunArgs),
@@ -314,6 +316,33 @@ enum BitsetsCommand {
 }
 
 #[derive(Args)]
+struct CalibrateArgs {
+    /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
+    #[arg(long)]
+    dataset: PathBuf,
+    /// The graph (for the graph-search costs): a directory with `graph.flab`, a `graph.flab`,
+    /// or a DiskANN index prefix.
+    #[arg(long)]
+    graph: Option<PathBuf>,
+    /// Start table of the graph (optional).
+    #[arg(long)]
+    starts: Option<PathBuf>,
+    /// Static bitsets threshold θ of the exact path (default ⌈n/64⌉; 0: no bitsets).
+    #[arg(long)]
+    theta: Option<u64>,
+    #[arg(long, default_value_t = 3)]
+    reps: usize,
+    /// Calibration predicates and queries (from random base points).
+    #[arg(long, default_value_t = 64)]
+    queries: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    /// Output JSON.
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+#[derive(Args)]
 struct RunArgs {
     /// The experiment file (TOML).
     experiment: PathBuf,
@@ -367,6 +396,41 @@ fn main() -> Result<()> {
             }
         }
         Command::Bitsets(c) => bitsets_command(c),
+        Command::Calibrate(a) => {
+            let opts = calibrate::Options {
+                reps: a.reps,
+                queries: a.queries,
+                seed: a.seed,
+                theta: a.theta,
+            };
+            let base = run::data::base_file(&a.dataset)?;
+            let report = match DType::from_path(&base)? {
+                DType::U8 => calibrate::calibrate::<u8>(
+                    &a.dataset,
+                    a.graph.as_deref(),
+                    a.starts.as_deref(),
+                    &opts,
+                )?,
+                DType::F32 => calibrate::calibrate::<f32>(
+                    &a.dataset,
+                    a.graph.as_deref(),
+                    a.starts.as_deref(),
+                    &opts,
+                )?,
+            };
+            if let Some(dir) = a.output.parent() {
+                if !dir.as_os_str().is_empty() {
+                    std::fs::create_dir_all(dir)?;
+                }
+            }
+            std::fs::write(&a.output, serde_json::to_string_pretty(&report)? + "\n")?;
+            println!(
+                "calibrated in {:.1} s -> {}",
+                report["elapsed_s"].as_f64().unwrap_or(0.0),
+                a.output.display()
+            );
+            Ok(())
+        }
         Command::Info { path, dtype: d } => info(&path, d),
     }
 }

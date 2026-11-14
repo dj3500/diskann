@@ -776,6 +776,18 @@ pub struct NodeVectors<'a, T> {
     n_data: u32,
 }
 
+impl<'a, T: Element> NodeVectors<'a, T> {
+    /// The vectors of the data points of `base` (no auxiliary nodes).
+    pub fn data(base: &'a Matrix<T>) -> Self {
+        Self {
+            base: base.as_slice(),
+            aux: &[],
+            dim: base.ncols(),
+            n_data: base.nrows() as u32,
+        }
+    }
+}
+
 impl<'a, T> NodeVectors<'a, T> {
     /// Vector of node `id`.
     ///

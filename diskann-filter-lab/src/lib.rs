@@ -12,6 +12,7 @@
 //! bands. File formats and the `flab` command-line tool are described in `README.md`.
 
 pub mod bitsets;
+pub mod calibrate;
 pub mod container;
 pub mod diskann_io;
 pub mod graph;

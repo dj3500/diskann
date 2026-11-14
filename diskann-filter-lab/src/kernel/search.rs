@@ -16,12 +16,13 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{StartAdmission, StartSource, Terminator},
+    cost::{Estimates, ExactPlan, PlanInputs, UnitCosts},
     entry::{self, SampleIndex, StartPredicate},
     eval::{
         ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
         StaticBits,
     },
-    exact,
+    exact::{self, ExactEval},
     materialize::{Materialized, Materializer},
     score::{
         self, AdditiveScore, BonusScore, DistanceScore, LexicographicScore, MultiplicativeScore,
@@ -68,8 +69,11 @@ pub struct Index<'a, T> {
     pub view_postings: Option<&'a [u64]>,
     /// Positive base-derived minimum of the per-query scales (`ε_min`; 0 if unknown).
     pub eps_min: f32,
-    /// Static per-label bitsets of `labels` (the `static_bits(θ)` predicate mode).
+    /// Static per-label bitsets of `labels` (the `static_bits(θ)` predicate mode, and the
+    /// exact path v2's checks and bitmaps).
     pub bitsets: Option<&'a LabelBitsets>,
+    /// Unit costs of the cost model (the planned exact path).
+    pub costs: Option<&'a UnitCosts>,
 }
 
 /// One query: its vector, predicate and, with a label view, the view's predicate.
@@ -134,6 +138,13 @@ pub struct Counters {
     /// Final expandable beam size (L after adaptive resizing).
     pub final_l: u64,
     pub route: Route,
+    /// Exact plan chosen ([`ExactPlan`] code; 0 for none or the version-1 paths).
+    pub plan: u64,
+    /// Estimated cost of the exact path (model ns; 0 if not computed).
+    pub est_exact_ns: u64,
+    /// Estimates of `|union(c*)|` and of the match count (0 if not computed).
+    pub a_hat: u64,
+    pub m_hat: u64,
 }
 
 impl Counters {
@@ -154,7 +165,7 @@ impl Counters {
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 14] = [
+    pub const NAMES: [&'static str; 18] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -169,10 +180,14 @@ impl Counters {
         "n_exact_cand",
         "n_start",
         "final_L",
+        "plan",
+        "est_exact_ns",
+        "a_hat",
+        "m_hat",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 14] {
+    pub fn values(&self) -> [u64; 18] {
         [
             self.n_dist,
             self.n_pred,
@@ -188,6 +203,10 @@ impl Counters {
             self.n_exact_cand,
             self.n_start,
             self.final_l,
+            self.plan,
+            self.est_exact_ns,
+            self.a_hat,
+            self.m_hat,
         ]
     }
 }
@@ -216,6 +235,10 @@ pub struct Plan {
     complete: bool,
     n_aux: usize,
     fast: FastPath,
+    /// Unit costs (planned exact path).
+    costs: Option<UnitCosts>,
+    /// Evaluator of the planned exact path.
+    exact_eval: ExactEval,
 }
 
 impl Plan {
@@ -320,6 +343,26 @@ impl Plan {
                 "adaptive_l counts matches, which deferred evaluation does not see"
             );
         }
+        let costs = if kernel.exact.is_planned() {
+            let c = ix.costs.ok_or_else(|| {
+                anyhow::anyhow!("the planned exact path needs unit costs (a calibration)")
+            })?;
+            c.validate()?;
+            Some(c.clone())
+        } else {
+            None
+        };
+        if let Some(b) = ix.bitsets {
+            ensure!(
+                b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
+                "the static bitsets refer to another label store"
+            );
+        }
+        let exact_eval = if ix.bitsets.is_some() && kernel.exact.is_planned() {
+            ExactEval::StaticBits
+        } else {
+            ExactEval::RowScan
+        };
         let fast = if eval != EvalMode::RowScan {
             FastPath::None
         } else if *kernel == Preset::Postfilter.kernel() {
@@ -340,7 +383,17 @@ impl Plan {
             complete: kernel.needs_g(),
             n_aux: ix.graph.n_aux(),
             fast,
+            costs,
+            exact_eval,
         })
+    }
+
+    /// Whether the plan may build dense bitmaps (materializers or the exact `bitmap` plan).
+    pub fn needs_dense(&self) -> bool {
+        matches!(
+            self.kernel.materializer,
+            Materializer::Dense | Materializer::DenseStatic
+        ) || (self.kernel.exact.is_planned() && self.kernel.exact_plans.contains(ExactPlan::Bitmap))
     }
 
     /// The same plan without its hand-specialized fast path (every query runs the
@@ -513,12 +566,7 @@ impl Searcher {
 
     /// Scratch sized for `ix` and the materializers of `plans`.
     pub fn for_index<T: Element>(ix: &Index<'_, T>, plans: &[&Plan]) -> Self {
-        let dense = plans.iter().any(|p| {
-            matches!(
-                p.kernel.materializer,
-                Materializer::Dense | Materializer::DenseStatic
-            )
-        });
+        let dense = plans.iter().any(|p| p.needs_dense());
         Self::new(
             ix.graph.n_nodes(),
             ix.graph.n_data(),
@@ -574,84 +622,62 @@ impl Searcher {
                 .split_static(ix.labels, b, plan.static_theta, plan.complete);
             b
         });
-        let exact_threshold = kernel.exact.threshold();
+        // The planned exact path checks clauses with the static bitsets when the index has
+        // them (the graph search may use another evaluator).
+        let exact_stat = match (stat, plan.exact_eval, ix.bitsets) {
+            (Some(b), _, _) => Some(b),
+            (None, ExactEval::StaticBits, Some(b)) => {
+                self.compiled.split_static(ix.labels, b, b.theta(), false);
+                Some(b)
+            }
+            _ => None,
+        };
         let n = if self.compiled.is_empty() {
             ctr.route = Route::Empty;
             0
-        } else if exact_threshold.is_some_and(|t| self.compiled.min_upper_bound() <= t) {
-            ctr.route = Route::Exact;
-            let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
-            if let Some(b) = stat {
-                cx = cx.with_static(b);
-            }
-            exact::run(
-                kernel.exact,
-                plan.eval,
-                &cx,
-                &ix.vectors,
-                ix.graph.n_data(),
-                q.vector,
-                k,
-                &mut self.mat,
-                &mut self.answers,
-                &mut ctr,
-            );
-            self.answers.finish(ids, dists)
         } else {
-            ctr.route = Route::Graph;
-            self.visited.clear();
-            let predicate = if ix.label_view {
-                let cnf = q
-                    .view
-                    .expect("the plan's per-label starts need the query's label-view predicate");
-                StartPredicate::View {
-                    cnf,
-                    postings: ix.view_postings,
+            let routed = kernel
+                .exact
+                .threshold()
+                .is_some_and(|t| self.compiled.min_upper_bound() <= t);
+            if routed && kernel.exact.is_planned() {
+                ctr.route = Route::Exact;
+                let costs = plan.costs.as_ref().expect("validated");
+                let est = Estimates::from_bounds(&self.compiled, ix.graph.n_data());
+                let (p, e) = PlanInputs {
+                    q: &self.compiled,
+                    labels: ix.labels,
+                    bitsets: exact_stat,
+                    k,
                 }
-            } else {
-                StartPredicate::Base
-            };
-            let inputs = entry::Inputs {
-                sources: &kernel.starts,
-                sample_start: kernel.sample_start,
-                global: ix.global,
-                label_starts: ix.label_starts,
-                sample: ix.sample,
-                predicate,
-                n_data: ix.graph.n_data() as u32,
-                n_nodes: ix.graph.n_nodes() as u32,
-            };
-            let cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
-            entry::select(
-                &inputs,
-                &cx,
-                &mut self.visited,
-                &mut self.starts,
-                &mut self.heap,
-                &mut self.pos,
-                &mut ctr,
-            );
-            ctr.n_start = self.starts.len() as u64;
-            match plan.fast {
-                FastPath::Postfilter if reference.is_none() && self.trace.is_none() => {
-                    self.fast_postfilter(ix, q, l, &mut ctr, ids, dists)
+                .best(costs, kernel.exact_plans, &est, false, false);
+                ctr.plan = p as u64;
+                ctr.est_exact_ns = e.round() as u64;
+                ctr.a_hat = est.a.round() as u64;
+                ctr.m_hat = est.m.round() as u64;
+                self.exact_v2(plan, ix, q, k, p, exact_stat, false, &mut ctr);
+                self.answers.finish(ids, dists)
+            } else if routed {
+                ctr.route = Route::Exact;
+                let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+                if let Some(b) = stat {
+                    cx = cx.with_static(b);
                 }
-                FastPath::Inline if reference.is_none() && self.trace.is_none() => {
-                    self.fast_inline(ix, q, l, &mut ctr, ids, dists)
-                }
-                _ => dispatch(
+                exact::run(
+                    kernel.exact,
                     plan.eval,
-                    plan.family,
-                    self,
-                    plan,
-                    ix,
-                    q,
-                    l,
-                    reference,
+                    &cx,
+                    &ix.vectors,
+                    ix.graph.n_data(),
+                    q.vector,
+                    k,
+                    &mut self.mat,
+                    &mut self.answers,
                     &mut ctr,
-                    ids,
-                    dists,
-                ),
+                );
+                self.answers.finish(ids, dists)
+            } else {
+                self.graph(plan, ix, q, l, reference, &mut ctr, ids, dists)
             }
         };
         self.compiled.clear_bits(&mut self.bits);
@@ -659,6 +685,118 @@ impl Searcher {
         dists[n..].fill(f32::MAX);
         ctr.n_out = n as u64;
         ctr
+    }
+
+    /// The planned exact path for the compiled query (`seeded`: the answer heap holds a
+    /// graph search's answers).
+    #[expect(clippy::too_many_arguments, reason = "the per-query inputs")]
+    fn exact_v2<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        k: usize,
+        p: ExactPlan,
+        exact_stat: Option<&LabelBitsets>,
+        seeded: bool,
+        ctr: &mut Counters,
+    ) {
+        let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+        let eval = match exact_stat {
+            Some(b) => {
+                cx = cx.with_static(b);
+                ExactEval::StaticBits
+            }
+            None => ExactEval::RowScan,
+        };
+        debug_assert!(plan.kernel.exact.is_planned());
+        exact::run_planned(
+            p,
+            eval,
+            &cx,
+            &ix.vectors,
+            ix.graph.n_data(),
+            q.vector,
+            k,
+            &mut self.mat,
+            &mut self.answers,
+            seeded,
+            ctr,
+        );
+    }
+
+    /// The graph search (start selection, then the loop); returns the answers written.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    fn graph<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        reference: Option<u64>,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
+        let kernel = &plan.kernel;
+        ctr.route = Route::Graph;
+        self.visited.clear();
+        let predicate = if ix.label_view {
+            let cnf = q
+                .view
+                .expect("the plan's per-label starts need the query's label-view predicate");
+            StartPredicate::View {
+                cnf,
+                postings: ix.view_postings,
+            }
+        } else {
+            StartPredicate::Base
+        };
+        let inputs = entry::Inputs {
+            sources: &kernel.starts,
+            sample_start: kernel.sample_start,
+            global: ix.global,
+            label_starts: ix.label_starts,
+            sample: ix.sample,
+            predicate,
+            n_data: ix.graph.n_data() as u32,
+            n_nodes: ix.graph.n_nodes() as u32,
+        };
+        let cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+        entry::select(
+            &inputs,
+            &cx,
+            &mut self.visited,
+            &mut self.starts,
+            &mut self.heap,
+            &mut self.pos,
+            ctr,
+        );
+        ctr.n_start = self.starts.len() as u64;
+        match plan.fast {
+            FastPath::Postfilter if reference.is_none() && self.trace.is_none() => {
+                self.fast_postfilter(ix, q, l, ctr, ids, dists)
+            }
+            FastPath::Inline if reference.is_none() && self.trace.is_none() => {
+                self.fast_inline(ix, q, l, ctr, ids, dists)
+            }
+            _ => dispatch(
+                plan.eval,
+                plan.family,
+                self,
+                plan,
+                ix,
+                q,
+                l,
+                reference,
+                ctr,
+                ids,
+                dists,
+            ),
+        }
     }
 }
 
@@ -835,6 +973,7 @@ const EAGER: u8 = 0;
 const DEFERRED: u8 = 1;
 const PREDICATE_FIRST: u8 = 2;
 const DISTANCE_FIRST: u8 = 3;
+const HEAP_BOUND: u8 = 4;
 
 /// Records an insertion (trace mode; kept out of the hot loop).
 #[cold]
@@ -1122,6 +1261,19 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                 let p = self.pred(v, c);
                 self.place::<TRACE>(v, d, p, src, c)
             }
+            HEAP_BOUND => {
+                let d = self.distance(v, cached, c);
+                // Strictly beyond a full answer heap's K-th: not an answer whatever the
+                // predicate says (equal distances may enter by id); the node still navigates.
+                if self.lazy_ok && self.answers.is_full() && d > self.answers.worst() {
+                    c.n_lazy += 1;
+                    let key = self.sc.key(d, false, 0.0);
+                    self.insert::<TRACE>(key, d, v, State::Unknown, src, None, "lazy_navigated", c);
+                    return Outcome::Admitted;
+                }
+                let p = self.pred(v, c);
+                self.place::<TRACE>(v, d, p, src, c)
+            }
             _ => {
                 let d = self.distance(v, cached, c);
                 let p = self.pred(v, c);
@@ -1137,6 +1289,7 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
             Laziness::Deferred => self.offer::<DEFERRED, true>(v, source, cached, c),
             Laziness::PredicateFirst => self.offer::<PREDICATE_FIRST, true>(v, source, cached, c),
             Laziness::DistanceFirst => self.offer::<DISTANCE_FIRST, true>(v, source, cached, c),
+            Laziness::HeapBound => self.offer::<HEAP_BOUND, true>(v, source, cached, c),
         }
     }
 
@@ -1208,7 +1361,11 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
         if n >= self.n_data {
             c.n_aux_expand += 1;
         }
-        let rows = P::ROWS && LZ != DEFERRED;
+        // Under `heap_bound` with a full heap most neighbours skip their predicate: their rows
+        // are not prefetched.
+        let rows = P::ROWS
+            && LZ != DEFERRED
+            && !(LZ == HEAP_BOUND && self.lazy_ok && self.answers.is_full());
         nbrs.clear();
         for &v in graph.neighbors(n) {
             if !self.visited.test_and_set(v) {
@@ -1370,6 +1527,7 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
             (Laziness::Deferred, _) => go!(DEFERRED, false),
             (Laziness::PredicateFirst, _) => go!(PREDICATE_FIRST, false),
             (Laziness::DistanceFirst, _) => go!(DISTANCE_FIRST, false),
+            (Laziness::HeapBound, _) => go!(HEAP_BOUND, false),
         }
     }
 

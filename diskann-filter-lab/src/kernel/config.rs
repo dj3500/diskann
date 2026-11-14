@@ -15,7 +15,13 @@ use std::fmt;
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 
-pub use super::{collect::Collector, eval::Weights, exact::ExactPath, materialize::Materializer};
+pub use super::{
+    collect::Collector,
+    cost::{ExactPlan, PlanSet},
+    eval::Weights,
+    exact::ExactPath,
+    materialize::Materializer,
+};
 
 /// A source of start nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -79,6 +85,10 @@ pub enum Laziness {
     /// Distance first; the predicate is skipped when the node can neither enter the beam nor
     /// the answers.
     DistanceFirst,
+    /// Distance first; the predicate is skipped whenever the node cannot be an answer (the
+    /// `heap(K)` collector is full and the distance exceeds its K-th), but the node still
+    /// navigates (distance keys, admission `all`).
+    HeapBound,
 }
 
 /// Scorer role (see [`super::score`]).
@@ -175,6 +185,8 @@ pub struct Kernel {
     pub padding: Padding,
     /// `g` used to key auxiliary nodes.
     pub aux_g: f32,
+    /// Plans the exact path v2 may choose from.
+    pub exact_plans: PlanSet,
 }
 
 impl Default for Kernel {
@@ -198,6 +210,7 @@ impl Default for Kernel {
             beam_width: 1,
             padding: Padding::Upstream,
             aux_g: 0.0,
+            exact_plans: PlanSet::ALL,
         }
     }
 }
@@ -348,7 +361,10 @@ impl Laziness {
             "deferred" => Self::Deferred,
             "predicate_first" => Self::PredicateFirst,
             "distance_first" => Self::DistanceFirst,
-            _ => bail!("unknown laziness {s:?} (eager, deferred, predicate_first, distance_first)"),
+            "heap_bound" => Self::HeapBound,
+            _ => bail!(
+                "unknown laziness {s:?} (eager, deferred, predicate_first, distance_first, heap_bound)"
+            ),
         })
     }
 }
@@ -360,6 +376,7 @@ impl fmt::Display for Laziness {
             Self::Deferred => "deferred",
             Self::PredicateFirst => "predicate_first",
             Self::DistanceFirst => "distance_first",
+            Self::HeapBound => "heap_bound",
         })
     }
 }
@@ -558,8 +575,10 @@ fn parse_exact(s: &str) -> Result<ExactPath> {
         ("none", []) => ExactPath::None,
         ("scan_smallest_clause", [t]) => ExactPath::ScanSmallestClause(num(t, "T_exact")?),
         ("intersect_then_scan", [t]) => ExactPath::IntersectThenScan(num(t, "T_exact")?),
+        ("planned", []) => ExactPath::Planned(0),
+        ("planned", [t]) => ExactPath::Planned(num(t, "T_exact")?),
         _ => bail!(
-            "unknown exact path {s:?} (none, scan_smallest_clause(T), intersect_then_scan(T))"
+            "unknown exact path {s:?} (none, scan_smallest_clause(T), intersect_then_scan(T), planned(T))"
         ),
     })
 }
@@ -569,6 +588,7 @@ fn exact_name(e: ExactPath) -> String {
         ExactPath::None => "none".into(),
         ExactPath::ScanSmallestClause(t) => format!("scan_smallest_clause({t})"),
         ExactPath::IntersectThenScan(t) => format!("intersect_then_scan({t})"),
+        ExactPath::Planned(t) => format!("planned({t})"),
     }
 }
 
@@ -610,6 +630,7 @@ impl Kernel {
             "beam_width" => self.beam_width = num(value, "beam width")?,
             "padding" => self.padding = parse_padding(value)?,
             "aux_g" => self.aux_g = num(value, "aux_g")?,
+            "exact_plans" => self.exact_plans = PlanSet::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -687,8 +708,16 @@ impl Kernel {
                 !two_hop,
                 "predicate_first is illegal with two_hop (the second hop ranks rejected nodes by distance)"
             ),
+            Laziness::HeapBound => ensure!(
+                !two_hop
+                    && self.admission == Admission::All
+                    && self.scorer == Scorer::Distance
+                    && self.collector == Collector::Heap,
+                "heap_bound requires admission all, the distance scorer, the heap collector and one_hop (keys must not depend on the predicate)"
+            ),
             Laziness::Eager => {}
         }
+        ensure!(!self.exact_plans.is_empty(), "exact_plans is empty");
         if let PredicateMode::StaticBits(t) = self.predicate {
             ensure!(t >= 1, "static_bits(θ) needs θ >= 1");
         }
@@ -738,6 +767,7 @@ impl Kernel {
                 Padding::Exact => "exact",
             },
             "aux_g": self.aux_g,
+            "exact_plans": self.exact_plans.to_string(),
         })
     }
 
@@ -957,6 +987,15 @@ mod tests {
         ] {
             assert_eq!(Terminator::parse(s).unwrap().to_string(), s);
         }
+        assert_eq!(parse_exact("planned").unwrap(), ExactPath::Planned(0));
+        assert_eq!(
+            exact_name(parse_exact("planned(500)").unwrap()),
+            "planned(500)"
+        );
+        assert_eq!(
+            Laziness::parse("heap_bound").unwrap().to_string(),
+            "heap_bound"
+        );
         for s in ["mode1", "mode2", "bitmap", "static_bits(31250)"] {
             assert_eq!(PredicateMode::parse(s).unwrap().to_string(), s);
         }
@@ -1046,6 +1085,16 @@ mod tests {
             ("scorer", "multiplicative(1.2)")
         ]));
         assert!(bad(&[("scorer", "bonus(0)")]));
+        assert!(
+            bad(&[("laziness", "heap_bound")]),
+            "needs the heap collector"
+        );
+        assert!(bad(&[
+            ("laziness", "heap_bound"),
+            ("collector", "heap"),
+            ("scorer", "bonus(0.5)")
+        ]));
+        assert!(!bad(&[("laziness", "heap_bound"), ("collector", "heap")]));
         assert!(!bad(&[
             ("predicate", "bitmap"),
             ("materializer", "dense"),

@@ -94,6 +94,33 @@ impl Answers {
         }
     }
 
+    /// [`Self::offer`] for `heap(K)` that ignores a point already held (merging answers found
+    /// by another search into a seeded heap). Returns whether the point was inserted.
+    #[inline]
+    pub fn offer_unique(&mut self, d: f32, id: u32) -> bool {
+        let p = pack(d, id);
+        if self.kind == Some(Collector::Heap)
+            && self.items.len() >= self.k
+            && (self.k == 0 || p >= self.items[0])
+        {
+            return false;
+        }
+        if self.items.iter().any(|&x| x as u32 == id) {
+            return false;
+        }
+        self.offer(d, id).0
+    }
+
+    /// Whether point `id` is held.
+    pub fn contains(&self, id: u32) -> bool {
+        self.items.iter().any(|&x| x as u32 == id)
+    }
+
+    /// The `K` of the collector.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
     /// Writes the answers, sorted by (distance, id), into `ids`/`dists` (at most
     /// `ids.len()`; `all` keeps the first `L₀` first) and returns their number. The caller
     /// pads the rest.

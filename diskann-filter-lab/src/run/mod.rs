@@ -53,6 +53,7 @@ use crate::{
     bitsets::LabelBitsets,
     kernel::{
         config::{Materializer, PredicateMode, StartSource},
+        cost::UnitCosts,
         entry::SampleIndex,
         search::{Counters, FastPath, Index, Plan, Query, Searcher},
         trace::Trace,
@@ -358,7 +359,9 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         .or_else(|| {
             exp.configs
                 .iter()
-                .any(|c| c.kernel.materializer == Materializer::DenseStatic)
+                .any(|c| {
+                    c.kernel.materializer == Materializer::DenseStatic || uses_exact_bitsets(c)
+                })
                 .then(|| ds.labels.n_points().div_ceil(64) as u64)
         });
     let (bitsets, bitsets_json) = match (theta_min, &exp.bitsets_sidecar) {
@@ -385,6 +388,15 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         }
     };
 
+    // Unit costs of the cost model (an untimed sidecar).
+    let (costs, costs_json) = match &exp.calibration {
+        None => (None, Value::Null),
+        Some(path) => {
+            let c = read_costs(path)?;
+            let doc = json!({"source": path, "costs": &c});
+            (Some(c), doc)
+        }
+    };
     // Indices, plans and per-row queries.
     let mut indices = Vec::new();
     let mut plans = Vec::new();
@@ -417,6 +429,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             view_postings,
             eps_min: eps,
             bitsets: bitsets.as_ref(),
+            costs: costs.as_ref(),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
         if !exp.fast_paths {
@@ -527,8 +540,10 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "qsets": exp.qsets, "limit": exp.limit, "queries": exp.queries,
                 "mode": exp.mode.name(), "reps": exp.reps, "seed": exp.seed,
                 "bitsets": (matches!(c.kernel.predicate, PredicateMode::StaticBits(_))
-                    || c.kernel.materializer == Materializer::DenseStatic)
+                    || c.kernel.materializer == Materializer::DenseStatic
+                    || uses_exact_bitsets(c))
                     .then(|| bitsets_json["source"].clone()),
+                "calibration": uses_costs(c).then(|| costs_json["source"].clone()),
             });
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));
             let safe: String = c
@@ -605,6 +620,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "sample": g.sample.as_ref().map(SampleIndex::len),
                 "sample_index_bytes": g.sample.as_ref().map(SampleIndex::bytes),
                 "bitsets": bitsets_json,
+                "calibration": if uses_costs(c) { costs_json.clone() } else { Value::Null },
             });
             let protocol = json!({
                 "reps": if exp.mode == Mode::Timed { exp.reps } else { 1 },
@@ -646,7 +662,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             put("skipped_efforts", json!(out.skipped));
             put(
                 "skipped_reason",
-                json!("the collector returns at most L answers (L < K)"),
+                json!("the collector returns at most L answers (L < K), or the configuration's own efforts"),
             );
             put("reps", protocol["reps"].clone());
             put("protocol", protocol);
@@ -727,7 +743,33 @@ fn counter_docs() -> Value {
         "n_exact_cand": "exact-path candidates",
         "n_start": "starts selected (deduplicated)",
         "final_L": "expandable beam size at the end (adaptive L)",
+        "plan": "exact plan chosen: 0 none / version-1 path, 1 scan, 2 distance-first, 3 gallop, 4 bitmap",
+        "est_exact_ns": "estimated exact-path cost (model ns; 0 if not computed)",
+        "a_hat": "estimate of |union(c*)| (0 if not computed)",
+        "m_hat": "estimate of the match count (0 if not computed)",
     })
+}
+
+/// Whether a configuration's exact path uses the static bitsets.
+fn uses_exact_bitsets(c: &ConfigSpec) -> bool {
+    c.kernel.exact.is_planned()
+}
+
+/// Whether a configuration reads the unit costs.
+fn uses_costs(c: &ConfigSpec) -> bool {
+    c.kernel.exact.is_planned()
+}
+
+/// Reads unit costs: a `flab calibrate` report (its `costs` member) or a bare cost object.
+pub fn read_costs(path: &Path) -> Result<UnitCosts> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let v: Value =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let c: UnitCosts = serde_json::from_value(v.get("costs").cloned().unwrap_or(v))
+        .with_context(|| format!("unit costs in {}", path.display()))?;
+    c.validate()?;
+    Ok(c)
 }
 
 /// Distinct values of the panel rows' `split` column.
@@ -753,14 +795,18 @@ fn run_k<T: Element>(
 ) -> Result<Vec<Outcome>> {
     let exp = cx.exp;
     let n = cx.rows.len();
+    let own_efforts: Vec<Option<Vec<usize>>> =
+        exp.configs.iter().map(|c| c.efforts.clone()).collect();
     let mut outs: Vec<Outcome> = cx
         .plans
         .iter()
-        .map(|p| {
-            let (efforts, skipped): (Vec<usize>, Vec<usize>) = exp
-                .efforts
-                .iter()
-                .partition(|&&l| !(p.kernel.needs_l_at_least_k() && l < k));
+        .enumerate()
+        .map(|(ci, p)| {
+            let (efforts, skipped): (Vec<usize>, Vec<usize>) =
+                exp.efforts.iter().partition(|&&l| {
+                    !(p.kernel.needs_l_at_least_k() && l < k)
+                        && own_efforts[ci].as_ref().is_none_or(|v| v.contains(&l))
+                });
             Outcome {
                 ids: efforts
                     .iter()
