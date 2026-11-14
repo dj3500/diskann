@@ -79,6 +79,10 @@ pub struct Compiled {
     small_mask: u64,
     /// The first bitset slot of the first navigation clause (`u32::MAX` if none; prefetched).
     static_first: u32,
+    /// Whether the static-bitset evaluator prefetches rows: some navigation clause has row
+    /// labels (complete evaluation), or the first one has (Boolean evaluation, where a
+    /// first clause made of bitset labels decides most nodes without the row).
+    static_row_prefetch: bool,
 }
 
 impl Compiled {
@@ -115,6 +119,7 @@ impl Compiled {
         self.small.clear();
         self.small_mask = 0;
         self.static_first = u32::MAX;
+        self.static_row_prefetch = false;
         for (i, clause) in cnf.clauses().enumerate() {
             if clause.is_empty() {
                 self.empty = true;
@@ -188,16 +193,24 @@ impl Compiled {
 
     /// Splits every clause for the [`StaticBits`] evaluator: labels with at least `theta`
     /// points that have a bitset in `sb` (ordered by decreasing posting length, so the label
-    /// most likely to hit is tested first), and the others (checked on the row). Called after
-    /// [`Self::compile`] (part of the per-query compilation); a no-op for queries with an empty
-    /// clause.
-    pub fn split_static(&mut self, labels: &LabelStore, sb: &LabelBitsets, theta: u64) {
+    /// most likely to hit is tested first), and the others (checked on the row). `complete`
+    /// tells whether evaluations will count failed clauses (it only changes what is
+    /// prefetched). Called after [`Self::compile`] (part of the per-query compilation); a
+    /// no-op for queries with an empty clause.
+    pub fn split_static(
+        &mut self,
+        labels: &LabelStore,
+        sb: &LabelBitsets,
+        theta: u64,
+        complete: bool,
+    ) {
         self.big_offsets.clear();
         self.big.clear();
         self.small_offsets.clear();
         self.small.clear();
         self.small_mask = 0;
         self.static_first = u32::MAX;
+        self.static_row_prefetch = false;
         if self.empty {
             return;
         }
@@ -226,6 +239,12 @@ impl Compiled {
                 self.static_first = slot;
             }
         }
+        let has_row = |j: u32| j < 64 && self.small_mask & (1u64 << j) != 0;
+        self.static_row_prefetch = if complete {
+            self.nav.iter().any(|&j| has_row(j))
+        } else {
+            self.nav.first().is_some_and(|&j| has_row(j))
+        };
     }
 
     /// Bitset slots of the clause at position `j` (after [`Self::split_static`]).
@@ -674,20 +693,20 @@ impl Eval for StaticBits {
         static_failed(cx, v, q.full_mask, true) == 0
     }
 
-    /// The row (when the query has labels without a bitset).
+    /// The row, when it is likely to be read (see [`Compiled::split_static`]).
     #[inline(always)]
     fn prefetch(cx: &EvalCtx<'_>, v: u32) {
-        if !cx.q.small.is_empty() {
+        if cx.q.static_row_prefetch {
             RowScan::prefetch(cx, v);
         }
     }
 
-    /// The row offsets (when the query has labels without a bitset) and the bitset word of
-    /// the first navigation clause's most frequent label.
+    /// The row offsets (when the row is likely to be read) and the bitset word of the first
+    /// navigation clause's most frequent label.
     #[inline(always)]
     fn prefetch_offsets(cx: &EvalCtx<'_>, v: u32) {
         let q = cx.q;
-        if !q.small.is_empty() {
+        if q.static_row_prefetch {
             RowScan::prefetch_offsets(cx, v);
         }
         if q.static_first != u32::MAX {
@@ -951,7 +970,7 @@ mod tests {
                         q.clear_bits(&mut bits);
                         continue;
                     }
-                    q.split_static(&s, bitsets, t);
+                    q.split_static(&s, bitsets, t, i % 2 == 0);
                     if (0..q.n_clauses()).all(|j| q.row_labels(j).is_empty()) {
                         row_reads_avoided += 1;
                     }
@@ -1004,7 +1023,7 @@ mod tests {
         assert_eq!((p.m, p.unit), (false, 1));
         assert!(!RowScan::full(&cx, 1));
         let sb = LabelBitsets::build(&s, 1);
-        q.split_static(&s, &sb, 1);
+        q.split_static(&s, &sb, 1, true);
         let cx = EvalCtx::new(&s, &q, &bits, &[], &[]).with_static(&sb);
         assert_eq!(StaticBits::eval(&cx, 1, true), p);
         assert!(StaticBits::full(&cx, 0) && !StaticBits::full(&cx, 1));

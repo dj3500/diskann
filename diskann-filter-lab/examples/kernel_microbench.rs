@@ -15,8 +15,9 @@
 //!   `cold_pf` (the same with the kernel's two-stage prefetch over groups of 32, as when
 //!   expanding a node: the evaluator's `prefetch_offsets` for the group, then `prefetch`
 //!   eight points ahead). Labels and predicates only (no vectors).
-//! - `materialize`: per query, the dense match bitmap and the sparse intersection (first run
-//!   after a cache flush, and the median of three warm runs).
+//! - `materialize`: per query, the dense match bitmap (from postings, and with static bitsets
+//!   for the labels with at least `θ` points) and the sparse intersection (first run after a
+//!   cache flush, and the median of three warm runs).
 //! - `exact`: per query, the exact paths (`scan_smallest_clause` with each evaluator,
 //!   `intersect_then_scan`) after a cache flush, with candidate and distance counts.
 //! - `distances`: ns per squared-L2 distance on random base rows (`warm`, `cold`, `cold_pf`).
@@ -109,6 +110,9 @@ struct MatArgs {
     /// Warm repetitions per query (after the first, cold run).
     #[arg(long, default_value_t = 3)]
     warm_reps: usize,
+    /// Static-bitset threshold of `dense_static` (default ⌈n/64⌉).
+    #[arg(long)]
+    theta: Option<u64>,
 }
 
 #[derive(Args)]
@@ -405,7 +409,7 @@ fn checks(a: &ChecksArgs) -> Result<()> {
                 Variant::Mode2(c) => ("mode2", 0, c),
                 Variant::Bitmap => ("bitmap", 0, false),
                 Variant::Static(i, c) => {
-                    q.split_static(&labels, &bitsets[i], thetas[i]);
+                    q.split_static(&labels, &bitsets[i], thetas[i], c);
                     ("static_bits", thetas[i], c)
                 }
             };
@@ -486,10 +490,19 @@ fn materialize(a: &MatArgs) -> Result<()> {
     let labels = load_labels(c)?;
     let n = labels.n_points();
     let (sets, picked) = load_queries(c, &labels)?;
+    let theta = a.theta.unwrap_or(n.div_ceil(64) as u64);
+    let tb = Instant::now();
+    let sb = LabelBitsets::build(&labels, theta);
+    eprintln!(
+        "static bitsets θ {theta}: {} labels, {:.1} MiB, built in {:.2} s",
+        sb.n_bitsets(),
+        sb.bytes() as f64 / (1u64 << 20) as f64,
+        tb.elapsed().as_secs_f64()
+    );
     let flusher = Flusher::new();
     let mut w = writer(
         &c.out,
-        "ds\tqset\tqidx\tclauses\tlabels\twidth\tu_min\tu_sum\tn_match\tsparse_cand\tdense_first_ns\tsparse_first_ns\tdense_warm_ns\tsparse_warm_ns",
+        "ds\tqset\tqidx\tclauses\tlabels\twidth\tu_min\tu_sum\tn_match\tsparse_cand\tdense_first_ns\tsparse_first_ns\tdense_warm_ns\tsparse_warm_ns\ttheta\tstatic_read\tdense_static_first_ns\tdense_static_warm_ns",
     )?;
     let mut bits = vec![0u64; labels.n_labels()];
     let mut q = Compiled::new();
@@ -508,10 +521,15 @@ fn materialize(a: &MatArgs) -> Result<()> {
         let cand = black_box(mat.build_sparse(&labels, &q, n));
         let sparse_first = t.elapsed().as_nanos() as u64;
         let n_match = mat.sparse.len();
-        let (mut dw, mut sw) = (vec![0], vec![0]);
+        flusher.flush();
+        let t = Instant::now();
+        let static_read = black_box(mat.build_dense_static(&labels, &q, n, &sb));
+        let static_first = t.elapsed().as_nanos() as u64;
+        let (mut dw, mut sw, mut stw) = (vec![0], vec![0], vec![0]);
         if a.warm_reps > 0 {
             dw.clear();
             sw.clear();
+            stw.clear();
         }
         for _ in 0..a.warm_reps {
             let t = Instant::now();
@@ -520,15 +538,19 @@ fn materialize(a: &MatArgs) -> Result<()> {
             let t = Instant::now();
             black_box(mat.build_sparse(&labels, &q, n));
             sw.push(t.elapsed().as_nanos() as u64);
+            let t = Instant::now();
+            black_box(mat.build_dense_static(&labels, &q, n, &sb));
+            stw.push(t.elapsed().as_nanos() as u64);
         }
         let (clauses, n_labels, width) = shape(&q);
         writeln!(
             w,
-            "{}\t{qname}\t{qi}\t{clauses}\t{n_labels}\t{width}\t{}\t{u_sum}\t{n_match}\t{cand}\t{dense_first}\t{sparse_first}\t{}\t{}",
+            "{}\t{qname}\t{qi}\t{clauses}\t{n_labels}\t{width}\t{}\t{u_sum}\t{n_match}\t{cand}\t{dense_first}\t{sparse_first}\t{}\t{}\t{theta}\t{static_read}\t{static_first}\t{}",
             c.tag,
             q.min_upper_bound(),
             median(&mut dw),
-            median(&mut sw)
+            median(&mut sw),
+            median(&mut stw)
         )?;
         q.clear_bits(&mut bits);
     }
@@ -631,7 +653,7 @@ fn exact_paths<T: Element>(a: &ExactArgs) -> Result<()> {
         for (rot, &(si, qi, b)) in list.iter().enumerate() {
             let (qname, preds) = &sets[si];
             q.compile(&labels, preds.get(qi), Weights::Unit, None, &mut bits);
-            q.split_static(&labels, &bitsets, theta);
+            q.split_static(&labels, &bitsets, theta, false);
             let (clauses, n_labels, _) = shape(&q);
             let cx = EvalCtx::new(&labels, &q, &bits, &[], &[]).with_static(&bitsets);
             let qv = qvecs[si].row(qi);

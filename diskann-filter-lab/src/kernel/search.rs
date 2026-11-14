@@ -247,7 +247,9 @@ impl Plan {
         let eval = match (kernel.predicate, kernel.materializer) {
             (PredicateMode::RowScan, _) => EvalMode::RowScan,
             (PredicateMode::ClauseSearch, _) => EvalMode::ClauseSearch,
-            (PredicateMode::Bitmap, Materializer::Dense) => EvalMode::Dense,
+            (PredicateMode::Bitmap, Materializer::Dense | Materializer::DenseStatic) => {
+                EvalMode::Dense
+            }
             (PredicateMode::Bitmap, _) => EvalMode::Sparse,
             (PredicateMode::StaticBits(_), _) => EvalMode::StaticBits,
         };
@@ -273,6 +275,15 @@ impl Plan {
             }
             _ => 0,
         };
+        if kernel.materializer == Materializer::DenseStatic {
+            let b = ix.bitsets.ok_or_else(|| {
+                anyhow::anyhow!("the dense_static materializer needs static per-label bitsets")
+            })?;
+            ensure!(
+                b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
+                "the static bitsets refer to another label store"
+            );
+        }
         for s in &kernel.starts {
             match s {
                 StartSource::Global => ensure!(
@@ -502,9 +513,12 @@ impl Searcher {
 
     /// Scratch sized for `ix` and the materializers of `plans`.
     pub fn for_index<T: Element>(ix: &Index<'_, T>, plans: &[&Plan]) -> Self {
-        let dense = plans
-            .iter()
-            .any(|p| p.kernel.materializer == Materializer::Dense);
+        let dense = plans.iter().any(|p| {
+            matches!(
+                p.kernel.materializer,
+                Materializer::Dense | Materializer::DenseStatic
+            )
+        });
         Self::new(
             ix.graph.n_nodes(),
             ix.graph.n_data(),
@@ -556,7 +570,8 @@ impl Searcher {
             let b = ix
                 .bitsets
                 .expect("a static_bits plan needs the static bitsets of the index");
-            self.compiled.split_static(ix.labels, b, plan.static_theta);
+            self.compiled
+                .split_static(ix.labels, b, plan.static_theta, plan.complete);
             b
         });
         let exact_threshold = kernel.exact.threshold();
@@ -1471,6 +1486,12 @@ fn run<T: Element, P: Eval, S: Score>(
     match kernel.materializer {
         Materializer::Dense => {
             mat.build_dense(ix.labels, compiled, n_data as usize);
+        }
+        Materializer::DenseStatic => {
+            let b = ix
+                .bitsets
+                .expect("a dense_static plan needs the static bitsets of the index");
+            mat.build_dense_static(ix.labels, compiled, n_data as usize, b);
         }
         Materializer::Sparse => {
             mat.build_sparse(ix.labels, compiled, n_data as usize);

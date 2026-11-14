@@ -538,7 +538,8 @@ fn parse_materializer(s: &str) -> Result<Materializer> {
         "none" => Materializer::None,
         "dense" => Materializer::Dense,
         "sparse" => Materializer::Sparse,
-        _ => bail!("unknown materializer {s:?} (none, dense, sparse)"),
+        "dense_static" => Materializer::DenseStatic,
+        _ => bail!("unknown materializer {s:?} (none, dense, sparse, dense_static)"),
     })
 }
 
@@ -547,6 +548,7 @@ fn materializer_name(m: Materializer) -> &'static str {
         Materializer::None => "none",
         Materializer::Dense => "dense",
         Materializer::Sparse => "sparse",
+        Materializer::DenseStatic => "dense_static",
     }
 }
 

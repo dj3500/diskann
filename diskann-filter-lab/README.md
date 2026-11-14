@@ -132,7 +132,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
 | `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
-| `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list) |
+| `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)` |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
@@ -168,9 +168,11 @@ unsatisfied and have row labels are then checked in one pass over the node's row
 scan, or galloping searches for long rows); a clause made only of bitset labels never reads the
 row, and Boolean evaluation stops at the first such clause that fails. It returns the
 failed-clause count like modes 1 and 2 (so it works with every scorer and admission rule), and
-the exact path uses it too. The run driver loads `bitsets_sidecar` or builds the bitsets in
-memory at the smallest `θ` of the experiment (untimed; recorded in `run.json`); a
-configuration's `θ` may exceed the sidecar's.
+the exact path uses it too. The materializer `dense_static` builds the dense match bitmap
+with the same bitsets (a label's bitset is ORed in word by word instead of scattering its
+postings). The run driver loads `bitsets_sidecar` or builds the bitsets in memory at the
+smallest `θ` of the experiment (untimed; recorded in `run.json`); a configuration's `θ` may
+exceed the sidecar's.
 
 `examples/kernel_microbench.rs` measures the kernel's components in isolation (ns per
 predicate check per evaluator, row length and access pattern; per-query materializations;

@@ -353,6 +353,11 @@ fn configs() -> Vec<(String, Kernel)> {
             ("predicate", "static_bits(60)"),
             ("exact", "scan_smallest_clause(60)"),
         ],
+        &[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_static"),
+            ("collector", "heap"),
+        ],
     ];
     for (i, edits) in overrides.iter().enumerate() {
         let mut k = Kernel::default();

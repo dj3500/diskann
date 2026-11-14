@@ -402,6 +402,13 @@ name = "static1000"
 preset = "upstream-beta(0.5)"
 collector = "heap"
 predicate = "static_bits(1000)"
+
+[[config]]
+name = "bitmap-static"
+preset = "upstream-beta(0.5)"
+collector = "heap"
+predicate = "bitmap"
+materializer = "dense_static"
 "#,
             ds = d.dir.display()
         );
@@ -413,6 +420,7 @@ predicate = "static_bits(1000)"
             .collect();
         assert_eq!(res[0], res[1]);
         assert_eq!(res[0], res[2]);
+        assert_eq!(res[0], res[3]);
         let run: Value =
             serde_json::from_str(&std::fs::read_to_string(dirs[1].join("run.json")).unwrap())
                 .unwrap();

@@ -52,7 +52,7 @@ use self::{
 use crate::{
     bitsets::LabelBitsets,
     kernel::{
-        config::{PredicateMode, StartSource},
+        config::{Materializer, PredicateMode, StartSource},
         entry::SampleIndex,
         search::{Counters, FastPath, Index, Plan, Query, Searcher},
         trace::Trace,
@@ -343,8 +343,10 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         (None, None) => (0.0, "not needed".to_owned()),
     };
 
-    // Static per-label bitsets (untimed T1 sidecar): loaded, or built at the smallest θ of the
-    // `static_bits(θ)` configurations.
+    // Static per-label bitsets (untimed T1 sidecar) for `static_bits(θ)` and `dense_static`
+    // configurations: loaded, or built at the smallest θ of the `static_bits(θ)`
+    // configurations (⌈n/64⌉ without one: a bitset then costs at most as many words as its
+    // postings).
     let theta_min = exp
         .configs
         .iter()
@@ -352,7 +354,13 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             PredicateMode::StaticBits(t) => Some(t),
             _ => None,
         })
-        .min();
+        .min()
+        .or_else(|| {
+            exp.configs
+                .iter()
+                .any(|c| c.kernel.materializer == Materializer::DenseStatic)
+                .then(|| ds.labels.n_points().div_ceil(64) as u64)
+        });
     let (bitsets, bitsets_json) = match (theta_min, &exp.bitsets_sidecar) {
         (None, _) => (None, Value::Null),
         (Some(_), Some(path)) => {
@@ -518,7 +526,8 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "panel": rows.source.as_ref().map(|s| &s.1), "split": exp.split,
                 "qsets": exp.qsets, "limit": exp.limit, "queries": exp.queries,
                 "mode": exp.mode.name(), "reps": exp.reps, "seed": exp.seed,
-                "bitsets": matches!(c.kernel.predicate, PredicateMode::StaticBits(_))
+                "bitsets": (matches!(c.kernel.predicate, PredicateMode::StaticBits(_))
+                    || c.kernel.materializer == Materializer::DenseStatic)
                     .then(|| bitsets_json["source"].clone()),
             });
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));

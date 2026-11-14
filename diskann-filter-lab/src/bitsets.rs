@@ -145,6 +145,12 @@ impl LabelBitsets {
         self.labels[s as usize]
     }
 
+    /// The bitset in slot `s` (`⌈n_points / 64⌉` words).
+    #[inline]
+    pub fn bitset(&self, s: u32) -> &[u64] {
+        &self.bits[s as usize * self.words..(s as usize + 1) * self.words]
+    }
+
     /// Word `w` (points `64w..64w + 64`) of the bitset in slot `s`.
     #[inline(always)]
     pub fn word(&self, s: u32, w: usize) -> u64 {

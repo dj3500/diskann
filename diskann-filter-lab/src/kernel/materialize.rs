@@ -9,6 +9,9 @@
 //!
 //! - **dense**: a bitmap over the data points, the union of each clause's postings ANDed
 //!   across clauses (the buffers are zeroed per query, inside the timer);
+//! - **dense_static**: the same bitmap, with the labels that have a static bitset
+//!   ([`crate::bitsets::LabelBitsets`]) ORed in word by word instead of scattered from their
+//!   postings;
 //! - **sparse**: the sorted list of matches, by merging the postings of the clause with the
 //!   smallest upper bound and filtering it against the other clauses with galloping searches
 //!   in their postings.
@@ -17,7 +20,7 @@
 //! [`crate::bitsets`]; the `static_bits(θ)` evaluator ([`super::eval::StaticBits`]) reads them.
 
 use super::eval::{gallop_lower_bound, Compiled};
-use crate::labels::LabelStore;
+use crate::{bitsets::LabelBitsets, labels::LabelStore};
 
 /// Materializer role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +28,8 @@ pub enum Materializer {
     None,
     Dense,
     Sparse,
+    /// Dense, built with the index's static bitsets.
+    DenseStatic,
 }
 
 /// Merges `n` sorted lists (`list(i)`) and calls `f` on every distinct value in increasing
@@ -164,6 +169,69 @@ impl Materialized {
         read
     }
 
+    /// [`Self::build_dense`] with static bitsets: the labels with a bitset in `sb` are ORed in
+    /// word by word, the others scattered from their postings. Returns the posting entries
+    /// plus the bitset words read.
+    pub fn build_dense_static(
+        &mut self,
+        labels: &LabelStore,
+        q: &Compiled,
+        n_data: usize,
+        sb: &LabelBitsets,
+    ) -> u64 {
+        let words = n_data.div_ceil(64);
+        assert!(
+            self.dense.len() >= words,
+            "dense buffers were not allocated"
+        );
+        assert_eq!(sb.n_points(), n_data, "bitsets of another point set");
+        if q.n_clauses() == 0 {
+            return self.build_dense(labels, q, n_data);
+        }
+        let mut read = 0u64;
+        for j in 0..q.n_clauses() {
+            let clause = q.clause(j);
+            // A clause of one bitset label after the first: AND it in directly.
+            if j > 0 && clause.len() == 1 {
+                if let Some(s) = sb.slot(clause[0]) {
+                    for (a, &b) in self.dense[..words].iter_mut().zip(sb.bitset(s)) {
+                        *a &= b;
+                    }
+                    read += words as u64;
+                    continue;
+                }
+            }
+            let target = if j == 0 {
+                &mut self.dense[..words]
+            } else {
+                &mut self.tmp[..words]
+            };
+            target.fill(0);
+            for &l in clause {
+                match sb.slot(l) {
+                    Some(s) => {
+                        for (t, &b) in target.iter_mut().zip(sb.bitset(s)) {
+                            *t |= b;
+                        }
+                        read += words as u64;
+                    }
+                    None => {
+                        for &p in labels.postings(l) {
+                            target[(p >> 6) as usize] |= 1u64 << (p & 63);
+                        }
+                        read += labels.posting_len(l) as u64;
+                    }
+                }
+            }
+            if j > 0 {
+                for (a, b) in self.dense[..words].iter_mut().zip(&self.tmp[..words]) {
+                    *a &= *b;
+                }
+            }
+        }
+        read
+    }
+
     /// Builds the sorted match list of `q` (galloping intersection); returns the number of
     /// candidates examined.
     pub fn build_sparse(&mut self, labels: &LabelStore, q: &Compiled, n_data: usize) -> u64 {
@@ -288,9 +356,14 @@ mod tests {
         let mut bits = vec![0u64; s.n_labels()];
         let mut q = Compiled::new();
         let mut m = Materialized::new(200, true);
+        let sb = LabelBitsets::build(&s, 38);
+        assert!(sb.n_bitsets() > 0 && sb.n_bitsets() < s.n_labels());
         for i in 0..preds.len() {
             q.compile(&s, preds.get(i), Weights::Unit, None, &mut bits);
+            m.build_dense_static(&s, &q, 200, &sb);
+            let with_bitsets = m.dense.clone();
             m.build_dense(&s, &q, 200);
+            assert_eq!(m.dense, with_bitsets, "query {i}");
             m.build_sparse(&s, &q, 200);
             let expect: Vec<u32> = (0..200)
                 .filter(|&p| preds.get(i).matches(s.row(p)))
