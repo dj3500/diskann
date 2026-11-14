@@ -499,7 +499,7 @@ pub fn run<T: VectorRepr + Element>(
             "load_avg_start": load_start,
             "load_avg_end": load_end,
             "calibration": {
-                "kernel": "squared L2, 64-d u8, 256 KiB buffer, best of 5 passes",
+                "kernel": "squared L2, 64-d u8, 256 KiB buffer, best of 10 passes after 50 ms warm-up",
                 "start_ns_per_dist": calibration_start,
                 "end_ns_per_dist": calibration_end,
             },

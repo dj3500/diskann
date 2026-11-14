@@ -219,7 +219,8 @@ pub fn utc_timestamp(compact: bool) -> String {
 }
 
 /// A fixed single-threaded CPU calibration: nanoseconds per squared-L2 distance between
-/// 64-dimensional `u8` vectors held in a 256 KiB buffer (best of five passes).
+/// 64-dimensional `u8` vectors held in a 256 KiB buffer (best of ten passes, after about
+/// 50 ms of untimed warm-up so that the core leaves its idle clock state).
 pub fn calibrate() -> f64 {
     const DIM: usize = 64;
     const N: usize = 4096;
@@ -235,7 +236,16 @@ pub fn calibrate() -> f64 {
     let query = &data[..DIM];
     let mut best = f64::INFINITY;
     let mut sink = 0f32;
-    for _ in 0..5 {
+    let warmup = std::time::Instant::now();
+    while warmup.elapsed() < std::time::Duration::from_millis(50) {
+        for row in data.chunks_exact(DIM) {
+            sink += <SquaredL2 as PureDistanceFunction<&[u8], &[u8], f32>>::evaluate(
+                std::hint::black_box(query),
+                row,
+            );
+        }
+    }
+    for _ in 0..10 {
         let start = std::time::Instant::now();
         for _ in 0..16 {
             for row in data.chunks_exact(DIM) {
