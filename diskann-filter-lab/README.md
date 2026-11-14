@@ -89,6 +89,13 @@ flab sketches stats --labels labels.flab -b 64,128,256
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
 
+# Graph construction: the lab's parallel Vamana builder, recording the candidate pools, and
+# prune replay of the pools with another pruning rule (see below)
+flab build --dataset <dir> --prune 'alpha(64, 1.2)' --l-build 100 -t 3 \
+        --pools pools/pools.flab -o graphs/vamana
+flab build --dataset <dir> --replay pools/pools.flab --prune 'label_containment(64, 1.2)' \
+        -t 3 --compare graphs/vamana/graph.flab -o graphs/lc
+
 # Summaries
 flab info labels.flab
 flab info queries.fpred
@@ -349,6 +356,69 @@ fingerprint (`label(c*)` / `label(all)` starts of the kernel); the JSON report g
 counts (labels with a start, entries, distinct nodes, sampled labels, distance computations)
 and the build cost (wall and CPU time, threads, peak RSS).
 
+## Graph construction and prune replay (`flab build`)
+
+`flab build` writes `graph.flab` and `meta.json` (parameters, wall and CPU time, threads, peak
+RSS, load, counters, degree statistics, bytes, and with `--compare` the edge overlap with
+another graph) into the output directory (module `build`).
+
+**Builder.** Vamana with batch-parallel insertion, close to upstream DiskANN's `multi_insert`
+(with `IntraBatchCandidates::None`):
+
+- the start is one auxiliary *frozen* node holding a copy of the medoid (the data row closest to
+  the mean, as upstream's `StartPointStrategy::Medoid`); it is a regular node of the graph;
+- points are inserted in a seeded random order (`--order random --seed s`, or `identity`), in
+  batches whose sizes double from 1 up to `--batch` (default 128) and then stay there (prefix
+  doubling, instead of upstream's multi-insert bootstrap);
+- per batch, in parallel, each point runs a greedy search from the start with list size
+  `--l-build` (upstream's semantics: a list of `L + 1` entries, a new entry goes before entries
+  at an equal distance) over the graph as it was before the batch; the expanded nodes, sorted by
+  (distance, id) and truncated to `--maxc` (750), are its *search pool*, which the pruning rule
+  reduces to its out-neighbors;
+- then every new edge `p → t` proposes the back-edge `t → p`: per target, the batch's sources
+  (by id) are appended while the row stays within `⌊slack · R⌋` entries (`--slack`, 1.3), else
+  the row and the new sources are re-pruned to `R` with the same rule (upstream's
+  `add_edge_and_prune`). `--final-prune` re-prunes every row longer than `R` at the end.
+
+A batch depends only on the graph before it, so the graph depends on the order and the batch
+schedule but not on the thread count (`-t`). Parallelism uses a rayon pool of `-t` threads.
+
+**Pruning rules** (`--prune`; module `build::prune`). Every rule scans the pool in (distance,
+id) order and builds on upstream's RobustPrune: a selected `r` occludes a later candidate `c`
+when `d(p, c) > α' · d(r, c)` (squared distances; `d(r, c) = 0` always occludes), in rounds
+`α' = 1, ×min(α, 1.2), …, α`; neighbors are kept in selection order. Auxiliary nodes carry no
+labels.
+
+| Rule | Meaning |
+|---|---|
+| `alpha(R, α)` | label-blind RobustPrune to degree `R` (α defaults to 1.2) |
+| `label_containment(R, α)` | FilteredVamana's label-aware occlusion as the C++ library implements it (`Index::occlude_list`): `r` may occlude `c` only if every label of `c` is a label of `r` (`F_c ⊆ F_r`), whatever the labels of `p` |
+| `source_containment(R, α)` | the FilteredVamana paper's rule: only if `F_p ∩ F_c ⊆ F_r` |
+| `coverage(R, α, B[, k])` | the first `R − B` neighbors of `alpha(R, α)` are kept; then, for the labels of `p` from the rarest (fewest points) to the most frequent, while a label has fewer than `k` neighbors carrying it and fewer than `B` coverage edges were added, the closest unselected pool candidate carrying it is added; the remaining slots up to `R` take the rest of the RobustPrune selection |
+| `split(R_geo, R_lab[, α])` | `alpha(R_geo, α)`, then up to `R_lab` more neighbors by RobustPrune with the containment rule of `label_containment`, in which the first part's neighbors already occlude |
+
+Label-aware rules read `--labels` (default: the dataset's `labels.flab`).
+
+**Candidate pools** (`--pools <file>`): the build records, for every node, its search pool and
+every back-edge proposal it received (each with its distance), the insertion order and the
+batch schedule (format below).
+
+**Prune replay** (`--replay pools.flab --prune <rule>`): the adjacency rebuilt from recorded
+pools, without searching (module `build::replay`):
+
+- `--replay-mode incremental` (default) replays the build's insertion process: every point's
+  out-neighbors are the rule applied to its recorded search pool, and the back-edges they propose
+  reach their targets batch by batch, appended or re-pruned with the rule as in the builder.
+  With the build's rule the replay reproduces the build's graph exactly; with another rule it is
+  a proxy for an incremental build with that rule (the pools stay those of the recorded build).
+  A target's row evolves only through its own back-edges, so all prunes run in parallel;
+- `--replay-mode union` prunes every node once over its whole recorded pool (search pool and
+  proposals, repeated ids removed), with no back-edges afterwards (a stitch-then-prune
+  construction over the pools). A point can then lose every in-edge (e.g. an exact duplicate
+  occluded by its twin in every pool).
+
+`--slack` and `--maxc` default to the recorded build's.
+
 ## Ground truth semantics
 
 Distances are squared L2, computed with `diskann-vector`'s SIMD kernels. For `u8` vectors they are
@@ -481,6 +551,23 @@ the number of entries `E` (`Σ_ℓ min(b, |post(ℓ)|)`). An entry is `(priority
 |---|---|---|---|
 | 0 | `u64` | `n_labels + 1` | per-label offsets into section 1 |
 | 1 | `u64` | `E` | each label's `min(b, |post|)` lowest entries, increasing |
+
+### Candidate pools: `pools.flab` (magic `FLABPOL\0`)
+
+Parameters: `n_data`, `n_nodes`, `n_entries`, `n_batches`, `slots` (row capacity of the build),
+`maxc` (pool truncation of the build), element type code (1 = `u8`, 2 = `f32`) `| dim << 8`,
+length of the metadata in bytes.
+
+| Section | Type | Length | Content |
+|---|---|---|---|
+| 0 | `u32` | `n_data` | insertion order of the data points |
+| 1 | `u64` | `n_batches + 1` | batch boundaries into section 0 |
+| 2 | `u64` | `n_nodes + 1` | row offsets per node into sections 4 and 5 |
+| 3 | `u32` | `n_nodes` | length of each row's search pool |
+| 4 | `u32` | `n_entries` | rows: the node's search pool (sorted by (distance, id), truncated to `maxc`: the list handed to the pruning rule), then the back-edge proposals it received, in arrival order (batch by batch, by source id within a batch) |
+| 5 | `f32` | `n_entries` | squared distances from the row's node |
+| 6 | element type | `(n_nodes − n_data) × dim` | vectors of the auxiliary nodes |
+| 7 | `u8` | metadata length | the build's parameters (JSON text) |
 
 Reading a section with NumPy:
 

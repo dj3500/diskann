@@ -68,6 +68,9 @@ enum Command {
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
     /// kernel and write run directories (see `run` in the crate documentation).
     Run(RunArgs),
+    /// Build a graph with the lab's parallel Vamana builder (optionally recording candidate
+    /// pools), or replay recorded pools with a pruning rule.
+    Build(diskann_filter_lab::build::cli::BuildArgs),
     /// Summarize a lab file (labels, predicates, ground truth, graph, starts) or a vector file.
     Info {
         path: PathBuf,
@@ -415,6 +418,7 @@ fn run_experiment(a: &RunArgs) -> Result<()> {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run_experiment(&args),
+        Command::Build(args) => diskann_filter_lab::build::cli::run(&args),
         Command::Convert(c) => convert(c),
         Command::Gt(args) => match dtype(args.dtype, &args.base)? {
             DType::U8 => run_gt::<u8>(&args),

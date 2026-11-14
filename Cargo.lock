@@ -631,6 +631,7 @@ dependencies = [
  "diskann-vector",
  "hashbrown 0.16.1",
  "libc",
+ "rayon",
  "serde",
  "serde_json",
  "tokio",
