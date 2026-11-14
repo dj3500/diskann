@@ -127,7 +127,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)` |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
-| `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`) |
+| `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`, C++ OR-filtered search), `exact` (capacity `L`, C++ multi-filter search) |
 | `aux_g` | penalty of auxiliary nodes in graded keys (0) |
 
 Illegal combinations are rejected when the configuration is validated (for example `deferred`

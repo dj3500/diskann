@@ -587,6 +587,24 @@ fn rejected_starts_under_force_and_obey() {
 }
 
 #[test]
+fn starts_beyond_the_capacity() {
+    // Starts 0, 1, 4 for a query at 0 with L = 2.
+    let rows: &[&[&str]] = &[&["x=1"], &["x=1"], &["x=1"], &["x=1"], &["x=1"]];
+    let (base, g, labels) = line(rows, false);
+    let pred = [vec!["x=1"]];
+    // Capacity max(L, |starts|) = 3: start 4 enters, then 2 evicts it and is expanded too.
+    let cxx = kernel(&[("padding", "cxx")]);
+    let (ids, ctr) = run_line(&base, &g, &labels, &[0, 1, 4], &cxx, &pred, 0.0, 2, 2);
+    assert_eq!(ids, [0, 1]);
+    assert_eq!((ctr.n_expand, ctr.n_evict, ctr.n_dist), (3, 1, 5));
+    // Capacity L = 2: start 4 is dropped on arrival (still visited), so is 2.
+    let exact = kernel(&[("padding", "exact")]);
+    let (ids, ctr) = run_line(&base, &g, &labels, &[0, 1, 4], &exact, &pred, 0.0, 2, 2);
+    assert_eq!(ids, [0, 1]);
+    assert_eq!((ctr.n_expand, ctr.n_evict, ctr.n_dist), (2, 0, 4));
+}
+
+#[test]
 fn duplicate_starts_and_a_start_that_is_a_neighbour() {
     let rows: &[&[&str]] = &[&["x=1"], &["x=1"], &["x=1"], &["x=1"], &["x=1"]];
     let (base, g, labels) = line(rows, false);

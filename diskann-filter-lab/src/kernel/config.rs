@@ -144,8 +144,11 @@ pub enum Padding {
     /// Upstream: capacity and expandable prefix `L + |starts|`; answers come from the first `L`
     /// non-auxiliary entries.
     Upstream,
-    /// C++: capacity `max(L, |starts|)`; answers come from the whole beam.
+    /// C++ OR-filtered search: capacity `max(L, |starts|)`; answers come from the whole beam.
     Cxx,
+    /// C++ multi-filter search: capacity exactly `L` (starts beyond it compete for the slots
+    /// like any node); answers come from the whole beam.
+    Exact,
 }
 
 /// A complete kernel configuration.
@@ -573,7 +576,8 @@ fn parse_padding(s: &str) -> Result<Padding> {
     Ok(match s.trim() {
         "upstream" => Padding::Upstream,
         "cxx" => Padding::Cxx,
-        _ => bail!("unknown padding {s:?} (upstream, cxx)"),
+        "exact" => Padding::Exact,
+        _ => bail!("unknown padding {s:?} (upstream, cxx, exact)"),
     })
 }
 
@@ -717,7 +721,11 @@ impl Kernel {
             "exact": exact_name(self.exact),
             "weights": match self.weights { Weights::Unit => "unit", Weights::Surprisal => "surprisal" },
             "beam_width": self.beam_width,
-            "padding": match self.padding { Padding::Upstream => "upstream", Padding::Cxx => "cxx" },
+            "padding": match self.padding {
+                Padding::Upstream => "upstream",
+                Padding::Cxx => "cxx",
+                Padding::Exact => "exact",
+            },
             "aux_g": self.aux_g,
         })
     }
@@ -875,6 +883,7 @@ impl Preset {
             },
             Self::Filt { lambda, tau } => Kernel {
                 scorer: Scorer::Additive(*lambda),
+                padding: Padding::Exact,
                 ..cxx(
                     vec![StartSource::Sample(10), StartSource::Global],
                     Admission::Cutoff(*tau),

@@ -1442,6 +1442,7 @@ fn run<T: Element, P: Eval, S: Score>(
         (Some(_), _) => (l.max(n_starts).max(1), usize::MAX),
         (None, Padding::Upstream) => (l + n_starts, l),
         (None, Padding::Cxx) => (l.max(n_starts).max(1), usize::MAX),
+        (None, Padding::Exact) => (l.max(1), usize::MAX),
     };
     beam.reset(capacity, capacity, reference.is_some(), S::STORE_D);
     answers.reset(kernel.collector, k, l);
