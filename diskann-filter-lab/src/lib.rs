@@ -20,6 +20,7 @@ pub mod kernel;
 pub mod labels;
 pub mod parallel;
 pub mod predicate;
+pub mod run;
 pub mod starts;
 pub mod text;
 pub mod vectors;

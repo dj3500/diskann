@@ -19,6 +19,7 @@ use diskann_filter_lab::{
     jsonl, labels,
     labels::LabelStore,
     predicate::{self, PredicateSet, PredicateSetBuilder},
+    run,
     starts::{self, Starts},
     text,
     vectors::{self, DType, Element, Matrix},
@@ -50,6 +51,9 @@ enum Command {
     ImportGraph(ImportGraphArgs),
     /// Build the start-node table (`starts.flab`) of a graph from C++ build outputs.
     ImportStarts(ImportStartsArgs),
+    /// Run an experiment file (configurations × panel × effort grid) with the lab search
+    /// kernel and write run directories (see `run` in the crate documentation).
+    Run(RunArgs),
     /// Summarize a lab file (labels, predicates, ground truth, graph, starts) or a vector file.
     Info {
         path: PathBuf,
@@ -235,8 +239,45 @@ struct ImportStartsArgs {
     report: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct RunArgs {
+    /// The experiment file (TOML).
+    experiment: PathBuf,
+    /// Directory for the run directories (overrides the experiment's `runs_dir`).
+    #[arg(long)]
+    runs_dir: Option<PathBuf>,
+    /// Ledger file (overrides the experiment's `ledger`).
+    #[arg(long)]
+    ledger: Option<PathBuf>,
+    /// Validate the experiment and print the resolved configurations without searching.
+    #[arg(long)]
+    dry_run: bool,
+    /// Code version recorded in the outputs (default: the `FLAB_COMMIT` environment variable).
+    #[arg(long)]
+    commit: Option<String>,
+}
+
+fn run_experiment(a: &RunArgs) -> Result<()> {
+    let opts = run::Options {
+        runs_dir: a.runs_dir.clone(),
+        ledger: a.ledger.clone(),
+        dry_run: a.dry_run,
+        commit: a
+            .commit
+            .clone()
+            .or_else(|| std::env::var("FLAB_COMMIT").ok()),
+        command_line: std::env::args().collect(),
+    };
+    let dirs = run::run(&a.experiment, &opts)?;
+    for d in dirs {
+        println!("{}", d.display());
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::Run(args) => run_experiment(&args),
         Command::Convert(c) => convert(c),
         Command::Gt(args) => match dtype(args.dtype, &args.base)? {
             DType::U8 => run_gt::<u8>(&args),

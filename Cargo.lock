@@ -630,8 +630,11 @@ dependencies = [
  "diskann-utils",
  "diskann-vector",
  "hashbrown 0.16.1",
+ "libc",
+ "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
