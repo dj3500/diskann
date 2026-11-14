@@ -16,6 +16,7 @@ pub mod diskann_io;
 pub mod graph;
 pub mod gt;
 pub mod jsonl;
+pub mod kernel;
 pub mod labels;
 pub mod parallel;
 pub mod predicate;

@@ -153,6 +153,13 @@ impl LabelStore {
         &self.row_labels[self.row_offsets[p] as usize..self.row_offsets[p + 1] as usize]
     }
 
+    /// The forward store as raw arrays: `n_points + 1` row offsets and the concatenated rows
+    /// (e.g. to prefetch a row before reading it).
+    #[inline]
+    pub fn forward(&self) -> (&[u64], &[u32]) {
+        (&self.row_offsets, &self.row_labels)
+    }
+
     /// Sorted point ids carrying label `l`.
     #[inline]
     pub fn postings(&self, l: u32) -> &[u32] {
