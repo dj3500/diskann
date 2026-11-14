@@ -430,6 +430,21 @@ pub trait Eval: Copy + Send + Sync + 'static {
     fn prefetch(cx: &EvalCtx<'_>, v: u32);
     /// First prefetch stage (the row offsets).
     fn prefetch_offsets(cx: &EvalCtx<'_>, v: u32);
+    /// The failed clauses of data point `v` among all clauses of the query (bit `j` for the
+    /// clause at position `j` of the Boolean order; complete evaluation of the first 64
+    /// clauses).
+    #[inline]
+    fn failed_all(cx: &EvalCtx<'_>, v: u32) -> u64 {
+        let q = cx.q;
+        let row = cx.labels.row(v);
+        let mut failed = 0u64;
+        for j in 0..q.n_clauses.min(64) {
+            if !gallop_intersects(row, q.clause(j)) {
+                failed |= 1u64 << j;
+            }
+        }
+        failed
+    }
 }
 
 /// Mode 1: row scan with clause bits (falls back to mode 2, see the module documentation).
@@ -521,6 +536,16 @@ impl Eval for RowScan {
     #[inline(always)]
     fn prefetch_offsets(cx: &EvalCtx<'_>, v: u32) {
         super::prefetch(cx.labels.forward().0.as_ptr().wrapping_add(v as usize));
+    }
+
+    #[inline]
+    fn failed_all(cx: &EvalCtx<'_>, v: u32) -> u64 {
+        let q = cx.q;
+        let row = cx.labels.row(v);
+        if !q.use_bits || row.len() > 4 * q.labels.len() {
+            return ClauseSearch::failed_all(cx, v);
+        }
+        scan(cx, row, q.full_mask)
     }
 }
 
@@ -699,6 +724,14 @@ impl Eval for StaticBits {
         if cx.q.static_row_prefetch {
             RowScan::prefetch(cx, v);
         }
+    }
+
+    #[inline]
+    fn failed_all(cx: &EvalCtx<'_>, v: u32) -> u64 {
+        if !cx.q.use_bits {
+            return ClauseSearch::failed_all(cx, v);
+        }
+        static_failed(cx, v, cx.q.full_mask, false)
     }
 
     /// The row offsets (when the row is likely to be read) and the bitset word of the first

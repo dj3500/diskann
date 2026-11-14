@@ -15,6 +15,7 @@ use diskann_filter_lab::{
     labels::{LabelStore, LabelStoreBuilder},
     predicate::{PredicateSet, PredicateSetBuilder},
     run,
+    sketches::LabelSketches,
     starts::Starts,
     vectors::{Element, Matrix},
 };
@@ -430,14 +431,18 @@ materializer = "dense_static"
         assert!(bits["n_bitsets"].as_u64().unwrap() >= 3, "{bits}");
     }
 
-    // B6: unit costs sidecar and per-configuration efforts; the planned exact path returns the
-    // version-1 scan's answers.
+    // B6: unit costs and sketches sidecars, per-configuration efforts, the crossover
+    // counters; the planned exact path returns the version-1 scan's answers.
     let costs = d.dir.join("costs.json");
     std::fs::write(
         &costs,
         serde_json::json!({"costs": UnitCosts::default()}).to_string(),
     )
     .unwrap();
+    let sk = d.dir.join("sketches.flab");
+    LabelSketches::build(&d.labels, 16, 1, 2)
+        .write(&sk)
+        .unwrap();
     let p = d.dir.join("b6.toml");
     let text = format!(
         r#"
@@ -452,6 +457,7 @@ mode = "trace"
 runs_dir = "{ds}/runs"
 ledger = "{ds}/ledger.jsonl"
 calibration = "{costs}"
+sketches_sidecar = "{sk}"
 
 [[config]]
 name = "exact-v1"
@@ -461,16 +467,22 @@ efforts = [10]
 [[config]]
 name = "exact-v2"
 exact = "planned(1000000)"
+estimates = "sketch"
 efforts = [10]
 
 [[config]]
-name = "lazy"
+name = "s2"
 starts = "label(c*)+global"
 collector = "heap"
 laziness = "heap_bound"
+exact = "planned"
+crossover = "cost"
+estimates = "sketch"
+terminator = "posting_l(16)"
 "#,
         ds = d.dir.display(),
         costs = costs.display(),
+        sk = sk.display(),
     );
     std::fs::write(&p, text).unwrap();
     let dirs = run::run(&p, &opts).unwrap();
@@ -482,12 +494,13 @@ laziness = "heap_bound"
     assert!(!dirs[1].join("res_30.bin").exists(), "own efforts only");
     assert!(dirs[2].join("res_30.bin").exists());
     let run: Value =
-        serde_json::from_str(&std::fs::read_to_string(dirs[1].join("run.json")).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(dirs[2].join("run.json")).unwrap()).unwrap();
+    assert_eq!(run["index"]["sketches"]["b"], 16);
     assert!(run["index"]["calibration"]["costs"]["graph_alpha"].is_number());
-    assert_eq!(run["skipped_efforts"], serde_json::json!([30]));
-    let pq = std::fs::read_to_string(dirs[1].join("perquery.tsv")).unwrap();
+    assert_eq!(run["skipped_efforts"], serde_json::json!([]));
+    let pq = std::fs::read_to_string(dirs[2].join("perquery.tsv")).unwrap();
     let header: Vec<&str> = pq.lines().next().unwrap().split('\t').collect();
-    for col in ["plan", "est_exact_ns", "a_hat", "m_hat"] {
+    for col in ["n_probe", "plan", "est_exact_ns", "a_hat", "m_hat"] {
         assert!(header.contains(&col), "{col} in {header:?}");
     }
 

@@ -51,6 +51,10 @@ pub struct UnitCosts {
     pub scatter_ns: f64,
     /// Per bitmap word enumerated.
     pub enum_ns: f64,
+    /// Per sampled point of a sketch probe (row read and every clause, batch-prefetched).
+    pub probe_ns: f64,
+    /// Per sketch entry merged by a probe.
+    pub sketch_ns: f64,
     /// Per distance computation of a graph search (adjacency, visited set and beam included).
     pub graph_dist_ns: f64,
     /// Per predicate evaluation of a graph search.
@@ -74,6 +78,8 @@ impl Default for UnitCosts {
             word_ns: 0.6,
             scatter_ns: 2.0,
             enum_ns: 0.8,
+            probe_ns: 120.0,
+            sketch_ns: 6.0,
             graph_dist_ns: 60.0,
             graph_pred_ns: 80.0,
             graph_alpha: 10.0,
@@ -101,6 +107,8 @@ impl UnitCosts {
             self.word_ns,
             self.scatter_ns,
             self.enum_ns,
+            self.probe_ns,
+            self.sketch_ns,
             self.graph_dist_ns,
             self.graph_pred_ns,
             self.graph_alpha,
@@ -256,6 +264,30 @@ pub struct Estimates {
     pub sampled: usize,
 }
 
+/// `z` of a two-sided `1 − δ` normal interval (δ = 0.01).
+pub const Z: f64 = 2.576;
+
+/// Wilson score interval of a binomial proportion `x / n` at `z`.
+pub fn wilson(x: usize, n: usize, z: f64) -> (f64, f64) {
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    let (x, n) = (x as f64, n as f64);
+    let p = x / n;
+    let z2 = z * z;
+    let den = 1.0 + z2 / n;
+    let centre = (p + z2 / (2.0 * n)) / den;
+    let half = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt() / den;
+    ((centre - half).max(0.0), (centre + half).min(1.0))
+}
+
+/// Quantile of the standard gamma distribution with shape `k` at the normal deviate `z`
+/// (Wilson–Hilferty).
+pub fn gamma_quantile(k: f64, z: f64) -> f64 {
+    let c = 1.0 / (9.0 * k);
+    (k * (1.0 - c + z * c.sqrt()).powi(3)).max(0.0)
+}
+
 impl Estimates {
     /// Posting-only estimates: `A = min(n, P*)` (exact for one label), clause survival from the
     /// clause bounds `min(1, U_j / n)` multiplied (an independence guess), `M = A·Π`.
@@ -284,6 +316,67 @@ impl Estimates {
             survival,
             exact: false,
             sampled: 0,
+        }
+    }
+
+    /// Estimates from a uniform sample of `union(c*)` of `sampled` points (the whole union if
+    /// `complete`) whose last priority fraction is `tau`, of which the first `evaluated` were
+    /// checked: `matches` of them satisfy every clause and `surv[j − 1]` satisfy clauses
+    /// `1..=j`. `a_min` / `a_max` are the posting bounds of the union (largest label,
+    /// `min(n, P*)`).
+    #[expect(clippy::too_many_arguments, reason = "the probe's outputs")]
+    pub fn from_sample(
+        n: usize,
+        sampled: usize,
+        complete: bool,
+        tau: f64,
+        evaluated: usize,
+        matches: usize,
+        surv: &[usize],
+        a_min: f64,
+        a_max: f64,
+    ) -> Self {
+        let nf = n as f64;
+        if (complete && evaluated == sampled) || sampled == 0 {
+            let a = sampled as f64;
+            let m = matches as f64;
+            let den = (sampled as f64).max(1.0);
+            return Self {
+                n: nf,
+                a,
+                a_hi: a,
+                m,
+                m_lo: m,
+                m_hi: m,
+                survival: surv.iter().map(|&s| s as f64 / den).collect(),
+                exact: true,
+                sampled,
+            };
+        }
+        let b = sampled as f64;
+        let (a, a_lo, a_hi) = if complete {
+            (b, b, b)
+        } else {
+            let clip = |x: f64| x.clamp(a_min.min(a_max), a_max);
+            (
+                clip((b - 1.0).max(1.0) / tau),
+                clip(gamma_quantile(b, -Z) / tau),
+                clip(gamma_quantile(b, Z) / tau),
+            )
+        };
+        let e = evaluated.max(1) as f64;
+        let f = matches as f64 / e;
+        let (f_lo, f_hi) = wilson(matches, evaluated, Z);
+        Self {
+            n: nf,
+            a,
+            a_hi,
+            m: a * f,
+            m_lo: a_lo * f_lo,
+            m_hi: (a_hi * f_hi).min(a_hi),
+            survival: surv.iter().map(|&s| s as f64 / e).collect(),
+            exact: false,
+            sampled: evaluated,
         }
     }
 
@@ -412,6 +505,22 @@ impl PlanInputs<'_> {
     }
 }
 
+/// Upstream DiskANN's adaptive-L multiplier at match rate `rate`: 1 (≥ 50 %), 2 (10–50 %),
+/// `2^{−log10 rate}` below 10 %, clamped to `[1, scale]` (`scale` at rate 0).
+pub fn l_multiplier(rate: f64, scale: f64) -> f64 {
+    if rate.is_nan() || rate <= 0.0 {
+        return scale.max(1.0);
+    }
+    let m = if rate >= 0.5 {
+        1.0
+    } else if rate >= 0.1 {
+        2.0
+    } else {
+        2.0_f64.powf(-rate.log10())
+    };
+    m.clamp(1.0, scale.max(1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +540,26 @@ mod tests {
         assert!(bad.validate().is_err());
         let text = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<UnitCosts>(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn intervals_cover_their_estimates() {
+        let (lo, hi) = wilson(10, 100, Z);
+        assert!(lo < 0.1 && 0.1 < hi && lo > 0.03 && hi < 0.25, "{lo} {hi}");
+        assert_eq!(wilson(0, 50, Z).0, 0.0);
+        assert!(wilson(0, 50, Z).1 > 0.05);
+        let g = gamma_quantile(128.0, 0.0);
+        assert!((g - 127.7).abs() < 0.5, "{g}");
+        let (lo, hi) = (gamma_quantile(128.0, -Z), gamma_quantile(128.0, Z));
+        assert!(
+            (99.0..103.0).contains(&lo) && (155.0..160.0).contains(&hi),
+            "{lo} {hi}"
+        );
+        assert_eq!(l_multiplier(0.7, 16.0), 1.0);
+        assert_eq!(l_multiplier(0.2, 16.0), 2.0);
+        assert!((l_multiplier(0.01, 16.0) - 4.0).abs() < 1e-9);
+        assert_eq!(l_multiplier(0.0, 16.0), 16.0);
+        assert_eq!(l_multiplier(1e-9, 8.0), 8.0);
     }
 
     #[test]

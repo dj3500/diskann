@@ -19,6 +19,8 @@
 //! - **Postings**: the k-way merge with deduplication of real posting lists (ns per entry and
 //!   binary level), galloping intersection of the calibration predicates (ns per modelled
 //!   probe), bitmap word operations, scatters and enumeration.
+//! - **Probe**: ns per sampled point of a sketch probe (every clause evaluated on random points,
+//!   prefetched like the probe).
 //! - **Graph search** (when a graph is given): random base points as queries, global start,
 //!   heap(K = 10) collection, mode-1 predicate; list sizes 10…2560. A predicate-free search
 //!   (deferred evaluation) gives ns per distance computation (adjacency, visited set and beam
@@ -36,7 +38,7 @@ use crate::{
         collect::{Answers, Collector},
         config::{Collector as Coll, Kernel, Laziness},
         cost::UnitCosts,
-        eval::{Compiled, EvalCtx, RowScan, StaticBits, Weights},
+        eval::{Compiled, Eval, EvalCtx, RowScan, StaticBits, Weights},
         exact,
         materialize::{merge_distinct, Materialized},
         search::{Counters, Index, Plan, Query, Searcher},
@@ -344,6 +346,37 @@ pub fn calibrate<T: Element>(
     }
     let enum_ns = median(&mut ev);
 
+    // Probe: every clause on random points, prefetched like the probe (128 points per query).
+    let mut pv = Vec::new();
+    for qi in 0..preds.len() {
+        compiled.compile(labels, preds.get(qi), Weights::Unit, None, &mut bits);
+        if compiled.is_empty() {
+            compiled.clear_bits(&mut bits);
+            continue;
+        }
+        let pts: Vec<u32> = (0..128).map(|_| rng.below(n) as u32).collect();
+        let cx = match &bitsets {
+            Some(b) => {
+                compiled.split_static(labels, b, b.theta(), false);
+                EvalCtx::new(labels, &compiled, &bits, &[], &[]).with_static(b)
+            }
+            None => EvalCtx::new(labels, &compiled, &bits, &[], &[]),
+        };
+        let t = Instant::now();
+        let failed = match &bitsets {
+            Some(_) => probe_points::<StaticBits>(&cx, &pts),
+            None => probe_points::<RowScan>(&cx, &pts),
+        };
+        std::hint::black_box(failed);
+        pv.push(t.elapsed().as_nanos() as f64 / pts.len() as f64);
+        compiled.clear_bits(&mut bits);
+    }
+    let probe_ns = if pv.is_empty() {
+        UnitCosts::default().probe_ns
+    } else {
+        median(&mut pv)
+    };
+
     // Graph search.
     let mut graph_doc = Value::Null;
     let (mut graph_dist_ns, mut graph_pred_ns, mut graph_alpha, mut graph_beta) = {
@@ -370,6 +403,7 @@ pub fn calibrate<T: Element>(
             eps_min: 0.0,
             bitsets: None,
             costs: None,
+            sketches: None,
         };
         let mut eager = Kernel {
             collector: Coll::Heap,
@@ -460,6 +494,8 @@ pub fn calibrate<T: Element>(
         word_ns,
         scatter_ns,
         enum_ns,
+        probe_ns,
+        sketch_ns: merge_ns,
         graph_dist_ns,
         graph_pred_ns,
         graph_alpha,
@@ -485,4 +521,27 @@ pub fn calibrate<T: Element>(
         "time": sys::utc_timestamp(false),
         "elapsed_s": t_all.elapsed().as_secs_f64(),
     }))
+}
+
+/// Every clause of the query on `pts` (rows prefetched ahead, as the probe does).
+fn probe_points<P: Eval>(cx: &EvalCtx<'_>, pts: &[u32]) -> u64 {
+    const AHEAD: usize = 8;
+    let m = pts.len();
+    for &v in &pts[..m.min(2 * AHEAD)] {
+        P::prefetch_offsets(cx, v);
+    }
+    for &v in &pts[..m.min(AHEAD)] {
+        P::prefetch(cx, v);
+    }
+    let mut acc = 0u64;
+    for i in 0..m {
+        if i + 2 * AHEAD < m {
+            P::prefetch_offsets(cx, pts[i + 2 * AHEAD]);
+        }
+        if i + AHEAD < m {
+            P::prefetch(cx, pts[i + AHEAD]);
+        }
+        acc = acc.wrapping_add(P::failed_all(cx, pts[i]));
+    }
+    acc
 }

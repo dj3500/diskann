@@ -135,6 +135,28 @@ pub enum Terminator {
     Budget(u64),
     /// Stop when the answer heap is full and no unexpanded node can be closer than its worst.
     MatchAware,
+    /// Posting-based adaptive L: the list size `L₀ × m`, with upstream's multiplier `m` of the
+    /// estimated match rate (`|M̂| / n` from the `estimates` role), clamped to `scale`, fixed
+    /// before navigation; then `exhaust`.
+    PostingL { scale: f64 },
+}
+
+/// How a query chooses between the graph search and the exact path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Crossover {
+    /// The exact path when `min_c U_c ≤ T` of the `exact` role (fixed threshold).
+    Threshold,
+    /// The exact path when its estimated cost is at most the nominal graph cost.
+    Cost,
+}
+
+/// Source of the per-query estimates of the cost model and of `posting_l`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EstimateSource {
+    /// Posting bounds only (`A = min(n, P*)`, clause survival `min(1, U_j/n)` multiplied).
+    Bounds,
+    /// A probe of the bottom-`b` sketches (a uniform sample of `union(c*)`).
+    Sketch,
 }
 
 /// Predicate evaluation mode.
@@ -185,6 +207,8 @@ pub struct Kernel {
     pub padding: Padding,
     /// `g` used to key auxiliary nodes.
     pub aux_g: f32,
+    pub crossover: Crossover,
+    pub estimates: EstimateSource,
     /// Plans the exact path v2 may choose from.
     pub exact_plans: PlanSet,
 }
@@ -210,6 +234,8 @@ impl Default for Kernel {
             beam_width: 1,
             padding: Padding::Upstream,
             aux_g: 0.0,
+            crossover: Crossover::Threshold,
+            estimates: EstimateSource::Bounds,
             exact_plans: PlanSet::ALL,
         }
     }
@@ -508,8 +534,12 @@ impl Terminator {
             },
             ("budget", [w]) => Self::Budget(num(w, "budget")?),
             ("match_aware", []) => Self::MatchAware,
+            ("posting_l", []) => Self::PostingL { scale: 16.0 },
+            ("posting_l", [m]) => Self::PostingL {
+                scale: num(m, "posting-L scale")?,
+            },
             _ => bail!(
-                "unknown terminator {s:?} (exhaust, adaptive_l(sample, scale), budget(W), match_aware)"
+                "unknown terminator {s:?} (exhaust, adaptive_l(sample, scale), budget(W), match_aware, posting_l(scale))"
             ),
         })
     }
@@ -522,6 +552,7 @@ impl fmt::Display for Terminator {
             Self::AdaptiveL { sample, scale } => write!(f, "adaptive_l({sample}, {scale})"),
             Self::Budget(w) => write!(f, "budget({w})"),
             Self::MatchAware => write!(f, "match_aware"),
+            Self::PostingL { scale } => write!(f, "posting_l({scale})"),
         }
     }
 }
@@ -600,6 +631,44 @@ fn parse_weights(s: &str) -> Result<Weights> {
     })
 }
 
+impl Crossover {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "threshold" => Self::Threshold,
+            "cost" => Self::Cost,
+            _ => bail!("unknown crossover {s:?} (threshold, cost)"),
+        })
+    }
+}
+
+impl fmt::Display for Crossover {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Threshold => "threshold",
+            Self::Cost => "cost",
+        })
+    }
+}
+
+impl EstimateSource {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "bounds" => Self::Bounds,
+            "sketch" => Self::Sketch,
+            _ => bail!("unknown estimates {s:?} (bounds, sketch)"),
+        })
+    }
+}
+
+impl fmt::Display for EstimateSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Bounds => "bounds",
+            Self::Sketch => "sketch",
+        })
+    }
+}
+
 fn parse_padding(s: &str) -> Result<Padding> {
     Ok(match s.trim() {
         "upstream" => Padding::Upstream,
@@ -630,6 +699,8 @@ impl Kernel {
             "beam_width" => self.beam_width = num(value, "beam width")?,
             "padding" => self.padding = parse_padding(value)?,
             "aux_g" => self.aux_g = num(value, "aux_g")?,
+            "crossover" => self.crossover = Crossover::parse(value)?,
+            "estimates" => self.estimates = EstimateSource::parse(value)?,
             "exact_plans" => self.exact_plans = PlanSet::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
@@ -681,6 +752,9 @@ impl Kernel {
                 self.collector == Collector::Heap,
                 "match_aware termination requires the heap collector"
             ),
+            Terminator::PostingL { scale } => {
+                ensure!(scale >= 1.0, "posting_l needs a scale of at least 1");
+            }
             Terminator::Exhaust => {}
         }
         if let Expander::TwoHop(Some(c)) = self.expander {
@@ -718,6 +792,13 @@ impl Kernel {
             Laziness::Eager => {}
         }
         ensure!(!self.exact_plans.is_empty(), "exact_plans is empty");
+        if self.crossover != Crossover::Threshold {
+            ensure!(
+                self.exact.is_planned(),
+                "crossover {} needs the planned exact path (exact = \"planned\")",
+                self.crossover
+            );
+        }
         if let PredicateMode::StaticBits(t) = self.predicate {
             ensure!(t >= 1, "static_bits(θ) needs θ >= 1");
         }
@@ -767,6 +848,8 @@ impl Kernel {
                 Padding::Exact => "exact",
             },
             "aux_g": self.aux_g,
+            "crossover": self.crossover.to_string(),
+            "estimates": self.estimates.to_string(),
             "exact_plans": self.exact_plans.to_string(),
         })
     }
@@ -984,8 +1067,19 @@ mod tests {
             "adaptive_l(1000, 16)",
             "budget(500)",
             "match_aware",
+            "posting_l(16)",
         ] {
             assert_eq!(Terminator::parse(s).unwrap().to_string(), s);
+        }
+        assert_eq!(
+            Terminator::parse("posting_l").unwrap(),
+            Terminator::PostingL { scale: 16.0 }
+        );
+        for s in ["threshold", "cost"] {
+            assert_eq!(Crossover::parse(s).unwrap().to_string(), s);
+        }
+        for s in ["bounds", "sketch"] {
+            assert_eq!(EstimateSource::parse(s).unwrap().to_string(), s);
         }
         assert_eq!(parse_exact("planned").unwrap(), ExactPath::Planned(0));
         assert_eq!(
@@ -1095,6 +1189,12 @@ mod tests {
             ("scorer", "bonus(0.5)")
         ]));
         assert!(!bad(&[("laziness", "heap_bound"), ("collector", "heap")]));
+        assert!(
+            bad(&[("crossover", "cost")]),
+            "needs the planned exact path"
+        );
+        assert!(!bad(&[("crossover", "cost"), ("exact", "planned")]));
+        assert!(bad(&[("terminator", "posting_l(0.5)")]));
         assert!(!bad(&[
             ("predicate", "bitmap"),
             ("materializer", "dense"),

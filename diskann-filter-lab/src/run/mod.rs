@@ -52,12 +52,13 @@ use self::{
 use crate::{
     bitsets::LabelBitsets,
     kernel::{
-        config::{Materializer, PredicateMode, StartSource},
+        config::{Crossover, EstimateSource, Materializer, PredicateMode, StartSource},
         cost::UnitCosts,
         entry::SampleIndex,
         search::{Counters, FastPath, Index, Plan, Query, Searcher},
         trace::Trace,
     },
+    sketches::LabelSketches,
     vectors::{DType, Element},
 };
 
@@ -388,7 +389,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         }
     };
 
-    // Unit costs of the cost model (an untimed sidecar).
+    // Unit costs of the cost model and bottom-b sketches (untimed sidecars).
     let (costs, costs_json) = match &exp.calibration {
         None => (None, Value::Null),
         Some(path) => {
@@ -397,6 +398,21 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             (Some(c), doc)
         }
     };
+    let (sketches, sketches_json) = match &exp.sketches_sidecar {
+        None => (None, Value::Null),
+        Some(path) => {
+            let t = Instant::now();
+            let sk = LabelSketches::read(path)?;
+            sk.check_sample(&ds.labels, 97)
+                .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
+            let doc = json!({
+                "source": path, "b": sk.b(), "seed": sk.seed(), "entries": sk.n_entries(),
+                "bytes": sk.bytes(), "load_s": t.elapsed().as_secs_f64(),
+            });
+            (Some(sk), doc)
+        }
+    };
+
     // Indices, plans and per-row queries.
     let mut indices = Vec::new();
     let mut plans = Vec::new();
@@ -430,6 +446,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             eps_min: eps,
             bitsets: bitsets.as_ref(),
             costs: costs.as_ref(),
+            sketches: sketches.as_ref(),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
         if !exp.fast_paths {
@@ -544,6 +561,8 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     || uses_exact_bitsets(c))
                     .then(|| bitsets_json["source"].clone()),
                 "calibration": uses_costs(c).then(|| costs_json["source"].clone()),
+                "sketches": (c.kernel.estimates == EstimateSource::Sketch)
+                    .then(|| sketches_json["source"].clone()),
             });
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));
             let safe: String = c
@@ -621,6 +640,11 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "sample_index_bytes": g.sample.as_ref().map(SampleIndex::bytes),
                 "bitsets": bitsets_json,
                 "calibration": if uses_costs(c) { costs_json.clone() } else { Value::Null },
+                "sketches": if c.kernel.estimates == EstimateSource::Sketch {
+                    sketches_json.clone()
+                } else {
+                    Value::Null
+                },
             });
             let protocol = json!({
                 "reps": if exp.mode == Mode::Timed { exp.reps } else { 1 },
@@ -742,22 +766,24 @@ fn counter_docs() -> Value {
         "n_evict": "beam entries evicted",
         "n_exact_cand": "exact-path candidates",
         "n_start": "starts selected (deduplicated)",
-        "final_L": "expandable beam size at the end (adaptive L)",
+        "final_L": "expandable beam size at the end (adaptive L, or the planned posting_l)",
+        "n_probe": "predicate evaluations of the sketch probe (also in n_pred)",
         "plan": "exact plan chosen: 0 none / version-1 path, 1 scan, 2 distance-first, 3 gallop, 4 bitmap",
         "est_exact_ns": "estimated exact-path cost (model ns; 0 if not computed)",
+        "est_graph_ns": "nominal graph cost at the planned L (model ns; 0 if not computed)",
         "a_hat": "estimate of |union(c*)| (0 if not computed)",
         "m_hat": "estimate of the match count (0 if not computed)",
     })
 }
 
-/// Whether a configuration's exact path uses the static bitsets.
+/// Whether a configuration's exact path or probe uses the static bitsets.
 fn uses_exact_bitsets(c: &ConfigSpec) -> bool {
-    c.kernel.exact.is_planned()
+    c.kernel.exact.is_planned() || c.kernel.estimates == EstimateSource::Sketch
 }
 
 /// Whether a configuration reads the unit costs.
 fn uses_costs(c: &ConfigSpec) -> bool {
-    c.kernel.exact.is_planned()
+    c.kernel.exact.is_planned() || c.kernel.crossover != Crossover::Threshold
 }
 
 /// Reads unit costs: a `flab calibrate` report (its `costs` member) or a bare cost object.

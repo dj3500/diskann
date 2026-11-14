@@ -24,6 +24,7 @@ pub mod labels;
 pub mod parallel;
 pub mod predicate;
 pub mod run;
+pub mod sketches;
 pub mod starts;
 pub mod text;
 pub mod upstream;

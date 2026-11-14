@@ -15,8 +15,8 @@ use super::{
     config::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
-    config::{StartAdmission, StartSource, Terminator},
-    cost::{Estimates, ExactPlan, PlanInputs, UnitCosts},
+    config::{Crossover, EstimateSource, StartAdmission, StartSource, Terminator},
+    cost::{l_multiplier, Estimates, ExactPlan, PlanInputs, UnitCosts},
     entry::{self, SampleIndex, StartPredicate},
     eval::{
         ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
@@ -24,6 +24,7 @@ use super::{
     },
     exact::{self, ExactEval},
     materialize::{Materialized, Materializer},
+    planner::{Decision, Probe},
     score::{
         self, AdditiveScore, BonusScore, DistanceScore, LexicographicScore, MultiplicativeScore,
         Score,
@@ -36,6 +37,7 @@ use crate::{
     graph::{Graph, NodeVectors},
     labels::LabelStore,
     predicate::Cnf,
+    sketches::LabelSketches,
     starts::Starts,
     vectors::Element,
 };
@@ -72,8 +74,10 @@ pub struct Index<'a, T> {
     /// Static per-label bitsets of `labels` (the `static_bits(θ)` predicate mode, and the
     /// exact path v2's checks and bitmaps).
     pub bitsets: Option<&'a LabelBitsets>,
-    /// Unit costs of the cost model (the planned exact path).
+    /// Unit costs of the cost model (the planned exact path and the crossovers).
     pub costs: Option<&'a UnitCosts>,
+    /// Bottom-`b` sketches of `labels` (the `sketch` estimates).
+    pub sketches: Option<&'a LabelSketches>,
 }
 
 /// One query: its vector, predicate and, with a label view, the view's predicate.
@@ -138,10 +142,13 @@ pub struct Counters {
     /// Final expandable beam size (L after adaptive resizing).
     pub final_l: u64,
     pub route: Route,
+    /// Predicate evaluations of the sketch probe (also counted in `n_pred`).
+    pub n_probe: u64,
     /// Exact plan chosen ([`ExactPlan`] code; 0 for none or the version-1 paths).
     pub plan: u64,
-    /// Estimated cost of the exact path (model ns; 0 if not computed).
+    /// Estimated cost of the exact path and nominal graph cost (model ns; 0 if not computed).
     pub est_exact_ns: u64,
+    pub est_graph_ns: u64,
     /// Estimates of `|union(c*)|` and of the match count (0 if not computed).
     pub a_hat: u64,
     pub m_hat: u64,
@@ -162,10 +169,11 @@ impl Counters {
         self.n_match_seen += o.n_match_seen;
         self.n_evict += o.n_evict;
         self.n_exact_cand += o.n_exact_cand;
+        self.n_probe += o.n_probe;
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 18] = [
+    pub const NAMES: [&'static str; 20] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -180,14 +188,16 @@ impl Counters {
         "n_exact_cand",
         "n_start",
         "final_L",
+        "n_probe",
         "plan",
         "est_exact_ns",
+        "est_graph_ns",
         "a_hat",
         "m_hat",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 18] {
+    pub fn values(&self) -> [u64; 20] {
         [
             self.n_dist,
             self.n_pred,
@@ -203,8 +213,10 @@ impl Counters {
             self.n_exact_cand,
             self.n_start,
             self.final_l,
+            self.n_probe,
             self.plan,
             self.est_exact_ns,
+            self.est_graph_ns,
             self.a_hat,
             self.m_hat,
         ]
@@ -235,9 +247,9 @@ pub struct Plan {
     complete: bool,
     n_aux: usize,
     fast: FastPath,
-    /// Unit costs (planned exact path).
+    /// Unit costs (planned exact path, crossovers).
     costs: Option<UnitCosts>,
-    /// Evaluator of the planned exact path.
+    /// Evaluator of the planned exact path and of the probe.
     exact_eval: ExactEval,
 }
 
@@ -343,22 +355,35 @@ impl Plan {
                 "adaptive_l counts matches, which deferred evaluation does not see"
             );
         }
-        let costs = if kernel.exact.is_planned() {
+        let costs = if kernel.exact.is_planned() || kernel.crossover != Crossover::Threshold {
             let c = ix.costs.ok_or_else(|| {
-                anyhow::anyhow!("the planned exact path needs unit costs (a calibration)")
+                anyhow::anyhow!(
+                    "the planned exact path and the cost crossovers need unit costs (a calibration)"
+                )
             })?;
             c.validate()?;
             Some(c.clone())
         } else {
             None
         };
+        if kernel.estimates == EstimateSource::Sketch {
+            let sk = ix.sketches.ok_or_else(|| {
+                anyhow::anyhow!("the sketch estimates need bottom-b sketches of the labels")
+            })?;
+            ensure!(
+                sk.dict_hash() == labels.dict_hash() && sk.n_points() == labels.n_points(),
+                "the sketches refer to another label store"
+            );
+        }
         if let Some(b) = ix.bitsets {
             ensure!(
                 b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
                 "the static bitsets refer to another label store"
             );
         }
-        let exact_eval = if ix.bitsets.is_some() && kernel.exact.is_planned() {
+        let exact_eval = if ix.bitsets.is_some()
+            && (kernel.exact.is_planned() || kernel.estimates == EstimateSource::Sketch)
+        {
             ExactEval::StaticBits
         } else {
             ExactEval::RowScan
@@ -529,6 +554,7 @@ pub struct Searcher {
     frontier: Vec<u32>,
     heap: Vec<(u32, u32)>,
     pos: Vec<usize>,
+    probe: Probe,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
 }
@@ -560,6 +586,7 @@ impl Searcher {
             frontier: Vec::new(),
             heap: Vec::new(),
             pos: Vec::new(),
+            probe: Probe::new(),
             trace: None,
         }
     }
@@ -622,8 +649,8 @@ impl Searcher {
                 .split_static(ix.labels, b, plan.static_theta, plan.complete);
             b
         });
-        // The planned exact path checks clauses with the static bitsets when the index has
-        // them (the graph search may use another evaluator).
+        // The planned exact path and the probe check clauses with the static bitsets when
+        // the index has them (the graph search may use another evaluator).
         let exact_stat = match (stat, plan.exact_eval, ix.bitsets) {
             (Some(b), _, _) => Some(b),
             (None, ExactEval::StaticBits, Some(b)) => {
@@ -635,7 +662,7 @@ impl Searcher {
         let n = if self.compiled.is_empty() {
             ctr.route = Route::Empty;
             0
-        } else {
+        } else if kernel.crossover == Crossover::Threshold {
             let routed = kernel
                 .exact
                 .threshold()
@@ -643,7 +670,7 @@ impl Searcher {
             if routed && kernel.exact.is_planned() {
                 ctr.route = Route::Exact;
                 let costs = plan.costs.as_ref().expect("validated");
-                let est = Estimates::from_bounds(&self.compiled, ix.graph.n_data());
+                let est = self.estimates(plan, ix, exact_stat, &mut ctr);
                 let (p, e) = PlanInputs {
                     q: &self.compiled,
                     labels: ix.labels,
@@ -651,10 +678,7 @@ impl Searcher {
                     k,
                 }
                 .best(costs, kernel.exact_plans, &est, false, false);
-                ctr.plan = p as u64;
-                ctr.est_exact_ns = e.round() as u64;
-                ctr.a_hat = est.a.round() as u64;
-                ctr.m_hat = est.m.round() as u64;
+                record(&mut ctr, p, e, 0.0, &est);
                 self.exact_v2(plan, ix, q, k, p, exact_stat, false, &mut ctr);
                 self.answers.finish(ids, dists)
             } else if routed {
@@ -677,7 +701,21 @@ impl Searcher {
                 );
                 self.answers.finish(ids, dists)
             } else {
-                self.graph(plan, ix, q, l, reference, &mut ctr, ids, dists)
+                let mut l_run = l;
+                if let Terminator::PostingL { scale } = kernel.terminator {
+                    let est = self.estimates(plan, ix, exact_stat, &mut ctr);
+                    l_run = planned_l(l, &est, scale);
+                }
+                self.graph(plan, ix, q, l_run, reference, &mut ctr, ids, dists)
+            }
+        } else {
+            let d = self.decide(plan, ix, l, k, exact_stat, &mut ctr);
+            if d.exact {
+                ctr.route = Route::Exact;
+                self.exact_v2(plan, ix, q, k, d.plan, exact_stat, false, &mut ctr);
+                self.answers.finish(ids, dists)
+            } else {
+                self.graph(plan, ix, q, d.l, reference, &mut ctr, ids, dists)
             }
         };
         self.compiled.clear_bits(&mut self.bits);
@@ -685,6 +723,107 @@ impl Searcher {
         dists[n..].fill(f32::MAX);
         ctr.n_out = n as u64;
         ctr
+    }
+
+    /// Estimates of the query (a sketch probe, or the posting bounds).
+    fn estimates<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        exact_stat: Option<&LabelBitsets>,
+        ctr: &mut Counters,
+    ) -> Estimates {
+        let n = ix.graph.n_data();
+        let est = match (plan.kernel.estimates, ix.sketches) {
+            (EstimateSource::Sketch, Some(sk)) if self.compiled.n_clauses() > 0 => {
+                let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+                match exact_stat {
+                    Some(b) => {
+                        cx = cx.with_static(b);
+                        self.probe.run::<StaticBits>(sk, &cx, n, ctr)
+                    }
+                    None => self.probe.run::<RowScan>(sk, &cx, n, ctr),
+                }
+            }
+            _ => {
+                self.probe.witnesses.clear();
+                Estimates::from_bounds(&self.compiled, n)
+            }
+        };
+        est
+    }
+
+    /// The cost crossover (see [`super::planner`]).
+    fn decide<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        l: usize,
+        k: usize,
+        exact_stat: Option<&LabelBitsets>,
+        ctr: &mut Counters,
+    ) -> Decision {
+        let kernel = &plan.kernel;
+        let costs = plan.costs.as_ref().expect("validated");
+        let n = ix.graph.n_data();
+        // Nominal graph cost: the list-size line of the calibration plus the starts.
+        let starts = start_count(kernel, ix, &self.compiled) as f64
+            * (costs.graph_dist_ns + costs.graph_pred_ns);
+        let g0 = costs.graph(l as f64) + starts;
+        let pi = PlanInputs {
+            q: &self.compiled,
+            labels: ix.labels,
+            bitsets: exact_stat,
+            k,
+        };
+        // Obviously cheap exact queries: the exact path's upper cost is below the cheapest
+        // graph search; no probe.
+        let (_, e_up) = pi.best(
+            costs,
+            kernel.exact_plans,
+            &Estimates::upper(&self.compiled, n),
+            false,
+            true,
+        );
+        if e_up <= g0 {
+            let est = Estimates::from_bounds(&self.compiled, n);
+            let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
+            record(ctr, p, e.min(e_up), g0, &est);
+            self.probe.witnesses.clear();
+            return Decision {
+                exact: true,
+                plan: p,
+                est_exact: e.min(e_up),
+                est_graph: g0,
+                l,
+            };
+        }
+        let est = self.estimates(plan, ix, exact_stat, ctr);
+        let pi = PlanInputs {
+            q: &self.compiled,
+            labels: ix.labels,
+            bitsets: exact_stat,
+            k,
+        };
+        let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
+        let scale = match kernel.terminator {
+            Terminator::PostingL { scale } | Terminator::AdaptiveL { scale, .. } => scale,
+            _ => 1.0,
+        };
+        let l_plan = planned_l(l, &est, scale);
+        let g = costs.graph(l_plan as f64) + starts;
+        record(ctr, p, e, g, &est);
+        Decision {
+            exact: e <= g,
+            plan: p,
+            est_exact: e,
+            est_graph: g,
+            l: if matches!(kernel.terminator, Terminator::PostingL { .. }) {
+                l_plan
+            } else {
+                l
+            },
+        }
     }
 
     /// The planned exact path for the compiled query (`seeded`: the answer heap holds a
@@ -798,6 +937,47 @@ impl Searcher {
             ),
         }
     }
+}
+
+/// Number of starts a graph search of the query will select (before deduplication).
+fn start_count<T: Element>(kernel: &Kernel, ix: &Index<'_, T>, q: &Compiled) -> usize {
+    let per_label = |l: u32| {
+        ix.label_starts
+            .filter(|t| !ix.label_view && (l as usize) < t.n_labels())
+            .map_or(0, |t| t.label_starts(l).len())
+    };
+    let mut n = 0;
+    for s in &kernel.starts {
+        n += match s {
+            StartSource::Global => ix.global.len(),
+            StartSource::LabelSmallest if q.n_clauses() > 0 => {
+                q.clause(0).iter().map(|&l| per_label(l)).sum()
+            }
+            StartSource::LabelAll => (0..q.n_clauses())
+                .flat_map(|j| q.clause(j).iter())
+                .map(|&l| per_label(l))
+                .sum(),
+            StartSource::Sample(k) => *k,
+            StartSource::Aux => ix.graph.n_aux(),
+            StartSource::LabelSmallest => 0,
+        };
+    }
+    n
+}
+
+/// `posting_l`: `L₀ × m(M̂ / n)` (upstream's multiplier, clamped to `scale`).
+fn planned_l(l0: usize, est: &Estimates, scale: f64) -> usize {
+    let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
+    ((l0 as f64) * l_multiplier(rate, scale)).round().max(1.0) as usize
+}
+
+/// Records the crossover's estimates in the counters.
+fn record(ctr: &mut Counters, p: ExactPlan, e: f64, g: f64, est: &Estimates) {
+    ctr.plan = p as u64;
+    ctr.est_exact_ns = e.round() as u64;
+    ctr.est_graph_ns = g.round() as u64;
+    ctr.a_hat = est.a.round() as u64;
+    ctr.m_hat = est.m.round() as u64;
 }
 
 #[expect(clippy::too_many_arguments, reason = "forwards the per-query inputs")]
@@ -1442,7 +1622,9 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                         }
                     }
                 }
-                Terminator::Exhaust | Terminator::AdaptiveL { .. } => {}
+                Terminator::Exhaust
+                | Terminator::AdaptiveL { .. }
+                | Terminator::PostingL { .. } => {}
             }
             frontier.clear();
             while frontier.len() < beam_width {

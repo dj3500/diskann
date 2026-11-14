@@ -82,6 +82,10 @@ flab bitsets stats --labels labels.flab --theta 1000,10000,31250
 # Unit costs of the exact path's cost model on this machine and dataset (pinned like the runs)
 taskset -c 7 flab calibrate --dataset <dir> --graph <graph> -o costs.json
 
+# Bottom-b priority sketches of the label postings (one sketches-b<b>.flab per b) and their memory
+flab sketches build --labels labels.flab -b 64,128,256 -t 4 --out-dir <dir>
+flab sketches stats --labels labels.flab -b 64,128,256
+
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
 
@@ -133,11 +137,13 @@ are navigated, never evaluated against the predicate and never returned.
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
-| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector) |
+| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
 | `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap` (default) or any subset |
+| `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost) |
+| `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
 | `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`, C++ OR-filtered search), `exact` (capacity `L`, C++ multi-filter search) |
@@ -195,10 +201,22 @@ still processes every candidate. The unit costs come from `flab calibrate` (modu
 bitmap costs, graph-search costs per distance and per predicate; a few seconds to a minute per
 dataset) and are loaded with the experiment key `calibration`.
 
+**Estimates and the cost crossover** (`kernel::planner`, module `sketches`): every data point
+has a fixed hash priority and every label keeps its `b` lowest-priority members (sidecar
+`sketches.flab`, `flab sketches build`); merging the lists of the smallest clause's labels
+gives a uniform sample of its union (the whole union when every label has at most `b`
+members). The probe checks the sampled points against every clause (the first 32, then the
+rest only if the estimated match rate is below 1/2) and estimates `A` (bottom-k estimator),
+`M`, the residual clauses' survival and confidence bounds. `crossover = "cost"` takes the
+exact path when the cheapest plan's estimated cost is at most the nominal graph cost of the
+planned list size (calibrated distances per `L` plus the starts); queries whose exact path is
+cheaper than the cheapest graph search even with posting-bound counts skip the probe.
+
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
-`n_start`, the final list size, and for the planned exact path the plan, its estimated cost
-and the estimates of `A` and `M`. A trace mode records per-node events (offers with keys,
+`n_start`, the final list size, and for the planned exact path and the crossover the plan, the
+probe's predicate evaluations, the estimated exact and nominal graph costs and the estimates
+of `A` and `M`. A trace mode records per-node events (offers with keys,
 predicate results and outcomes, expansions, answers), and a reference mode runs with a
 resizable candidate list until a distance budget is spent.
 
@@ -217,6 +235,7 @@ graph = "/path/to/graph"         # default graph: a directory with graph.flab, a
 #                                           # (untimed) at the smallest θ of the experiment
 #                                           # (θ = ⌈n/64⌉ for the planned exact path alone)
 # calibration = "/path/to/costs.json"       # unit costs (flab calibrate) of the planned exact path
+# sketches_sidecar = "/path/to/sketches.flab" # bottom-b sketches (estimates = "sketch")
 # view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred
 queries = "q10K"                 # a whole query set, or:
 # panel = "panels/screen.tsv"    # TSV with columns qset, qidx (optional split); relative to the dataset
@@ -442,6 +461,17 @@ with a bitset `B` (every label with at least `θ` points), `words` = `⌈n_point
 |---|---|---|---|
 | 0 | `u32` | `B` | labels with a bitset, increasing |
 | 1 | `u64` | `B × words` | the bitsets in the order of section 0; bit `p % 64` of word `p / 64` is set when point `p` carries the label |
+
+### Bottom-b sketches: `sketches.flab` (magic `FLABSKT\0`)
+
+Parameters: `n_points`, `n_labels` and `dict_hash` of the label store, `b`, the priority seed,
+the number of entries `E` (`Σ_ℓ min(b, |post(ℓ)|)`). An entry is `(priority << 32) | point` with
+`priority` the high 32 bits of SplitMix64(`seed ^ point × 0x9e3779b97f4a7c15`).
+
+| Section | Type | Length | Content |
+|---|---|---|---|
+| 0 | `u64` | `n_labels + 1` | per-label offsets into section 1 |
+| 1 | `u64` | `E` | each label's `min(b, |post|)` lowest entries, increasing |
 
 Reading a section with NumPy:
 

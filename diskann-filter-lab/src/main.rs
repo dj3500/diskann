@@ -21,6 +21,7 @@ use diskann_filter_lab::{
     labels::LabelStore,
     predicate::{self, PredicateSet, PredicateSetBuilder},
     run,
+    sketches::{self, LabelSketches},
     starts::{self, Starts},
     text,
     vectors::{self, DType, Element, Matrix},
@@ -58,6 +59,10 @@ enum Command {
     /// Static per-label bitsets (`bitsets.flab`, for the `static_bits(θ)` predicate mode).
     #[command(subcommand)]
     Bitsets(BitsetsCommand),
+    /// Bottom-b priority sketches of the label postings (`sketches.flab`, for the sketch
+    /// estimates of the cost crossover).
+    #[command(subcommand)]
+    Sketches(SketchesCommand),
     /// Measure the unit costs of the cost model on this machine and dataset (JSON).
     Calibrate(CalibrateArgs),
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
@@ -315,6 +320,35 @@ enum BitsetsCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum SketchesCommand {
+    /// Build the sketches of every label for each b: writes `sketches-b<b>.flab` and
+    /// `sketches-b<b>.json` (memory, build time).
+    Build {
+        /// The label store.
+        #[arg(long)]
+        labels: PathBuf,
+        /// Entries per label (comma-separated list).
+        #[arg(short, long, value_delimiter = ',', required = true)]
+        b: Vec<usize>,
+        /// Seed of the point priorities.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        #[arg(short, long, default_value_t = 4)]
+        threads: usize,
+        /// Output directory (created if needed).
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Memory of the sketches for a list of b (without building them).
+    Stats {
+        #[arg(long)]
+        labels: PathBuf,
+        #[arg(short, long, value_delimiter = ',', required = true)]
+        b: Vec<usize>,
+    },
+}
+
 #[derive(Args)]
 struct CalibrateArgs {
     /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
@@ -396,6 +430,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Bitsets(c) => bitsets_command(c),
+        Command::Sketches(c) => sketches_command(c),
         Command::Calibrate(a) => {
             let opts = calibrate::Options {
                 reps: a.reps,
@@ -1079,6 +1114,89 @@ fn bitsets_command(c: BitsetsCommand) -> Result<()> {
     Ok(())
 }
 
+fn sketches_command(c: SketchesCommand) -> Result<()> {
+    match c {
+        SketchesCommand::Build {
+            labels,
+            b,
+            seed,
+            threads,
+            out_dir,
+        } => {
+            let store = LabelStore::read(&labels)?;
+            std::fs::create_dir_all(&out_dir)?;
+            let postings = 4 * store.n_entries() as u64;
+            for b in b {
+                let t = Instant::now();
+                let sk = LabelSketches::build(&store, b, seed, threads);
+                let build_s = secs(t);
+                let out = out_dir.join(format!("sketches-b{b}.flab"));
+                sk.write(&out)?;
+                ensure!(
+                    LabelSketches::read(&out)? == sk,
+                    "{} does not read back identically",
+                    out.display()
+                );
+                let complete = (0..store.n_labels() as u32)
+                    .filter(|&l| store.posting_len(l) <= b)
+                    .count();
+                let report = json!({
+                    "labels": labels,
+                    "n_points": store.n_points(),
+                    "n_labels": store.n_labels(),
+                    "b": b,
+                    "seed": seed,
+                    "entries": sk.n_entries(),
+                    "bytes": sk.bytes(),
+                    "postings_bytes": postings,
+                    "labels_complete": complete,
+                    "build_s": build_s,
+                    "threads": threads,
+                    "output": out,
+                });
+                std::fs::write(
+                    out_dir.join(format!("sketches-b{b}.json")),
+                    serde_json::to_string_pretty(&report)? + "\n",
+                )?;
+                println!(
+                    "b {b}: {} entries, {:.1} MiB ({:.1} % of the postings), {complete} of {} labels complete; built in {build_s:.2} s -> {}",
+                    sk.n_entries(),
+                    sk.bytes() as f64 / (1u64 << 20) as f64,
+                    100.0 * sk.bytes() as f64 / postings.max(1) as f64,
+                    store.n_labels(),
+                    out.display()
+                );
+            }
+        }
+        SketchesCommand::Stats { labels, b } => {
+            let store = LabelStore::read(&labels)?;
+            let postings = 4 * store.n_entries() as u64;
+            println!(
+                "{} points, {} labels, postings {:.1} MiB",
+                store.n_points(),
+                store.n_labels(),
+                postings as f64 / (1u64 << 20) as f64
+            );
+            println!(
+                "{:>8} {:>12} {:>10} {:>12}",
+                "b", "entries", "MiB", "% postings"
+            );
+            for b in b {
+                let entries: u64 = (0..store.n_labels() as u32)
+                    .map(|l| store.posting_len(l).min(b) as u64)
+                    .sum();
+                let bytes = 8 * (entries + store.n_labels() as u64 + 1);
+                println!(
+                    "{b:>8} {entries:>12} {:>10.1} {:>11.1}%",
+                    bytes as f64 / (1u64 << 20) as f64,
+                    100.0 * bytes as f64 / postings.max(1) as f64
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn info(path: &Path, d: Option<DTypeArg>) -> Result<()> {
     let magic = container::peek_magic(path)?;
     if &magic == labels::MAGIC {
@@ -1092,6 +1210,18 @@ fn info(path: &Path, d: Option<DTypeArg>) -> Result<()> {
         print_graph(&g, &g.stats());
     } else if &magic == starts::MAGIC {
         print_starts(&Starts::read(path)?);
+    } else if &magic == sketches::MAGIC {
+        let sk = LabelSketches::read(path)?;
+        println!(
+            "bottom-{} sketches of {} labels over {} points: {} entries, {:.1} MiB, seed {}, dictionary hash {:016x}",
+            sk.b(),
+            sk.n_labels(),
+            sk.n_points(),
+            sk.n_entries(),
+            sk.bytes() as f64 / (1u64 << 20) as f64,
+            sk.seed(),
+            sk.dict_hash()
+        );
     } else if &magic == bitsets::MAGIC {
         let b = LabelBitsets::read(path)?;
         println!(

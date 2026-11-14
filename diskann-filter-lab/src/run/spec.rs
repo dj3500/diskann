@@ -27,7 +27,8 @@
 //! bitsets_sidecar = "<bitsets.flab>" # optional static bitsets of `static_bits(θ)` configs
 //!                                  # (default: built in memory at the smallest θ, untimed)
 //! calibration = "<costs.json>"     # unit costs of the cost model (`flab calibrate`): needed by
-//!                                  # the planned exact path
+//!                                  # the planned exact path and the cost crossovers
+//! sketches_sidecar = "<sketches.flab>" # bottom-b sketches (`estimates = "sketch"`)
 //!
 //! [[config]]
 //! name = "inline"
@@ -104,6 +105,7 @@ struct RawExperiment {
     fast_paths: Option<bool>,
     bitsets_sidecar: Option<PathBuf>,
     calibration: Option<PathBuf>,
+    sketches_sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -168,6 +170,8 @@ pub struct Experiment {
     pub bitsets_sidecar: Option<PathBuf>,
     /// Unit costs of the cost model (`flab calibrate` output).
     pub calibration: Option<PathBuf>,
+    /// Bottom-`b` sketches of the dataset's labels.
+    pub sketches_sidecar: Option<PathBuf>,
     pub configs: Vec<ConfigSpec>,
 }
 
@@ -354,6 +358,7 @@ impl Experiment {
             fast_paths: e.fast_paths.unwrap_or(true),
             bitsets_sidecar: e.bitsets_sidecar.map(|p| resolve(dir, &p)),
             calibration: e.calibration.map(|p| resolve(dir, &p)),
+            sketches_sidecar: e.sketches_sidecar.map(|p| resolve(dir, &p)),
             configs,
         })
     }

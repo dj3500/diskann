@@ -189,6 +189,7 @@ impl Fixture {
             eps_min: 1.0,
             bitsets: Some(&self.bitsets),
             costs: None,
+            sketches: None,
         }
     }
 
@@ -497,6 +498,7 @@ fn static_bits_do_not_change_answers_or_counters() {
     let ix_high = Index {
         bitsets: Some(&high),
         costs: None,
+        sketches: None,
         ..f.index()
     };
     let mut k = Kernel::default();
@@ -507,6 +509,7 @@ fn static_bits_do_not_change_answers_or_counters() {
         &Index {
             bitsets: None,
             costs: None,
+            sketches: None,
             ..f.index()
         }
     )
@@ -622,6 +625,7 @@ fn run_line(
         eps_min: 0.5,
         bitsets: None,
         costs: None,
+        sketches: None,
     };
     let plan = Plan::new(kernel, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -761,6 +765,7 @@ fn exact_duplicates_follow_the_upstream_tie_rule() {
         eps_min: 0.5,
         bitsets: None,
         costs: None,
+        sketches: None,
     };
     let plan = Plan::new(&k, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -941,30 +946,38 @@ fn planned_exact_plans_are_exact() {
     use super::cost::{ExactPlan, UnitCosts};
     let f = fixture(300, 5, false);
     let costs = UnitCosts::default();
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 16, 3, 1);
     for with_bits in [false, true] {
         let ix = Index {
             bitsets: with_bits.then_some(&f.bitsets),
             costs: Some(&costs),
+            sketches: Some(&sketches),
             ..f.index()
         };
         for plans in ["scan", "df", "gallop", "bitmap", "scan+df+gallop+bitmap"] {
-            let k = kernel(&[
-                ("exact", "planned(18446744073709551615)"),
-                ("exact_plans", plans),
-            ]);
-            let plan = Plan::new(&k, &ix).unwrap();
-            let mut st = Searcher::for_index(&ix, &[&plan]);
-            for q in 0..f.preds.len() {
-                for kk in [1, 7, 10] {
-                    let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 10, kk);
-                    let what = format!("{plans} bits={with_bits} q={q} K={kk}");
-                    assert_eq!(out, f.truth(q, kk), "{what}");
-                    if q == 7 {
-                        continue;
-                    }
-                    assert_eq!(ctr.route, Route::Exact, "{what}");
-                    if !plans.contains('+') {
-                        assert_eq!(ctr.plan, ExactPlan::parse(plans).unwrap() as u64);
+            for estimates in ["bounds", "sketch"] {
+                let k = kernel(&[
+                    ("exact", "planned(18446744073709551615)"),
+                    ("exact_plans", plans),
+                    ("estimates", estimates),
+                ]);
+                let plan = Plan::new(&k, &ix).unwrap();
+                let mut st = Searcher::for_index(&ix, &[&plan]);
+                for q in 0..f.preds.len() {
+                    for kk in [1, 7, 10] {
+                        let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 10, kk);
+                        let what = format!("{plans} {estimates} bits={with_bits} q={q} K={kk}");
+                        assert_eq!(out, f.truth(q, kk), "{what}");
+                        if q == 7 {
+                            continue;
+                        }
+                        assert_eq!(ctr.route, Route::Exact, "{what}");
+                        if !plans.contains('+') {
+                            assert_eq!(ctr.plan, ExactPlan::parse(plans).unwrap() as u64);
+                        }
+                        if estimates == "sketch" && f.preds.get(q).n_clauses() > 1 {
+                            assert!(ctr.n_probe > 0, "{what}: no probe");
+                        }
                     }
                 }
             }
@@ -1085,5 +1098,103 @@ fn heap_bound_laziness_keeps_answers_and_skips_checks() {
             }
         }
         assert!(skipped > 0 && saved > 0, "{terminator}: nothing skipped");
+    }
+}
+
+/// Costs whose nominal graph search costs only its starts: the cost crossovers try the graph
+/// unless the exact path is cheaper than evaluating the starts.
+fn free_graph_costs() -> super::cost::UnitCosts {
+    super::cost::UnitCosts {
+        graph_alpha: 0.0,
+        graph_beta: 0.0,
+        ..super::cost::UnitCosts::default()
+    }
+}
+
+#[test]
+fn cost_crossovers_give_valid_answers() {
+    use super::cost::UnitCosts;
+    let f = fixture(300, 23, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 12, 5, 1);
+    let calibrated = UnitCosts::default();
+    let (mut exact, mut graph) = (0, 0);
+    for costs in [&calibrated, &free_graph_costs()] {
+        let ix = Index {
+            costs: Some(costs),
+            sketches: Some(&sketches),
+            ..f.index()
+        };
+        let configs: Vec<Kernel> = vec![
+            khpad(&[("exact", "planned(60)"), ("laziness", "heap_bound")]),
+            khpad(&[("exact", "planned"), ("crossover", "cost")]),
+            khpad(&[
+                ("exact", "planned"),
+                ("crossover", "cost"),
+                ("estimates", "sketch"),
+                ("terminator", "posting_l(4)"),
+                ("laziness", "heap_bound"),
+            ]),
+            khpad(&[
+                ("exact", "planned"),
+                ("crossover", "cost"),
+                ("estimates", "sketch"),
+                ("exact_plans", "scan+df"),
+            ]),
+        ];
+        for k in configs {
+            let plan = Plan::new(&k, &ix).unwrap();
+            let mut st = Searcher::for_index(&ix, &[&plan]);
+            for q in 0..f.preds.len() {
+                for (l, kk) in [(10, 10), (40, 5)] {
+                    let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, l, kk);
+                    let what = format!("{} q={q} L={l} K={kk}", k.to_json());
+                    check_properties(&f, q, &out, &what);
+                    match ctr.route {
+                        Route::Exact => {
+                            assert_eq!(out, f.truth(q, kk), "{what}");
+                            exact += 1;
+                        }
+                        Route::Graph => graph += 1,
+                        Route::Empty => {}
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        exact > 0 && graph > 0,
+        "both routes are taken: {exact} / {graph}"
+    );
+}
+
+#[test]
+fn posting_l_fixes_the_list_size_before_navigation() {
+    use super::cost::l_multiplier;
+    let f = fixture(300, 31, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let ix = Index {
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let k = khpad(&[
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut st = Searcher::for_index(&ix, &[&plan]);
+    for q in 0..f.preds.len() {
+        if q == 7 {
+            continue;
+        }
+        let m = (0..300u32)
+            .filter(|&p| f.preds.get(q).matches(f.labels.row(p)))
+            .count();
+        let want = (20.0 * l_multiplier(m as f64 / 300.0, 4.0)).round() as u64;
+        let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 20, 10);
+        check_properties(&f, q, &out, "posting_l");
+        assert_eq!(ctr.route, Route::Graph);
+        // The expandable prefix is L plus the starts (upstream padding).
+        assert_eq!(ctr.final_l, want + ctr.n_start, "q={q}: m={m}");
     }
 }
