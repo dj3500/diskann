@@ -142,8 +142,9 @@ are navigated, never evaluated against the predicate and never returned.
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
 | `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap` (default) or any subset |
-| `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost) |
+| `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector) |
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
+| `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
 | `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`, C++ OR-filtered search), `exact` (capacity `L`, C++ multi-filter search) |
@@ -211,12 +212,20 @@ rest only if the estimated match rate is below 1/2) and estimates `A` (bottom-k 
 exact path when the cheapest plan's estimated cost is at most the nominal graph cost of the
 planned list size (calibrated distances per `L` plus the starts); queries whose exact path is
 cheaper than the cheapest graph search even with posting-bound counts skip the probe.
+`crossover = "guarded"` runs the graph search as a bounded trial: at checkpoints (64 distance
+computations after the starts, then at doubling intervals) it falls back when, with the heap
+incomplete, the remaining graph cost forecast from the arrival rate of answers exceeds the
+exact cost (`forecast`), or when the graph's model cost reaches the estimated exact cost
+(`budget`); at nominal termination it falls back on an incomplete heap or when a held-out
+sampled match is closer than the K-th answer (`witness`). The fallback exhausts the exact path
+seeded with the graph's answers (route `fallback`). Costs are model costs of the counters,
+so trials are deterministic.
 
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
 `n_start`, the final list size, and for the planned exact path and the crossover the plan, the
-probe's predicate evaluations, the estimated exact and nominal graph costs and the estimates
-of `A` and `M`. A trace mode records per-node events (offers with keys,
+probe's predicate evaluations, the estimated exact and nominal graph costs, the estimates of
+`A` and `M`, a guarded trial's fallback reason and its graph work (model ns). A trace mode records per-node events (offers with keys,
 predicate results and outcomes, expansions, answers), and a reference mode runs with a
 resizable candidate list until a distance budget is spent.
 

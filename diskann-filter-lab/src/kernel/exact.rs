@@ -26,8 +26,8 @@
 //!   enumerated in id order, then distances.
 //!
 //! Every plan processes *every* candidate, so the answers are the exact top-K. With a
-//! *seeded* answer heap (the answers of another search, e.g. a graph search) the plans keep
-//! the seed's answers, skip points already held (graph-visited points are not known to be
+//! *seeded* answer heap (the graph search's answers, after a fallback) the plans keep the
+//! seed's answers, skip points already held (graph-visited points are not known to be
 //! exact-processed, e.g. after lazy predicate skips), and use the seed's K-th distance as the
 //! initial bound of `df`.
 

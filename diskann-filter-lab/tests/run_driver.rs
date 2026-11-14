@@ -471,12 +471,12 @@ estimates = "sketch"
 efforts = [10]
 
 [[config]]
-name = "s2"
+name = "s3"
 starts = "label(c*)+global"
 collector = "heap"
 laziness = "heap_bound"
 exact = "planned"
-crossover = "cost"
+crossover = "guarded"
 estimates = "sketch"
 terminator = "posting_l(16)"
 "#,
@@ -500,7 +500,14 @@ terminator = "posting_l(16)"
     assert_eq!(run["skipped_efforts"], serde_json::json!([]));
     let pq = std::fs::read_to_string(dirs[2].join("perquery.tsv")).unwrap();
     let header: Vec<&str> = pq.lines().next().unwrap().split('\t').collect();
-    for col in ["n_probe", "plan", "est_exact_ns", "a_hat", "m_hat"] {
+    for col in [
+        "n_probe",
+        "plan",
+        "fallback",
+        "est_exact_ns",
+        "a_hat",
+        "m_hat",
+    ] {
         assert!(header.contains(&col), "{col} in {header:?}");
     }
 

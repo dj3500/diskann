@@ -12,8 +12,9 @@
 //!    weights. A query with an empty clause has no answers (route `empty`);
 //! 2. exact-path routing: with the `threshold` crossover, when `min_c U_c ≤ T_exact` the query
 //!    is answered exactly from the postings ([`exact`]) and nothing else is computed; the
-//!    `cost` crossover ([`planner`]) compares the cost model's estimate of the exact path
-//!    ([`cost`]) with the nominal graph cost;
+//!    `cost` and `guarded` crossovers ([`planner`]) compare the cost model's estimate of the
+//!    exact path ([`cost`]) with the nominal graph cost, and `guarded` watches the graph search
+//!    and falls back to the exact path;
 //! 3. start selection ([`entry`]), the pilot (for scorers with per-query scales), the
 //!    materialization of a match set ([`materialize`]) if configured;
 //! 4. the loop: the `W` closest unexpanded beam nodes are expanded, every unvisited neighbour
@@ -25,7 +26,7 @@
 //! Roles ([`config::Kernel`]): `PredicateEval` (mode 1 row scan, mode 2 per-clause search, a
 //! materialized bitmap, static per-label bitsets), `Materializer`, `Admission`, `Laziness`, `Scorer`, `Collector`,
 //! `Expander`, `Terminator`, `Starts` (with a start-admission policy), `ExactPath` and the
-//! crossover (with its estimates and exact plans).
+//! crossover (with its estimates, exact plans and fallback signals).
 //! The element type, the predicate mode and the scorer family are compile-time parameters
 //! (dispatched once per plan), and so are the laziness, the expander and tracing (dispatched
 //! once per query); the other roles are enums matched in the loop. The `postfilter` and

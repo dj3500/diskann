@@ -12,9 +12,14 @@
 //!    uniform sample of `union(c*)`, each sampled point checked against every clause, in
 //!    stages: the first [`PROBE_STAGE`] points, then the rest of the sample only if the match
 //!    rate estimate is below 1/2), which gives `A`, `M`, the residual-clause survival,
-//!    confidence bounds and the sampled matches;
+//!    confidence bounds and the sampled matches (held-out witnesses of the `guarded`
+//!    crossover);
 //! 3. the cheapest exact plan `E`, the planned list size (`posting_l`: `L₀ × m(M̂ / n)`) and
-//!    the nominal graph cost `G`; the exact path if `E ≤ G`.
+//!    the nominal graph cost `G`; the exact path if `E ≤ G`;
+//! 4. `guarded`: a graph trial watched by a [`Guard`] (forecast of the remaining graph cost
+//!    from the arrival rate of answers while the heap is incomplete; spend cap `E`; at nominal
+//!    termination an incomplete heap or a sampled match closer than the K-th answer), with a
+//!    fallback that exhausts the exact path seeded with the graph's answers.
 
 use super::{
     cost::{Estimates, ExactPlan},
@@ -22,6 +27,22 @@ use super::{
     search::Counters,
 };
 use crate::sketches::LabelSketches;
+
+/// Why a guarded graph trial fell back to the exact path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum Fallback {
+    #[default]
+    None = 0,
+    /// The forecast remaining graph cost exceeded the exact cost.
+    Forecast = 1,
+    /// Graph spend reached the estimated exact cost.
+    Budget = 2,
+    /// Fewer than K answers at nominal termination.
+    Incomplete = 3,
+    /// A sampled match closer than the K-th answer at nominal termination.
+    Witness = 4,
+}
 
 /// Points of the first probe stage: the probe stops there when the estimated match rate is at
 /// least 1/2 (upstream's multiplier is then 1, and the exact path costs at least `n/2`
@@ -158,6 +179,93 @@ impl Probe {
     }
 }
 
+/// Watches a guarded graph trial (see the module documentation). Costs are model costs of
+/// the counters ([`super::cost::UnitCosts::charged`]), so a trial's decisions do not depend
+/// on timing noise.
+#[derive(Debug, Clone, Copy)]
+pub struct Guard {
+    /// The estimated exact cost (spend cap and the forecast's alternative).
+    pub budget: f64,
+    pub k: usize,
+    pub forecast: bool,
+    pub cap: bool,
+    pub witness: bool,
+    pub dist_ns: f64,
+    pub pred_ns: f64,
+    /// Counters after the starts (the arrival rate excludes them).
+    pub start_dist: u64,
+    pub start_pred: u64,
+    pub start_matches: u64,
+    /// Distance computations at the next checkpoint.
+    pub next_check: u64,
+    pub outcome: Fallback,
+}
+
+impl Guard {
+    /// A guard for a trial with exact cost `budget`.
+    pub fn new(
+        budget: f64,
+        k: usize,
+        fb: super::config::Fallbacks,
+        dist_ns: f64,
+        pred_ns: f64,
+    ) -> Self {
+        Self {
+            budget,
+            k,
+            forecast: fb.forecast,
+            cap: fb.budget,
+            witness: fb.witness,
+            dist_ns,
+            pred_ns,
+            start_dist: 0,
+            start_pred: 0,
+            start_matches: 0,
+            next_check: u64::MAX,
+            outcome: Fallback::None,
+        }
+    }
+
+    /// Records the counters after the starts and arms the first checkpoint (64 distance
+    /// computations later; then at doubling intervals).
+    pub fn arm(&mut self, ctr: &Counters) {
+        self.start_dist = ctr.n_dist;
+        self.start_pred = ctr.n_pred;
+        self.start_matches = ctr.n_match_seen;
+        self.next_check = ctr.n_dist + 64;
+    }
+
+    fn spent(&self, n_dist: u64, n_pred: u64) -> f64 {
+        n_dist as f64 * self.dist_ns + n_pred as f64 * self.pred_ns
+    }
+
+    /// A checkpoint (called when `n_dist ≥ next_check`): whether to stop the trial.
+    #[cold]
+    pub fn check(&mut self, n_dist: u64, n_pred: u64, n_matches: u64, collected: usize) -> bool {
+        let gap = (self.next_check - self.start_dist).max(1);
+        while self.next_check <= n_dist {
+            self.next_check = self.start_dist + 2 * (self.next_check - self.start_dist).max(gap);
+        }
+        let spent = self.spent(n_dist, n_pred);
+        if self.cap && spent >= self.budget {
+            self.outcome = Fallback::Budget;
+            return true;
+        }
+        if self.forecast && collected < self.k {
+            let since = (spent - self.spent(self.start_dist, self.start_pred)).max(1.0);
+            let arrivals = n_matches.saturating_sub(self.start_matches) as f64;
+            // Optimistic rate: one more arrival than observed.
+            let rate = (arrivals + 1.0) / since;
+            let more = (self.k - collected) as f64 / rate;
+            if more > self.budget {
+                self.outcome = Fallback::Forecast;
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// The decision of the crossover for one query.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Decision {
@@ -167,4 +275,41 @@ pub struct Decision {
     pub est_graph: f64,
     /// List size of the graph search.
     pub l: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::config::Fallbacks;
+
+    #[test]
+    fn guard_checkpoints_double_and_fall_back() {
+        let mut ctr = Counters {
+            n_dist: 100,
+            n_pred: 100,
+            n_match_seen: 3,
+            ..Counters::default()
+        };
+        // Budget 10,000 ns; 10 ns per distance and per predicate.
+        let mut g = Guard::new(10_000.0, 10, Fallbacks::ALL, 10.0, 10.0);
+        g.arm(&ctr);
+        assert_eq!(g.next_check, 164);
+        // 64 distances later with 9 answers already collected and 5 arrivals: continue.
+        ctr.n_dist = 164;
+        ctr.n_pred = 164;
+        assert!(!g.check(ctr.n_dist, ctr.n_pred, 8, 9));
+        assert_eq!(g.next_check, 228, "the interval doubles");
+        // No arrival and an empty heap: the forecast (10 × 1,280 ns) exceeds the budget.
+        let mut g2 = Guard::new(10_000.0, 10, Fallbacks::ALL, 10.0, 10.0);
+        g2.arm(&ctr);
+        assert!(g2.check(228, 228, 3, 0));
+        assert_eq!(g2.outcome, Fallback::Forecast);
+        // Without the forecast, the spend cap stops the trial at the budget.
+        let only_cap = Fallbacks::parse("budget").unwrap();
+        let mut g3 = Guard::new(10_000.0, 10, only_cap, 10.0, 10.0);
+        g3.arm(&ctr);
+        assert!(!g3.check(228, 228, 8, 0));
+        assert!(g3.check(600, 500, 8, 0));
+        assert_eq!(g3.outcome, Fallback::Budget);
+    }
 }

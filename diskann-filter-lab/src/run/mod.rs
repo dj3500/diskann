@@ -769,10 +769,12 @@ fn counter_docs() -> Value {
         "final_L": "expandable beam size at the end (adaptive L, or the planned posting_l)",
         "n_probe": "predicate evaluations of the sketch probe (also in n_pred)",
         "plan": "exact plan chosen: 0 none / version-1 path, 1 scan, 2 distance-first, 3 gallop, 4 bitmap",
+        "fallback": "guarded trial: 0 none, 1 forecast, 2 budget, 3 incomplete heap, 4 witness",
         "est_exact_ns": "estimated exact-path cost (model ns; 0 if not computed)",
         "est_graph_ns": "nominal graph cost at the planned L (model ns; 0 if not computed)",
         "a_hat": "estimate of |union(c*)| (0 if not computed)",
         "m_hat": "estimate of the match count (0 if not computed)",
+        "graph_ns": "model cost of the graph work of a guarded trial (ns)",
     })
 }
 

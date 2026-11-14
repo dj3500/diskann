@@ -148,6 +148,9 @@ pub enum Crossover {
     Threshold,
     /// The exact path when its estimated cost is at most the nominal graph cost.
     Cost,
+    /// `cost`, then a bounded graph trial with online fallback to the exact path (needs the
+    /// `heap` collector).
+    Guarded,
 }
 
 /// Source of the per-query estimates of the cost model and of `posting_l`.
@@ -157,6 +160,67 @@ pub enum EstimateSource {
     Bounds,
     /// A probe of the bottom-`b` sketches (a uniform sample of `union(c*)`).
     Sketch,
+}
+
+/// Fallback signals of the `guarded` crossover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Fallbacks {
+    /// While the heap is incomplete: forecast of the remaining graph cost from the arrival
+    /// rate of answers, against the exact cost.
+    pub forecast: bool,
+    /// Graph spend reaching the estimated exact cost.
+    pub budget: bool,
+    /// At nominal termination: a sampled match closer than the graph's K-th answer.
+    pub witness: bool,
+}
+
+impl Fallbacks {
+    pub const ALL: Self = Self {
+        forecast: true,
+        budget: true,
+        witness: true,
+    };
+
+    /// Parses `forecast+budget+witness` (any subset) or `none`.
+    pub fn parse(s: &str) -> Result<Self> {
+        let mut f = Self {
+            forecast: false,
+            budget: false,
+            witness: false,
+        };
+        if s.trim() == "none" {
+            return Ok(f);
+        }
+        for p in s.split('+') {
+            match p.trim() {
+                "forecast" => f.forecast = true,
+                "budget" => f.budget = true,
+                "witness" => f.witness = true,
+                _ => bail!("unknown fallback signal {p:?} (forecast, budget, witness, none)"),
+            }
+        }
+        Ok(f)
+    }
+}
+
+impl fmt::Display for Fallbacks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut v = Vec::new();
+        if self.forecast {
+            v.push("forecast");
+        }
+        if self.budget {
+            v.push("budget");
+        }
+        if self.witness {
+            v.push("witness");
+        }
+        if v.is_empty() {
+            f.write_str("none")
+        } else {
+            f.write_str(&v.join("+"))
+        }
+    }
 }
 
 /// Predicate evaluation mode.
@@ -211,6 +275,7 @@ pub struct Kernel {
     pub estimates: EstimateSource,
     /// Plans the exact path v2 may choose from.
     pub exact_plans: PlanSet,
+    pub fallback: Fallbacks,
 }
 
 impl Default for Kernel {
@@ -237,6 +302,7 @@ impl Default for Kernel {
             crossover: Crossover::Threshold,
             estimates: EstimateSource::Bounds,
             exact_plans: PlanSet::ALL,
+            fallback: Fallbacks::ALL,
         }
     }
 }
@@ -636,7 +702,8 @@ impl Crossover {
         Ok(match s.trim() {
             "threshold" => Self::Threshold,
             "cost" => Self::Cost,
-            _ => bail!("unknown crossover {s:?} (threshold, cost)"),
+            "guarded" => Self::Guarded,
+            _ => bail!("unknown crossover {s:?} (threshold, cost, guarded)"),
         })
     }
 }
@@ -646,6 +713,7 @@ impl fmt::Display for Crossover {
         f.write_str(match self {
             Self::Threshold => "threshold",
             Self::Cost => "cost",
+            Self::Guarded => "guarded",
         })
     }
 }
@@ -702,6 +770,7 @@ impl Kernel {
             "crossover" => self.crossover = Crossover::parse(value)?,
             "estimates" => self.estimates = EstimateSource::parse(value)?,
             "exact_plans" => self.exact_plans = PlanSet::parse(value)?,
+            "fallback" => self.fallback = Fallbacks::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -799,6 +868,12 @@ impl Kernel {
                 self.crossover
             );
         }
+        if self.crossover == Crossover::Guarded {
+            ensure!(
+                self.collector == Collector::Heap,
+                "the guarded crossover needs the heap collector (its answers seed the fallback)"
+            );
+        }
         if let PredicateMode::StaticBits(t) = self.predicate {
             ensure!(t >= 1, "static_bits(θ) needs θ >= 1");
         }
@@ -851,6 +926,7 @@ impl Kernel {
             "crossover": self.crossover.to_string(),
             "estimates": self.estimates.to_string(),
             "exact_plans": self.exact_plans.to_string(),
+            "fallback": self.fallback.to_string(),
         })
     }
 
@@ -1075,12 +1151,21 @@ mod tests {
             Terminator::parse("posting_l").unwrap(),
             Terminator::PostingL { scale: 16.0 }
         );
-        for s in ["threshold", "cost"] {
+        for s in ["threshold", "cost", "guarded"] {
             assert_eq!(Crossover::parse(s).unwrap().to_string(), s);
         }
         for s in ["bounds", "sketch"] {
             assert_eq!(EstimateSource::parse(s).unwrap().to_string(), s);
         }
+        for s in [
+            "forecast+budget+witness",
+            "budget",
+            "none",
+            "forecast+witness",
+        ] {
+            assert_eq!(Fallbacks::parse(s).unwrap().to_string(), s);
+        }
+        assert!(Fallbacks::parse("panic").is_err());
         assert_eq!(parse_exact("planned").unwrap(), ExactPath::Planned(0));
         assert_eq!(
             exact_name(parse_exact("planned(500)").unwrap()),
@@ -1194,6 +1279,12 @@ mod tests {
             "needs the planned exact path"
         );
         assert!(!bad(&[("crossover", "cost"), ("exact", "planned")]));
+        assert!(bad(&[("crossover", "guarded"), ("exact", "planned")]));
+        assert!(!bad(&[
+            ("crossover", "guarded"),
+            ("exact", "planned"),
+            ("collector", "heap")
+        ]));
         assert!(bad(&[("terminator", "posting_l(0.5)")]));
         assert!(!bad(&[
             ("predicate", "bitmap"),

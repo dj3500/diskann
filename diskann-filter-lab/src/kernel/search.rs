@@ -24,7 +24,7 @@ use super::{
     },
     exact::{self, ExactEval},
     materialize::{Materialized, Materializer},
-    planner::{Decision, Probe},
+    planner::{Decision, Fallback, Guard, Probe},
     score::{
         self, AdditiveScore, BonusScore, DistanceScore, LexicographicScore, MultiplicativeScore,
         Score,
@@ -98,6 +98,8 @@ pub enum Route {
     Exact,
     /// A clause is empty: no answers.
     Empty,
+    /// A guarded graph trial, then the exact path.
+    Fallback,
 }
 
 impl Route {
@@ -106,6 +108,7 @@ impl Route {
             Self::Graph => "graph",
             Self::Exact => "exact",
             Self::Empty => "empty",
+            Self::Fallback => "fallback",
         }
     }
 }
@@ -146,12 +149,16 @@ pub struct Counters {
     pub n_probe: u64,
     /// Exact plan chosen ([`ExactPlan`] code; 0 for none or the version-1 paths).
     pub plan: u64,
+    /// Why a guarded trial fell back ([`Fallback`] code).
+    pub fallback: u64,
     /// Estimated cost of the exact path and nominal graph cost (model ns; 0 if not computed).
     pub est_exact_ns: u64,
     pub est_graph_ns: u64,
     /// Estimates of `|union(c*)|` and of the match count (0 if not computed).
     pub a_hat: u64,
     pub m_hat: u64,
+    /// Model cost of the graph work of a guarded trial (ns).
+    pub graph_ns: u64,
 }
 
 impl Counters {
@@ -173,7 +180,7 @@ impl Counters {
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 20] = [
+    pub const NAMES: [&'static str; 22] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -190,14 +197,16 @@ impl Counters {
         "final_L",
         "n_probe",
         "plan",
+        "fallback",
         "est_exact_ns",
         "est_graph_ns",
         "a_hat",
         "m_hat",
+        "graph_ns",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 20] {
+    pub fn values(&self) -> [u64; 22] {
         [
             self.n_dist,
             self.n_pred,
@@ -215,10 +224,12 @@ impl Counters {
             self.final_l,
             self.n_probe,
             self.plan,
+            self.fallback,
             self.est_exact_ns,
             self.est_graph_ns,
             self.a_hat,
             self.m_hat,
+            self.graph_ns,
         ]
     }
 }
@@ -555,6 +566,7 @@ pub struct Searcher {
     heap: Vec<(u32, u32)>,
     pos: Vec<usize>,
     probe: Probe,
+    last_estimates: Estimates,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
 }
@@ -587,6 +599,7 @@ impl Searcher {
             heap: Vec::new(),
             pos: Vec::new(),
             probe: Probe::new(),
+            last_estimates: Estimates::default(),
             trace: None,
         }
     }
@@ -706,7 +719,8 @@ impl Searcher {
                     let est = self.estimates(plan, ix, exact_stat, &mut ctr);
                     l_run = planned_l(l, &est, scale);
                 }
-                self.graph(plan, ix, q, l_run, reference, &mut ctr, ids, dists)
+                self.graph(plan, ix, q, l_run, reference, &mut ctr, ids, dists, None)
+                    .expect("an unguarded graph search finishes")
             }
         } else {
             let d = self.decide(plan, ix, l, k, exact_stat, &mut ctr);
@@ -715,7 +729,53 @@ impl Searcher {
                 self.exact_v2(plan, ix, q, k, d.plan, exact_stat, false, &mut ctr);
                 self.answers.finish(ids, dists)
             } else {
-                self.graph(plan, ix, q, d.l, reference, &mut ctr, ids, dists)
+                let costs = plan.costs.as_ref().expect("validated");
+                let mut guard = (kernel.crossover == Crossover::Guarded && reference.is_none())
+                    .then(|| {
+                        Guard::new(
+                            d.est_exact,
+                            k,
+                            kernel.fallback,
+                            costs.graph_dist_ns,
+                            costs.graph_pred_ns,
+                        )
+                    });
+                match self.graph(
+                    plan,
+                    ix,
+                    q,
+                    d.l,
+                    reference,
+                    &mut ctr,
+                    ids,
+                    dists,
+                    guard.as_mut(),
+                ) {
+                    Some(n) => {
+                        if guard.is_some() {
+                            ctr.graph_ns = costs.charged(ctr.n_dist, ctr.n_pred) as u64;
+                        }
+                        n
+                    }
+                    None => {
+                        let g = guard.expect("only a guarded trial falls back");
+                        ctr.route = Route::Fallback;
+                        ctr.fallback = g.outcome as u64;
+                        ctr.graph_ns = costs.charged(ctr.n_dist, ctr.n_pred) as u64;
+                        // Re-plan with the seeded heap (distance-first prunes with its K-th).
+                        let est = self.last_estimates.clone();
+                        let (p, _) = PlanInputs {
+                            q: &self.compiled,
+                            labels: ix.labels,
+                            bitsets: exact_stat,
+                            k,
+                        }
+                        .best(costs, kernel.exact_plans, &est, true, false);
+                        ctr.plan = p as u64;
+                        self.exact_v2(plan, ix, q, k, p, exact_stat, true, &mut ctr);
+                        self.answers.finish(ids, dists)
+                    }
+                }
             }
         };
         self.compiled.clear_bits(&mut self.bits);
@@ -725,7 +785,7 @@ impl Searcher {
         ctr
     }
 
-    /// Estimates of the query (a sketch probe, or the posting bounds).
+    /// Estimates of the query (a sketch probe, or the posting bounds); kept for a fallback.
     fn estimates<T: Element>(
         &mut self,
         plan: &Plan,
@@ -750,6 +810,7 @@ impl Searcher {
                 Estimates::from_bounds(&self.compiled, n)
             }
         };
+        self.last_estimates = est.clone();
         est
     }
 
@@ -789,6 +850,7 @@ impl Searcher {
             let est = Estimates::from_bounds(&self.compiled, n);
             let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
             record(ctr, p, e.min(e_up), g0, &est);
+            self.last_estimates = est;
             self.probe.witnesses.clear();
             return Decision {
                 exact: true,
@@ -864,7 +926,8 @@ impl Searcher {
         );
     }
 
-    /// The graph search (start selection, then the loop); returns the answers written.
+    /// The graph search (start selection, then the loop): `Some(answers written)`, or `None`
+    /// when a guarded trial falls back (its answers are left in the heap collector).
     #[expect(
         clippy::too_many_arguments,
         reason = "the per-query inputs and outputs"
@@ -879,7 +942,8 @@ impl Searcher {
         ctr: &mut Counters,
         ids: &mut [u32],
         dists: &mut [f32],
-    ) -> usize {
+        guard: Option<&mut Guard>,
+    ) -> Option<usize> {
         let kernel = &plan.kernel;
         ctr.route = Route::Graph;
         self.visited.clear();
@@ -917,24 +981,31 @@ impl Searcher {
         ctr.n_start = self.starts.len() as u64;
         match plan.fast {
             FastPath::Postfilter if reference.is_none() && self.trace.is_none() => {
-                self.fast_postfilter(ix, q, l, ctr, ids, dists)
+                Some(self.fast_postfilter(ix, q, l, ctr, ids, dists))
             }
             FastPath::Inline if reference.is_none() && self.trace.is_none() => {
-                self.fast_inline(ix, q, l, ctr, ids, dists)
+                Some(self.fast_inline(ix, q, l, ctr, ids, dists))
             }
-            _ => dispatch(
-                plan.eval,
-                plan.family,
-                self,
-                plan,
-                ix,
-                q,
-                l,
-                reference,
-                ctr,
-                ids,
-                dists,
-            ),
+            _ => {
+                let witnesses = std::mem::take(&mut self.probe.witnesses);
+                let out = dispatch(
+                    plan.eval,
+                    plan.family,
+                    self,
+                    plan,
+                    ix,
+                    q,
+                    l,
+                    reference,
+                    ctr,
+                    ids,
+                    dists,
+                    guard,
+                    &witnesses,
+                );
+                self.probe.witnesses = witnesses;
+                out
+            }
         }
     }
 }
@@ -993,25 +1064,27 @@ fn dispatch<T: Element>(
     ctr: &mut Counters,
     ids: &mut [u32],
     dists: &mut [f32],
-) -> usize {
+    guard: Option<&mut Guard>,
+    witnesses: &[u32],
+) -> Option<usize> {
     macro_rules! by_family {
         ($p:ty) => {
             match family {
-                Family::Distance => {
-                    run::<T, $p, DistanceScore>(st, plan, ix, q, l, reference, ctr, ids, dists)
-                }
-                Family::Bonus => {
-                    run::<T, $p, BonusScore>(st, plan, ix, q, l, reference, ctr, ids, dists)
-                }
-                Family::Additive => {
-                    run::<T, $p, AdditiveScore>(st, plan, ix, q, l, reference, ctr, ids, dists)
-                }
-                Family::Multiplicative => run::<T, $p, MultiplicativeScore>(
-                    st, plan, ix, q, l, reference, ctr, ids, dists,
+                Family::Distance => run::<T, $p, DistanceScore>(
+                    st, plan, ix, q, l, reference, ctr, ids, dists, guard, witnesses,
                 ),
-                Family::Lexicographic => {
-                    run::<T, $p, LexicographicScore>(st, plan, ix, q, l, reference, ctr, ids, dists)
-                }
+                Family::Bonus => run::<T, $p, BonusScore>(
+                    st, plan, ix, q, l, reference, ctr, ids, dists, guard, witnesses,
+                ),
+                Family::Additive => run::<T, $p, AdditiveScore>(
+                    st, plan, ix, q, l, reference, ctr, ids, dists, guard, witnesses,
+                ),
+                Family::Multiplicative => run::<T, $p, MultiplicativeScore>(
+                    st, plan, ix, q, l, reference, ctr, ids, dists, guard, witnesses,
+                ),
+                Family::Lexicographic => run::<T, $p, LexicographicScore>(
+                    st, plan, ix, q, l, reference, ctr, ids, dists, guard, witnesses,
+                ),
             }
         };
     }
@@ -1137,6 +1210,7 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     answers: Answers,
     ctr: Counters,
     trace: Option<&'r mut Trace>,
+    guard: Option<&'r mut Guard>,
     _p: PhantomData<P>,
 }
 
@@ -1654,6 +1728,19 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                 adaptive.end_of_step(&mut self.beam, view);
                 self.lazy_ok = !adaptive.sampling();
             }
+            if let Some(g) = self.guard.as_deref_mut() {
+                let nd = self.ctr.n_dist + c.n_dist;
+                if nd >= g.next_check
+                    && g.check(
+                        nd,
+                        self.ctr.n_pred + c.n_pred,
+                        self.ctr.n_match_seen + c.n_match_seen,
+                        self.answers.len(),
+                    )
+                {
+                    break;
+                }
+            }
         }
         self.ctr.add(&c);
     }
@@ -1751,7 +1838,9 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
     }
 }
 
-/// The graph search of one query (steps 3–6 of the per-query flow).
+/// The graph search of one query (steps 3–6 of the per-query flow). With a guard: `None`
+/// when the trial falls back (the answers, merged with the `witnesses`, stay in the heap
+/// collector of `st`).
 #[expect(clippy::too_many_arguments, reason = "forwards the per-query inputs")]
 fn run<T: Element, P: Eval, S: Score>(
     st: &mut Searcher,
@@ -1763,7 +1852,9 @@ fn run<T: Element, P: Eval, S: Score>(
     ctr: &mut Counters,
     ids: &mut [u32],
     dists: &mut [f32],
-) -> usize {
+    guard: Option<&mut Guard>,
+    witnesses: &[u32],
+) -> Option<usize> {
     let Searcher {
         beam32,
         beam64,
@@ -1886,6 +1977,7 @@ fn run<T: Element, P: Eval, S: Score>(
         answers: std::mem::take(answers),
         ctr: *ctr,
         trace: trace.as_mut(),
+        guard,
         _p: PhantomData,
     };
 
@@ -1928,6 +2020,9 @@ fn run<T: Element, P: Eval, S: Score>(
         r.lazy_ok = !adaptive.sampling();
     }
 
+    if let Some(g) = r.guard.as_deref_mut() {
+        g.arm(&r.ctr);
+    }
     // The loop.
     r.search(
         two_hop,
@@ -1968,8 +2063,32 @@ fn run<T: Element, P: Eval, S: Score>(
         }
     }
     r.ctr.final_l = r.beam.search_l() as u64;
+    // A guarded trial at nominal termination: an incomplete heap, or a held-out sampled match
+    // closer than the K-th answer (merged into the heap), falls back; so do the checkpoints.
+    let mut fallback = false;
+    if let Some(g) = r.guard.as_deref_mut() {
+        if g.outcome == Fallback::None && r.answers.len() < k {
+            g.outcome = Fallback::Incomplete;
+        }
+        let check = g.outcome == Fallback::None && g.witness;
+        if check || g.outcome != Fallback::None {
+            let mut deficit = false;
+            for &w in witnesses {
+                if r.answers.contains(w) {
+                    continue;
+                }
+                let d = T::squared_l2(qv, vectors.get(w));
+                r.ctr.n_dist += 1;
+                deficit |= r.answers.offer_unique(d, w);
+            }
+            if check && deficit {
+                g.outcome = Fallback::Witness;
+            }
+        }
+        fallback = g.outcome != Fallback::None;
+    }
     *ctr = r.ctr;
-    let n = r.answers.finish(ids, dists);
+    let n = (!fallback).then(|| r.answers.finish(ids, dists));
     let Run {
         beam: b,
         visited: v,

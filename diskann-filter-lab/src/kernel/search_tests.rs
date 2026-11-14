@@ -1112,13 +1112,20 @@ fn free_graph_costs() -> super::cost::UnitCosts {
 }
 
 #[test]
-fn cost_crossovers_give_valid_answers() {
+fn crossovers_give_valid_answers_and_exact_fallbacks() {
     use super::cost::UnitCosts;
     let f = fixture(300, 23, true);
     let sketches = crate::sketches::LabelSketches::build(&f.labels, 12, 5, 1);
     let calibrated = UnitCosts::default();
-    let (mut exact, mut graph) = (0, 0);
-    for costs in [&calibrated, &free_graph_costs()] {
+    // A nominal graph search of a few starts, exact checks costing 0.1 ms, and a graph spend
+    // of 1 ms per distance: the graph is tried and overspends at the first checkpoint.
+    let overspend = UnitCosts {
+        graph_dist_ns: 1e6,
+        pred_ns: vec![1e5; 6],
+        ..free_graph_costs()
+    };
+    let mut fallbacks = [0usize; 5];
+    for costs in [&calibrated, &overspend] {
         let ix = Index {
             costs: Some(costs),
             sketches: Some(&sketches),
@@ -1136,8 +1143,16 @@ fn cost_crossovers_give_valid_answers() {
             ]),
             khpad(&[
                 ("exact", "planned"),
-                ("crossover", "cost"),
+                ("crossover", "guarded"),
                 ("estimates", "sketch"),
+                ("terminator", "posting_l(4)"),
+                ("laziness", "heap_bound"),
+            ]),
+            khpad(&[
+                ("exact", "planned"),
+                ("crossover", "guarded"),
+                ("estimates", "sketch"),
+                ("fallback", "budget+witness"),
                 ("exact_plans", "scan+df"),
             ]),
         ];
@@ -1149,22 +1164,61 @@ fn cost_crossovers_give_valid_answers() {
                     let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, l, kk);
                     let what = format!("{} q={q} L={l} K={kk}", k.to_json());
                     check_properties(&f, q, &out, &what);
-                    match ctr.route {
-                        Route::Exact => {
-                            assert_eq!(out, f.truth(q, kk), "{what}");
-                            exact += 1;
-                        }
-                        Route::Graph => graph += 1,
-                        Route::Empty => {}
+                    if matches!(ctr.route, Route::Exact | Route::Fallback) {
+                        assert_eq!(out, f.truth(q, kk), "{what}");
+                    }
+                    if ctr.route == Route::Fallback {
+                        assert!((1..=4).contains(&ctr.fallback), "{what}");
+                        fallbacks[ctr.fallback as usize] += 1;
+                        assert!(ctr.n_exact_cand > 0 && ctr.graph_ns > 0, "{what}");
+                    } else {
+                        assert_eq!(ctr.fallback, 0, "{what}");
                     }
                 }
             }
         }
     }
-    assert!(
-        exact > 0 && graph > 0,
-        "both routes are taken: {exact} / {graph}"
-    );
+    assert!(fallbacks[2] > 0, "the spend cap never fired: {fallbacks:?}");
+}
+
+#[test]
+fn complete_witnesses_make_the_guarded_trial_exact() {
+    // With sketches holding every label completely, the probe enumerates all matches; at
+    // nominal termination any missed answer is a held-out witness, so every answer is exact.
+    let f = fixture(300, 29, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = free_graph_costs();
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let k = khpad(&[
+        ("exact", "planned"),
+        ("crossover", "guarded"),
+        ("estimates", "sketch"),
+        ("fallback", "witness"),
+        ("laziness", "heap_bound"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut st = Searcher::for_index(&ix, &[&plan]);
+    let mut witnessed = 0;
+    for q in 0..f.preds.len() {
+        for (l, kk) in [(10, 10), (10, 3), (30, 10)] {
+            let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, l, kk);
+            assert_eq!(out, f.truth(q, kk), "q={q} L={l} K={kk} {ctr:?}");
+            if ctr.fallback == super::planner::Fallback::Witness as u64 {
+                witnessed += 1;
+            }
+            if q != 7 {
+                let truth = (0..300u32)
+                    .filter(|&p| f.preds.get(q).matches(f.labels.row(p)))
+                    .count();
+                assert_eq!(ctr.m_hat as usize, truth, "exact estimates q={q}");
+            }
+        }
+    }
+    assert!(witnessed > 0, "no discovery deficit was caught");
 }
 
 #[test]
