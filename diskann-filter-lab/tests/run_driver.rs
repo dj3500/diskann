@@ -327,6 +327,39 @@ fn driver_writes_the_run_format() {
         }
     }
 
+    // A prefix of a query set is described by the rows written to `panel.tsv`.
+    let prefix = d.dir.join("prefix.toml");
+    let text = format!(
+        r#"
+[experiment]
+name = "driver-prefix"
+dataset = "{ds}"
+graph = "{ds}/graph"
+queries = "qa"
+limit = 3
+k = 5
+efforts = [10]
+mode = "trace"
+runs_dir = "{ds}/runs"
+ledger = "{ds}/ledger.jsonl"
+
+[[config]]
+name = "post"
+preset = "postfilter"
+"#,
+        ds = d.dir.display()
+    );
+    std::fs::write(&prefix, text).unwrap();
+    let dirs = run::run(&prefix, &opts).unwrap();
+    let run: Value =
+        serde_json::from_str(&std::fs::read_to_string(dirs[0].join("run.json")).unwrap()).unwrap();
+    let file = run["panel"]["file"].as_str().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap().lines().count(),
+        1 + 3
+    );
+    assert_eq!(read_res(&dirs[0].join("res_10.bin")).0, 3);
+
     let ledger = std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap();
     let lines: Vec<Value> = ledger
         .lines()

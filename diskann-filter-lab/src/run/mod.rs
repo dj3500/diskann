@@ -506,8 +506,10 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             ensure!(!dir.exists(), "{} exists", dir.display());
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             let summary = write_run_files(&dir, &rows, k, &out)?;
-            let panel_json = match &rows.source {
-                Some((src, sha)) => json!({
+            // A whole query set has no panel; a prefix of one (`limit`) is described by the
+            // rows written to `panel.tsv`, so that evaluators read exactly the rows used.
+            let panel_json = match (&rows.source, exp.limit) {
+                (Some((src, sha)), _) => json!({
                     "file": dir.join("panel.tsv"),
                     "sha256": data::sha256_file(&dir.join("panel.tsv"))?,
                     "source": src,
@@ -516,7 +518,14 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     "qsets": exp.qsets,
                     "limit": exp.limit,
                 }),
-                None => Value::Null,
+                (None, Some(limit)) => json!({
+                    "file": dir.join("panel.tsv"),
+                    "sha256": data::sha256_file(&dir.join("panel.tsv"))?,
+                    "source": Value::Null,
+                    "qsets": [exp.queries],
+                    "limit": limit,
+                }),
+                (None, None) => Value::Null,
             };
             let tool = json!({
                 "name": "flab run",
