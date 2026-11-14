@@ -172,6 +172,10 @@ the exact path uses it too. The run driver loads `bitsets_sidecar` or builds the
 memory at the smallest `θ` of the experiment (untimed; recorded in `run.json`); a
 configuration's `θ` may exceed the sidecar's.
 
+`examples/kernel_microbench.rs` measures the kernel's components in isolation (ns per
+predicate check per evaluator, row length and access pattern; per-query materializations;
+exact paths per candidate; distances).
+
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
 `n_start` and the final list size. A trace mode records per-node events (offers with keys,
