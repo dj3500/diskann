@@ -14,16 +14,23 @@ publish = false
 name = "flab"
 path = "src/main.rs"
 
+[[bin]]
+name = "flab-upstream"
+path = "src/bin/flab_upstream.rs"
+
 [dependencies]
 anyhow.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
 clap = { workspace = true, features = ["derive"] }
+diskann.workspace = true
+diskann-providers.workspace = true
 diskann-vector.workspace = true
 hashbrown.workspace = true
 libc = "0.2.189"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 toml = "0.8.23"
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 diskann.workspace = true

@@ -23,4 +23,5 @@ pub mod predicate;
 pub mod run;
 pub mod starts;
 pub mod text;
+pub mod upstream;
 pub mod vectors;
