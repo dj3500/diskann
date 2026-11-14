@@ -216,4 +216,5 @@ flab-upstream info --index graphs/ds/index --dtype u8
 
 Queries come from `--qset S` (`qS.{u8bin,fbin}` and `qS.fpred` in the dataset directory),
 explicit `--queries`/`--predicates`, or `--panel` (TSV with columns `qset`, `qidx` and optionally
-`split`; rows in panel order). Efforts below K are skipped for that K.
+`split`; rows in panel order). Efforts below K are skipped for that K; `-k K:L1/L2/...` gives K
+its own efforts (e.g. `-k 10:10/20/50,100:100/200/500`).

@@ -106,11 +106,12 @@ struct RunArgs {
     /// Predicate providers (comma-separated).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "forward")]
     providers: Vec<ProviderArg>,
-    /// Numbers of results K (comma-separated); each K runs the efforts L >= K.
+    /// Numbers of results K (comma-separated). Each K runs the efforts L >= K of --efforts,
+    /// or its own list given as `K:L1/L2/...` (e.g. `10:10/20/50,100:100/200/500`).
     #[arg(short, value_delimiter = ',', default_value = "10")]
-    k: Vec<usize>,
+    k: Vec<String>,
     /// Search list sizes L (comma-separated).
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',')]
     efforts: Vec<usize>,
     /// Adaptive L: distance computations before the match rate is estimated.
     #[arg(long, default_value_t = 1000)]
@@ -156,6 +157,27 @@ fn main() -> Result<()> {
             DTypeArg::F32 => info::<f32>(&index),
         },
     }
+}
+
+/// Parses `K` (efforts: those of `default` that are >= K) or `K:L1/L2/...`.
+fn parse_k(spec: &str, default: &[usize]) -> Result<(usize, Vec<usize>)> {
+    let (k, efforts) = match spec.split_once(':') {
+        Some((k, list)) => (
+            k.trim().parse::<usize>()?,
+            list.split('/')
+                .map(|l| l.trim().parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        None => {
+            let k = spec.trim().parse::<usize>()?;
+            (k, default.iter().copied().filter(|&l| l >= k).collect())
+        }
+    };
+    ensure!(
+        !efforts.is_empty() && efforts.iter().all(|&l| l >= k),
+        "K = {k} needs at least one effort, and every effort must be >= K"
+    );
+    Ok((k, efforts))
 }
 
 fn index_description<T: VectorRepr + Element>(loaded: &LoadedIndex<T>, prefix: &str) -> Value {
@@ -218,10 +240,8 @@ fn run_typed<T: VectorRepr + Element>(args: &RunArgs) -> Result<()> {
             AlgorithmArg::Beta => Algorithm::beta(args.beta)?,
         };
         for &provider in &args.providers {
-            for &k in &args.k {
-                let efforts: Vec<usize> =
-                    args.efforts.iter().copied().filter(|&l| l >= k).collect();
-                ensure!(!efforts.is_empty(), "no effort L >= K = {k}");
+            for k_spec in &args.k {
+                let (k, efforts) = parse_k(k_spec, &args.efforts)?;
                 specs.push(RunSpec {
                     algorithm: algorithm.clone(),
                     provider: match provider {
@@ -354,4 +374,20 @@ fn info<T: VectorRepr + Element>(prefix: &str) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_k;
+
+    #[test]
+    fn efforts_per_k() {
+        assert_eq!(parse_k("10", &[5, 10, 50]).unwrap(), (10, vec![10, 50]));
+        assert_eq!(
+            parse_k("100:100/500", &[10]).unwrap(),
+            (100, vec![100, 500])
+        );
+        assert!(parse_k("100", &[10, 50]).is_err());
+        assert!(parse_k("10:5/20", &[]).is_err());
+    }
 }
