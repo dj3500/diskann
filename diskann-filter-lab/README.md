@@ -8,6 +8,9 @@ normal form (an AND of ORs over Boolean labels). The crate provides:
   used by search kernels;
 - binary file formats for labels, predicates and ground truth, and converters from text formats;
 - exact filtered k-NN ground truth with complete distance-tie bands;
+- graphs over data points and auxiliary nodes (`Graph::neighbors`, `NodeLabels`, `NodeVectors`)
+  with start-node tables, and an importer of saved DiskANN in-memory indices (C++ library and
+  Rust `diskann-providers`);
 - the `flab` command-line tool.
 
 ## Concepts
@@ -27,6 +30,14 @@ normal form (an AND of ORs over Boolean labels). The crate provides:
   a predicate is compiled; the number dropped is kept per query. A clause made only of unknown
   labels becomes empty, so the predicate matches nothing. A predicate without clauses (an empty
   text line) matches every point.
+- A **graph** has `n_nodes ≥ n_data` nodes. Ids `0..n_data` are the data points (rows of the
+  base vectors and of the label store); ids `n_data..n_nodes` are **auxiliary nodes** (frozen
+  start points, centroids, routers) whose vectors are stored with the graph, in the element type
+  of the data. Auxiliary nodes have no labels and are never answers: `Graph::labels(&store)`
+  gives bounds-safe access that returns `Node::Auxiliary` for them instead of indexing a label
+  row (and never matches a predicate), and `Graph::vectors(&base)` serves base rows and
+  auxiliary vectors by node id. Adjacency rows have a fixed stride of `r_max` slots, so
+  `Graph::neighbors(id)` is a slice of one 64-byte-aligned array.
 
 ## Command-line tool
 
@@ -46,10 +57,23 @@ flab gt --base base.u8bin --queries queries.u8bin --labels labels.flab \
 # Compare with another DiskANN ground truth file (with distances), up to tie order
 flab gt-compare --ext gt100.fgt --reference other_gt.bin -k 100
 
+# Graphs: import a saved DiskANN in-memory index (graph file <prefix>, vectors <prefix>.data)
+flab import-graph --graph <prefix> --data <prefix>.data --base base.u8bin \
+        -o graph.flab --report import.json
+
+# Start-node tables: the graph's starts, C++ per-label start points (joined by label name with
+# the label store of the graph's label view) and the C++ build-time sample
+flab import-starts --graph graph.flab --labels labels.flab \
+        --medoids <prefix>_labels_to_medoids.txt --label-map <prefix>_labels_map.txt \
+        --sample <prefix>_sample_ids.bin --sample-map <prefix>_sample_labels.txt_map.bin \
+        -o starts.flab --report starts.json
+
 # Summaries
 flab info labels.flab
 flab info queries.fpred
 flab info gt100.fgt
+flab info graph.flab    # node space, degree distributions, starts, reachability from the starts
+flab info starts.flab
 ```
 
 The element type of vector files is inferred from the extension (`.u8bin` = `u8`, `.fbin` =
@@ -66,6 +90,45 @@ The element type of vector files is inferred from the extension (`.u8bin` = `u8`
   `false` and `null` values are skipped.
 - JSONL predicates: `{"query_id": i, "filter": F}` with `F` = `{"$and": [C, ...]}` or `C`, `C` =
   `{"$or": [A, ...]}` or `A`, `A` = `{"<label>": {"$eq": true}}`.
+
+## Importing DiskANN indices
+
+The C++ library (`Index::save`) and the Rust in-memory index of `diskann-providers`
+(`SaveWith<AsyncIndexMetadata>`) save the same layout:
+
+- the graph file `<prefix>`: a 24-byte header (`u64` file size, `u32` maximum degree, `u32`
+  start id, `u64` number of frozen points `F`), then for every node in id order a `u32` degree
+  `k` and `k` `u32` neighbor ids. The C++ library records the largest observed degree, Rust its
+  configured maximum degree;
+- the vectors `<prefix>.data` in the `.bin` layout, one row per node; the `F` frozen points are
+  the last nodes and rows.
+
+The Rust provider allocates one adjacency list more than it has nodes, so its graph files end
+with an empty list beyond the `N + F` rows of the vector file; it belongs to no node.
+
+`import-graph` (and `diskann_io::read_index`) takes the node count from the vector file
+(without it, from the number of lists; then `F` must be 0). The first `n_nodes − F` nodes are the
+data points, the frozen points become auxiliary nodes of kind *frozen* with their vectors,
+`r_max` is the header's maximum degree, and the starts are the header's start id followed by
+the frozen points (the start set of both libraries). It checks the file size, every degree
+against the maximum degree, every id against the node count, and that the extra list is empty.
+With `--base` it also checks that the first `n_data` rows of the vector file equal the base
+vectors, so that point ids agree, and fails otherwise (unless `--allow-base-mismatch`). The
+written file is read back and compared. `diskann_io::open` loads a graph either from
+`graph.flab` or directly from a DiskANN graph file, without conversion.
+
+`import-starts` builds a start-node table: the global starts are the graph's starts; C++
+per-label start points (`label, point` lines with integer labels) are translated to label names
+with the label map (`name<TAB>label` lines) and to the label ids of `--labels` by name (names
+absent from the store are dropped and reported, and so are starts that lack their label); the
+sample keeps the order of the id file, and `--sample-map` gives the node that the C++ search
+starts from for each sample entry (entries beyond the sample are ignored).
+
+The example `upstream_check` compares an import with the adjacency lists that the upstream
+loader reads from the same files:
+`cargo run --release -p diskann-filter-lab --example upstream_check -- <prefix> [--flab graph.flab]`.
+The test `tests/upstream_roundtrip.rs` builds and saves an index with `diskann-providers` and
+checks that the import holds the same lists, starts and frozen vector.
 
 ## Ground truth semantics
 
@@ -150,6 +213,34 @@ Parameters: `n_queries`, `K`, `n_points`, `n_band` (Σ band lengths), `dict_hash
 | 4 | `u64` | `n_queries + 1` | band offsets |
 | 5 | `u32` | `n_band` | band ids, per query sorted by (distance, id) |
 | 6 | `f32` | `n_band` | band distances |
+
+### Graphs: `graph.flab` (magic `FLABGRF\0`)
+
+Parameters: `n_data`, `n_nodes`, `r_max`, `n_starts`, element type of the vectors (0 = not
+recorded, 1 = `u8`, 2 = `f32`), dimension (0 if not recorded), flags (0; none are defined in
+version 1), `n_edges` (sum of the degrees). Auxiliary nodes require a recorded element type.
+
+| Section | Type | Length | Content |
+|---|---|---|---|
+| 0 | `u32` | `n_nodes` | out-degree of each node |
+| 1 | `u32` | `n_nodes × r_max` | adjacency rows; the slots after the degree hold `u32::MAX` |
+| 2 | `u32` | `n_starts` | start nodes in priority order |
+| 3 | `u8` | `n_nodes − n_data` | kind of each auxiliary node (0 = frozen, 1 = centroid, 2 = router) |
+| 4 | element type | `(n_nodes − n_data) × dim` | vectors of the auxiliary nodes, row-major |
+
+### Start-node tables: `starts.flab` (magic `FLABSTR\0`)
+
+Parameters: `n_nodes` and `n_data` of the graph; `n_labels` and `dict_hash` of the label store
+that the per-label table refers to (0 without a table); `n_global`; `n_label_entries`;
+`n_sample`.
+
+| Section | Type | Length | Content |
+|---|---|---|---|
+| 0 | `u32` | `n_global` | global starts in priority order |
+| 1 | `u64` | `n_labels + 1` | per-label offsets into section 2 |
+| 2 | `u32` | `n_label_entries` | start nodes of each label |
+| 3 | `u32` | `n_sample` | sample entries (data points) in order |
+| 4 | `u32` | `n_sample` | start node of each sample entry |
 
 Reading a section with NumPy:
 

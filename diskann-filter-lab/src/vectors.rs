@@ -22,6 +22,8 @@ use diskann_vector::{distance::SquaredL2, PureDistanceFunction};
 pub trait Element: Pod + Send + Sync {
     /// Short type name used in messages.
     const NAME: &'static str;
+    /// The element type as a value.
+    const DTYPE: DType;
 
     /// Squared Euclidean distance computed with `diskann-vector`'s SIMD kernels.
     ///
@@ -32,6 +34,7 @@ pub trait Element: Pod + Send + Sync {
 
 impl Element for u8 {
     const NAME: &'static str = "u8";
+    const DTYPE: DType = DType::U8;
 
     #[inline(always)]
     fn squared_l2(a: &[u8], b: &[u8]) -> f32 {
@@ -41,6 +44,7 @@ impl Element for u8 {
 
 impl Element for f32 {
     const NAME: &'static str = "f32";
+    const DTYPE: DType = DType::F32;
 
     #[inline(always)]
     fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
@@ -56,6 +60,22 @@ pub enum DType {
 }
 
 impl DType {
+    /// Size of one element in bytes.
+    pub fn size(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::F32 => 4,
+        }
+    }
+
+    /// Short type name used in messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::U8 => u8::NAME,
+            Self::F32 => f32::NAME,
+        }
+    }
+
     /// Infers the element type from the file extension (`.u8bin` or `.fbin`).
     pub fn from_path(path: &Path) -> Result<Self> {
         match path.extension().and_then(|e| e.to_str()) {

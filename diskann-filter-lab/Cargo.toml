@@ -22,5 +22,11 @@ diskann-vector.workspace = true
 hashbrown.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+diskann.workspace = true
+diskann-providers = { workspace = true, features = ["virtual_storage"] }
+diskann-utils.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
 [lints]
 workspace = true
