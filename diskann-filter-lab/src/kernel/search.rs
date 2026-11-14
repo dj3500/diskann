@@ -17,7 +17,10 @@ use super::{
     },
     config::{StartAdmission, StartSource, Terminator},
     entry::{self, SampleIndex, StartPredicate},
-    eval::{ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList},
+    eval::{
+        ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
+        StaticBits,
+    },
     exact,
     materialize::{Materialized, Materializer},
     score::{
@@ -28,6 +31,7 @@ use super::{
     visited::Visited,
 };
 use crate::{
+    bitsets::LabelBitsets,
     graph::{Graph, NodeVectors},
     labels::LabelStore,
     predicate::Cnf,
@@ -64,6 +68,8 @@ pub struct Index<'a, T> {
     pub view_postings: Option<&'a [u64]>,
     /// Positive base-derived minimum of the per-query scales (`ε_min`; 0 if unknown).
     pub eps_min: f32,
+    /// Static per-label bitsets of `labels` (the `static_bits(θ)` predicate mode).
+    pub bitsets: Option<&'a LabelBitsets>,
 }
 
 /// One query: its vector, predicate and, with a label view, the view's predicate.
@@ -193,6 +199,7 @@ pub enum EvalMode {
     ClauseSearch,
     Dense,
     Sparse,
+    StaticBits,
 }
 
 /// A kernel configuration resolved against an index (validated once per run).
@@ -202,6 +209,8 @@ pub struct Plan {
     projection: Option<Vec<u32>>,
     two_hop_cap: usize,
     eval: EvalMode,
+    /// `θ` of the `static_bits(θ)` mode.
+    static_theta: u64,
     family: Family,
     pilot: bool,
     complete: bool,
@@ -240,6 +249,29 @@ impl Plan {
             (PredicateMode::ClauseSearch, _) => EvalMode::ClauseSearch,
             (PredicateMode::Bitmap, Materializer::Dense) => EvalMode::Dense,
             (PredicateMode::Bitmap, _) => EvalMode::Sparse,
+            (PredicateMode::StaticBits(_), _) => EvalMode::StaticBits,
+        };
+        let static_theta = match kernel.predicate {
+            PredicateMode::StaticBits(t) => {
+                let b = ix.bitsets.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "predicate {} needs static per-label bitsets",
+                        kernel.predicate
+                    )
+                })?;
+                ensure!(
+                    b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
+                    "the static bitsets refer to another label store"
+                );
+                ensure!(
+                    b.theta() <= t,
+                    "predicate {} needs bitsets of every label with at least {t} points; they were built with θ = {}",
+                    kernel.predicate,
+                    b.theta()
+                );
+                t
+            }
+            _ => 0,
         };
         for s in &kernel.starts {
             match s {
@@ -291,6 +323,7 @@ impl Plan {
             projection,
             two_hop_cap,
             eval,
+            static_theta,
             family: kernel.scorer.family(),
             pilot: kernel.scorer.needs_pilot(),
             complete: kernel.needs_g(),
@@ -519,16 +552,26 @@ impl Searcher {
             plan.projection.as_deref(),
             &mut self.bits,
         );
+        let stat = (plan.eval == EvalMode::StaticBits).then(|| {
+            let b = ix
+                .bitsets
+                .expect("a static_bits plan needs the static bitsets of the index");
+            self.compiled.split_static(ix.labels, b, plan.static_theta);
+            b
+        });
         let exact_threshold = kernel.exact.threshold();
         let n = if self.compiled.is_empty() {
             ctr.route = Route::Empty;
             0
         } else if exact_threshold.is_some_and(|t| self.compiled.min_upper_bound() <= t) {
             ctr.route = Route::Exact;
-            let cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+            let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+            if let Some(b) = stat {
+                cx = cx.with_static(b);
+            }
             exact::run(
                 kernel.exact,
-                plan.eval == EvalMode::ClauseSearch,
+                plan.eval,
                 &cx,
                 &ix.vectors,
                 ix.graph.n_data(),
@@ -644,6 +687,7 @@ fn dispatch<T: Element>(
         EvalMode::ClauseSearch => by_family!(ClauseSearch),
         EvalMode::Dense => by_family!(DenseBitmap),
         EvalMode::Sparse => by_family!(SparseList),
+        EvalMode::StaticBits => by_family!(StaticBits),
     }
 }
 
@@ -1433,7 +1477,10 @@ fn run<T: Element, P: Eval, S: Score>(
         }
         Materializer::None => {}
     }
-    let cx = EvalCtx::new(ix.labels, compiled, bits, &mat.dense, &mat.sparse);
+    let mut cx = EvalCtx::new(ix.labels, compiled, bits, &mat.dense, &mat.sparse);
+    if let (EvalMode::StaticBits, Some(b)) = (plan.eval, ix.bitsets) {
+        cx = cx.with_static(b);
+    }
     let sc = S::new(&plan.score_params(compiled, &scales));
     let mut beam = std::mem::take(S::beam(beam32, beam64));
 

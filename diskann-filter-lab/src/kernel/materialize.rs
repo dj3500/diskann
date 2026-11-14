@@ -13,7 +13,8 @@
 //!   smallest upper bound and filtering it against the other clauses with galloping searches
 //!   in their postings.
 //!
-//! Static per-label bitsets (a sidecar) are not implemented yet.
+//! Static per-label bitsets (a sidecar built once, not per query) are in
+//! [`crate::bitsets`]; the `static_bits(θ)` evaluator ([`super::eval::StaticBits`]) reads them.
 
 use super::eval::{gallop_lower_bound, Compiled};
 use crate::labels::LabelStore;

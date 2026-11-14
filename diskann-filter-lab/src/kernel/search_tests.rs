@@ -12,6 +12,7 @@ use super::{
     search::{Counters, Index, Plan, Query, Route, Searcher},
 };
 use crate::{
+    bitsets::LabelBitsets,
     graph::{AuxKind, AuxNodes, Graph},
     labels::{LabelStore, LabelStoreBuilder},
     predicate::{PredicateSet, PredicateSetBuilder},
@@ -36,8 +37,8 @@ impl Lcg {
 }
 
 /// A random dataset: `n` points in 6 dimensions (`u8`), a k-NN graph plus random edges, one
-/// frozen auxiliary start (a copy of point 0), labels over three categories, predicates, and
-/// a start table with per-label starts and a sample.
+/// frozen auxiliary start (a copy of point 0), labels over three categories, predicates, a
+/// start table with per-label starts and a sample, and static bitsets of every label.
 struct Fixture {
     base: Matrix<u8>,
     queries: Matrix<u8>,
@@ -46,6 +47,7 @@ struct Fixture {
     preds: PredicateSet,
     starts: Starts,
     sample: SampleIndex,
+    bitsets: LabelBitsets,
 }
 
 const DIM: usize = 6;
@@ -160,6 +162,7 @@ fn fixture(n: usize, seed: u64, aux: bool) -> Fixture {
     let sample: Vec<u32> = (0..n as u32).filter(|p| p % 3 != 1).collect();
     starts.set_sample(sample, None).unwrap();
     let sample = SampleIndex::build(&starts, &labels).unwrap();
+    let bitsets = LabelBitsets::build(&labels, 1);
     Fixture {
         base,
         queries,
@@ -168,6 +171,7 @@ fn fixture(n: usize, seed: u64, aux: bool) -> Fixture {
         preds,
         starts,
         sample,
+        bitsets,
     }
 }
 
@@ -183,6 +187,7 @@ impl Fixture {
             label_view: false,
             view_postings: None,
             eps_min: 1.0,
+            bitsets: Some(&self.bitsets),
         }
     }
 
@@ -329,6 +334,25 @@ fn configs() -> Vec<(String, Kernel)> {
             ("admission", "projection(b)"),
             ("laziness", "predicate_first"),
         ],
+        &[
+            ("predicate", "static_bits(60)"),
+            ("scorer", "multiplicative(1)"),
+            ("collector", "heap"),
+        ],
+        &[
+            ("predicate", "static_bits(1)"),
+            ("admission", "cutoff(1)"),
+            ("scorer", "additive(5)"),
+        ],
+        &[
+            ("predicate", "static_bits(100)"),
+            ("admission", "projection(b)"),
+            ("collector", "heap"),
+        ],
+        &[
+            ("predicate", "static_bits(60)"),
+            ("exact", "scan_smallest_clause(60)"),
+        ],
     ];
     for (i, edits) in overrides.iter().enumerate() {
         let mut k = Kernel::default();
@@ -424,6 +448,66 @@ fn lazy_and_predicate_first_evaluation_do_not_change_answers() {
 }
 
 #[test]
+fn static_bits_do_not_change_answers_or_counters() {
+    let f = fixture(300, 13, true);
+    let ix = f.index();
+    let edits: &[&[(&str, &str)]] = &[
+        &[],
+        &[("collector", "heap"), ("laziness", "distance_first")],
+        &[("admission", "strict"), ("laziness", "predicate_first")],
+        &[("admission", "cutoff(1)"), ("scorer", "additive(5)")],
+        &[("scorer", "shifted(1)"), ("weights", "surprisal")],
+        &[("admission", "projection(a)"), ("collector", "heap")],
+        &[("admission", "strict"), ("expander", "two_hop")],
+        &[("starts", "sample(3)+global"), ("collector", "all")],
+        &[("exact", "scan_smallest_clause(70)")],
+    ];
+    let mut static_preds = 0;
+    for e in edits {
+        let mut base = Kernel::default();
+        for (key, value) in e.iter() {
+            base.set(key, value).unwrap();
+        }
+        let pa = Plan::new(&base, &ix).unwrap();
+        let mut st = Searcher::for_index(&ix, &[&pa]);
+        for theta in ["1", "60", "100", "1000"] {
+            let mut k = base.clone();
+            k.set("predicate", &format!("static_bits({theta})"))
+                .unwrap();
+            let pb = Plan::new(&k, &ix).unwrap();
+            for q in 0..f.preds.len() {
+                for l in [10, 30] {
+                    let (oa, ca) = search(&f, &mut st, &pa, q, l, 10, None);
+                    let (ob, cb) = search(&f, &mut st, &pb, q, l, 10, None);
+                    assert_eq!((oa, ca), (ob, cb), "{e:?} static_bits({theta}) q={q} L={l}");
+                    static_preds += cb.n_pred;
+                }
+            }
+        }
+    }
+    assert!(static_preds > 0);
+    // Bitsets built above the requested threshold are refused.
+    let high = LabelBitsets::build(&f.labels, 100);
+    let ix_high = Index {
+        bitsets: Some(&high),
+        ..f.index()
+    };
+    let mut k = Kernel::default();
+    k.set("predicate", "static_bits(60)").unwrap();
+    assert!(Plan::new(&k, &ix_high).is_err());
+    assert!(Plan::new(
+        &k,
+        &Index {
+            bitsets: None,
+            ..f.index()
+        }
+    )
+    .is_err());
+    k.set("predicate", "static_bits(100)").unwrap();
+    assert!(Plan::new(&k, &ix_high).is_ok());
+}
+
+#[test]
 fn reference_mode_finds_the_exact_answers() {
     let f = fixture(300, 11, true);
     let ix = f.index();
@@ -457,7 +541,7 @@ fn exact_paths_are_exact() {
         "scan_smallest_clause(1000000)",
         "intersect_then_scan(1000000)",
     ] {
-        for mode in ["mode1", "mode2"] {
+        for mode in ["mode1", "mode2", "static_bits(60)"] {
             let mut k = Kernel::default();
             k.set("exact", exact).unwrap();
             k.set("predicate", mode).unwrap();
@@ -528,6 +612,7 @@ fn run_line(
         label_view: false,
         view_postings: None,
         eps_min: 0.5,
+        bitsets: None,
     };
     let plan = Plan::new(kernel, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -665,6 +750,7 @@ fn exact_duplicates_follow_the_upstream_tie_rule() {
         label_view: false,
         view_postings: None,
         eps_min: 0.5,
+        bitsets: None,
     };
     let plan = Plan::new(&k, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);

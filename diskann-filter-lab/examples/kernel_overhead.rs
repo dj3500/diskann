@@ -80,6 +80,7 @@ fn bench<T: Element>(
         label_view: false,
         view_postings: None,
         eps_min: 0.0,
+        bitsets: None,
     };
     let post_fast = Plan::new(&Preset::parse("postfilter")?.kernel(), &ix)?;
     let inline_fast = Plan::new(&Preset::parse("upstream-inline")?.kernel(), &ix)?;

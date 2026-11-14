@@ -21,7 +21,7 @@
 //! 5. the collector returns at most `K` matching data points sorted by (true distance, id).
 //!
 //! Roles ([`config::Kernel`]): `PredicateEval` (mode 1 row scan, mode 2 per-clause search, a
-//! materialized bitmap), `Materializer`, `Admission`, `Laziness`, `Scorer`, `Collector`,
+//! materialized bitmap, static per-label bitsets), `Materializer`, `Admission`, `Laziness`, `Scorer`, `Collector`,
 //! `Expander`, `Terminator`, `Starts` (with a start-admission policy) and `ExactPath`.
 //! The element type, the predicate mode and the scorer family are compile-time parameters
 //! (dispatched once per plan), and so are the laziness, the expander and tracing (dispatched

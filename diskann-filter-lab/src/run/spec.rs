@@ -24,6 +24,8 @@
 //! seed = 1                         # order of the configurations per (rep, effort)
 //! runs_dir = "<dir>"               # run directories are created here
 //! ledger = "<file>"                # one JSON line per run
+//! bitsets_sidecar = "<bitsets.flab>" # optional static bitsets of `static_bits(θ)` configs
+//!                                  # (default: built in memory at the smallest θ, untimed)
 //!
 //! [[config]]
 //! name = "inline"
@@ -96,6 +98,7 @@ struct RawExperiment {
     reference_min: Option<u64>,
     eps_min: Option<f32>,
     fast_paths: Option<bool>,
+    bitsets_sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -153,6 +156,9 @@ pub struct Experiment {
     /// Whether configurations that are exactly a preset with a hand-specialized loop use it
     /// (default); `false` runs every configuration in the configurable loop.
     pub fast_paths: bool,
+    /// Static per-label bitsets of the dataset's labels for `static_bits(θ)` configurations
+    /// (built in memory when absent).
+    pub bitsets_sidecar: Option<PathBuf>,
     pub configs: Vec<ConfigSpec>,
 }
 
@@ -318,6 +324,7 @@ impl Experiment {
             reference_min: e.reference_min.unwrap_or(1000),
             eps_min: e.eps_min,
             fast_paths: e.fast_paths.unwrap_or(true),
+            bitsets_sidecar: e.bitsets_sidecar.map(|p| resolve(dir, &p)),
             configs,
         })
     }

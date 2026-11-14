@@ -70,6 +70,15 @@ flab import-starts --graph graph.flab --labels labels.flab \
         --sample <prefix>_sample_ids.bin --sample-map <prefix>_sample_labels.txt_map.bin \
         -o starts.flab --report starts.json
 
+# Per-label start tables computed from the data, for any label store and any graph over the
+# same points (one starts-<tag>.flab + starts-<tag>.json report per strategy)
+flab starts build --dataset <dir> --graph <graph> --strategy medoid,random,kmeans(4) \
+        -t 4 --out-dir <dir>
+
+# Static per-label bitsets (labels with at least θ points) and their memory per θ
+flab bitsets build --labels labels.flab --theta 31250 -o bitsets.flab
+flab bitsets stats --labels labels.flab --theta 1000,10000,31250
+
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
 
@@ -122,7 +131,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
 | `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector) |
-| `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer) |
+| `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)` |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
@@ -150,6 +159,19 @@ hand-specialized loops (`search::FastPath`, same answers and counters), used unl
 is made generic (`Plan::generic`). `examples/kernel_overhead.rs` measures the configurable
 loop against them.
 
+**Static per-label bitsets** (`predicate = "static_bits(θ)"`, module `bitsets`): a dense
+bitset over the data points for every label with at least `θ` points (a sidecar built once:
+`⌈n/64⌉ × 8` bytes per label, smaller than the label's postings when `θ > n/32`). Per query the
+clauses are split into bitset labels (tested in O(1), most frequent first) and row labels. A
+node is evaluated clause by clause in Boolean order with the bitsets; the clauses that remain
+unsatisfied and have row labels are then checked in one pass over the node's row (a mode-1
+scan, or galloping searches for long rows); a clause made only of bitset labels never reads the
+row, and Boolean evaluation stops at the first such clause that fails. It returns the
+failed-clause count like modes 1 and 2 (so it works with every scorer and admission rule), and
+the exact path uses it too. The run driver loads `bitsets_sidecar` or builds the bitsets in
+memory at the smallest `θ` of the experiment (untimed; recorded in `run.json`); a
+configuration's `θ` may exceed the sidecar's.
+
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
 `n_start` and the final list size. A trace mode records per-node events (offers with keys,
@@ -167,6 +189,8 @@ name = "smoke"
 dataset = "/path/to/dataset"     # base.<u8bin|fbin>, labels.flab, q<set>.<ext>, q<set>.fpred
 graph = "/path/to/graph"         # default graph: a directory with graph.flab, a graph.flab, or a DiskANN index prefix
 # starts_sidecar = "/path/to/starts.flab"  # default: starts.flab next to graph.flab
+# bitsets_sidecar = "/path/to/bitsets.flab" # static_bits(θ) configs; default: built in memory
+#                                           # (untimed) at the smallest θ of the experiment
 # view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred
 queries = "q10K"                 # a whole query set, or:
 # panel = "panels/screen.tsv"    # TSV with columns qset, qidx (optional split); relative to the dataset
@@ -247,6 +271,27 @@ loader reads from the same files:
 `cargo run --release -p diskann-filter-lab --example upstream_check -- <prefix> [--flab graph.flab]`.
 The test `tests/upstream_roundtrip.rs` builds and saves an index with `diskann-providers` and
 checks that the import holds the same lists, starts and frozen vector.
+
+## Computed start tables (`flab starts build`)
+
+Per-label starts for any label store on any graph over the same points (for example a
+label-blind graph, or a synthetic label set on an existing graph): for every label, from its
+members (data points carrying it):
+
+- `medoid`: the member closest to the label's centroid;
+- `random(k)`: `k` distinct members drawn uniformly, in random order (`random` = 1);
+- `kmeans(k)`: up to `k` representatives: k-means++ seeding and `--iters` Lloyd iterations,
+  then, per non-empty cluster, the member closest to its centroid, largest cluster first
+  (labels with at most `k` members get all of them).
+
+Labels with more than `--exact-max` members (default 10,000) use a seeded sample of `--sample`
+members (default 10,000) for the centroid, the k-means and the candidates. Distances are
+squared L2 in `f32` against `f32` centroids. Every choice depends only on the data, the
+parameters and `--seed` (one random stream per label), not on the thread count. The table
+carries the graph's global starts and node space, and the label store's dictionary
+fingerprint (`label(c*)` / `label(all)` starts of the kernel); the JSON report gives the
+counts (labels with a start, entries, distinct nodes, sampled labels, distance computations)
+and the build cost (wall and CPU time, threads, peak RSS).
 
 ## Ground truth semantics
 
@@ -359,6 +404,16 @@ that the per-label table refers to (0 without a table); `n_global`; `n_label_ent
 | 2 | `u32` | `n_label_entries` | start nodes of each label |
 | 3 | `u32` | `n_sample` | sample entries (data points) in order |
 | 4 | `u32` | `n_sample` | start node of each sample entry |
+
+### Static per-label bitsets: `bitsets.flab` (magic `FLABBIT\0`)
+
+Parameters: `n_points`, `n_labels` and `dict_hash` of the label store, `θ`, the number of labels
+with a bitset `B` (every label with at least `θ` points), `words` = `⌈n_points / 64⌉`.
+
+| Section | Type | Length | Content |
+|---|---|---|---|
+| 0 | `u32` | `B` | labels with a bitset, increasing |
+| 1 | `u64` | `B × words` | the bitsets in the order of section 0; bit `p % 64` of word `p / 64` is set when point `p` carries the label |
 
 Reading a section with NumPy:
 

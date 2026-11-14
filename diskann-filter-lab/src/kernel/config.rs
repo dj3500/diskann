@@ -136,6 +136,9 @@ pub enum PredicateMode {
     ClauseSearch,
     /// Lookup in the materialized match set.
     Bitmap,
+    /// Static per-label bitsets for the labels with at least `θ` points, the row for the
+    /// others (needs bitsets built with a threshold of at most `θ`).
+    StaticBits(u64),
 }
 
 /// Beam capacity convention.
@@ -508,22 +511,25 @@ impl fmt::Display for Terminator {
 
 impl PredicateMode {
     pub fn parse(s: &str) -> Result<Self> {
-        Ok(match s.trim() {
-            "mode1" | "row_scan" => Self::RowScan,
-            "mode2" | "clause_search" => Self::ClauseSearch,
-            "bitmap" => Self::Bitmap,
-            _ => bail!("unknown predicate mode {s:?} (mode1, mode2, bitmap)"),
+        let (name, args) = call(s)?;
+        Ok(match (name.as_str(), args.as_slice()) {
+            ("mode1" | "row_scan", []) => Self::RowScan,
+            ("mode2" | "clause_search", []) => Self::ClauseSearch,
+            ("bitmap", []) => Self::Bitmap,
+            ("static_bits", [t]) => Self::StaticBits(num(t, "θ_bits")?),
+            _ => bail!("unknown predicate mode {s:?} (mode1, mode2, bitmap, static_bits(θ))"),
         })
     }
 }
 
 impl fmt::Display for PredicateMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::RowScan => "mode1",
-            Self::ClauseSearch => "mode2",
-            Self::Bitmap => "bitmap",
-        })
+        match self {
+            Self::RowScan => write!(f, "mode1"),
+            Self::ClauseSearch => write!(f, "mode2"),
+            Self::Bitmap => write!(f, "bitmap"),
+            Self::StaticBits(t) => write!(f, "static_bits({t})"),
+        }
     }
 }
 
@@ -680,6 +686,9 @@ impl Kernel {
                 "predicate_first is illegal with two_hop (the second hop ranks rejected nodes by distance)"
             ),
             Laziness::Eager => {}
+        }
+        if let PredicateMode::StaticBits(t) = self.predicate {
+            ensure!(t >= 1, "static_bits(θ) needs θ >= 1");
         }
         let bitmap = self.predicate == PredicateMode::Bitmap;
         ensure!(
@@ -946,6 +955,10 @@ mod tests {
         ] {
             assert_eq!(Terminator::parse(s).unwrap().to_string(), s);
         }
+        for s in ["mode1", "mode2", "bitmap", "static_bits(31250)"] {
+            assert_eq!(PredicateMode::parse(s).unwrap().to_string(), s);
+        }
+        assert!(PredicateMode::parse("static_bits").is_err());
         assert!(Scorer::parse("bonus").is_err());
         assert!(Scorer::parse("bonus(x)").is_err());
         assert!(Terminator::parse("adaptive_l(5)").is_err());
@@ -1021,6 +1034,15 @@ mod tests {
         ]));
         assert!(bad(&[("terminator", "adaptive_l(5, 2)")]));
         assert!(bad(&[("beam_width", "0")]));
+        assert!(bad(&[("predicate", "static_bits(0)")]));
+        assert!(bad(&[
+            ("predicate", "static_bits(100)"),
+            ("materializer", "dense")
+        ]));
+        assert!(!bad(&[
+            ("predicate", "static_bits(100)"),
+            ("scorer", "multiplicative(1.2)")
+        ]));
         assert!(bad(&[("scorer", "bonus(0)")]));
         assert!(!bad(&[
             ("predicate", "bitmap"),

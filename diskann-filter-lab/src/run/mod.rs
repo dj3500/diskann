@@ -50,8 +50,9 @@ use self::{
     spec::{ConfigSpec, Experiment, Mode},
 };
 use crate::{
+    bitsets::LabelBitsets,
     kernel::{
-        config::StartSource,
+        config::{PredicateMode, StartSource},
         entry::SampleIndex,
         search::{Counters, FastPath, Index, Plan, Query, Searcher},
         trace::Trace,
@@ -342,6 +343,40 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         (None, None) => (0.0, "not needed".to_owned()),
     };
 
+    // Static per-label bitsets (untimed T1 sidecar): loaded, or built at the smallest θ of the
+    // `static_bits(θ)` configurations.
+    let theta_min = exp
+        .configs
+        .iter()
+        .filter_map(|c| match c.kernel.predicate {
+            PredicateMode::StaticBits(t) => Some(t),
+            _ => None,
+        })
+        .min();
+    let (bitsets, bitsets_json) = match (theta_min, &exp.bitsets_sidecar) {
+        (None, _) => (None, Value::Null),
+        (Some(_), Some(path)) => {
+            let t = Instant::now();
+            let b = LabelBitsets::read(path)?;
+            b.check(&ds.labels)
+                .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
+            let doc = json!({
+                "source": path, "theta": b.theta(), "n_bitsets": b.n_bitsets(),
+                "bytes": b.bytes(), "load_s": t.elapsed().as_secs_f64(),
+            });
+            (Some(b), doc)
+        }
+        (Some(theta), None) => {
+            let t = Instant::now();
+            let b = LabelBitsets::build(&ds.labels, theta);
+            let doc = json!({
+                "source": "built in memory", "theta": b.theta(), "n_bitsets": b.n_bitsets(),
+                "bytes": b.bytes(), "build_s": t.elapsed().as_secs_f64(),
+            });
+            (Some(b), doc)
+        }
+    };
+
     // Indices, plans and per-row queries.
     let mut indices = Vec::new();
     let mut plans = Vec::new();
@@ -373,6 +408,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             label_view,
             view_postings,
             eps_min: eps,
+            bitsets: bitsets.as_ref(),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
         if !exp.fast_paths {
@@ -482,6 +518,8 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "panel": rows.source.as_ref().map(|s| &s.1), "split": exp.split,
                 "qsets": exp.qsets, "limit": exp.limit, "queries": exp.queries,
                 "mode": exp.mode.name(), "reps": exp.reps, "seed": exp.seed,
+                "bitsets": matches!(c.kernel.predicate, PredicateMode::StaticBits(_))
+                    .then(|| bitsets_json["source"].clone()),
             });
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));
             let safe: String = c
@@ -557,6 +595,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "per_label_starts": g.starts.as_ref().map(|s| s.n_label_entries()),
                 "sample": g.sample.as_ref().map(SampleIndex::len),
                 "sample_index_bytes": g.sample.as_ref().map(SampleIndex::bytes),
+                "bitsets": bitsets_json,
             });
             let protocol = json!({
                 "reps": if exp.mode == Mode::Timed { exp.reps } else { 1 },

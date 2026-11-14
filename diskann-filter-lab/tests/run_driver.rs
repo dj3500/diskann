@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use diskann_filter_lab::{
+    bitsets::LabelBitsets,
     graph::{AuxNodes, Graph},
     labels::{LabelStore, LabelStoreBuilder},
     predicate::{PredicateSet, PredicateSetBuilder},
@@ -359,6 +360,66 @@ preset = "postfilter"
         1 + 3
     );
     assert_eq!(read_res(&dirs[0].join("res_10.bin")).0, 3);
+
+    // Static per-label bitsets, built in memory or loaded from a sidecar: mode 1's answers.
+    let sidecar = d.dir.join("bitsets.flab");
+    LabelBitsets::build(&d.labels, 40).write(&sidecar).unwrap();
+    for (i, extra) in [
+        String::new(),
+        format!("bitsets_sidecar = \"{}\"", sidecar.display()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let p = d.dir.join("static.toml");
+        let text = format!(
+            r#"
+[experiment]
+name = "driver-static-{i}"
+dataset = "{ds}"
+graph = "{ds}/graph"
+queries = "qa"
+k = 5
+efforts = [10]
+mode = "trace"
+runs_dir = "{ds}/runs"
+ledger = "{ds}/ledger.jsonl"
+{extra}
+
+[[config]]
+name = "mode1"
+preset = "upstream-beta(0.5)"
+collector = "heap"
+
+[[config]]
+name = "static60"
+preset = "upstream-beta(0.5)"
+collector = "heap"
+predicate = "static_bits(60)"
+
+[[config]]
+name = "static1000"
+preset = "upstream-beta(0.5)"
+collector = "heap"
+predicate = "static_bits(1000)"
+"#,
+            ds = d.dir.display()
+        );
+        std::fs::write(&p, text).unwrap();
+        let dirs = run::run(&p, &opts).unwrap();
+        let res: Vec<_> = dirs
+            .iter()
+            .map(|dir| read_res(&dir.join("res_10.bin")))
+            .collect();
+        assert_eq!(res[0], res[1]);
+        assert_eq!(res[0], res[2]);
+        let run: Value =
+            serde_json::from_str(&std::fs::read_to_string(dirs[1].join("run.json")).unwrap())
+                .unwrap();
+        let bits = &run["index"]["bitsets"];
+        assert_eq!(bits["theta"], if extra.is_empty() { 60 } else { 40 });
+        assert!(bits["n_bitsets"].as_u64().unwrap() >= 3, "{bits}");
+    }
 
     let ledger = std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap();
     let lines: Vec<Value> = ledger

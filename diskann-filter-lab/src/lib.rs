@@ -11,12 +11,14 @@
 //! converters from text formats, and exact filtered ground truth with complete distance-tie
 //! bands. File formats and the `flab` command-line tool are described in `README.md`.
 
+pub mod bitsets;
 pub mod container;
 pub mod diskann_io;
 pub mod graph;
 pub mod gt;
 pub mod jsonl;
 pub mod kernel;
+pub mod label_starts;
 pub mod labels;
 pub mod parallel;
 pub mod predicate;

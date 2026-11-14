@@ -13,10 +13,11 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use diskann_filter_lab::{
+    bitsets::{self, LabelBitsets},
     container, diskann_io,
     graph::{self, Graph, GraphStats},
     gt::{self, DiskannTruth, GroundTruth},
-    jsonl, labels,
+    jsonl, label_starts, labels,
     labels::LabelStore,
     predicate::{self, PredicateSet, PredicateSetBuilder},
     run,
@@ -51,6 +52,12 @@ enum Command {
     ImportGraph(ImportGraphArgs),
     /// Build the start-node table (`starts.flab`) of a graph from C++ build outputs.
     ImportStarts(ImportStartsArgs),
+    /// Start-node tables computed from the data.
+    #[command(subcommand)]
+    Starts(StartsCommand),
+    /// Static per-label bitsets (`bitsets.flab`, for the `static_bits(θ)` predicate mode).
+    #[command(subcommand)]
+    Bitsets(BitsetsCommand),
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
     /// kernel and write run directories (see `run` in the crate documentation).
     Run(RunArgs),
@@ -239,6 +246,73 @@ struct ImportStartsArgs {
     report: Option<PathBuf>,
 }
 
+#[derive(Subcommand)]
+enum StartsCommand {
+    /// Per-label starts of every label of a label store, for a graph over the same points:
+    /// writes `starts-<tag>.flab` (with the graph's global starts) and a JSON report per
+    /// strategy.
+    Build(StartsBuildArgs),
+}
+
+#[derive(Args)]
+struct StartsBuildArgs {
+    /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
+    #[arg(long)]
+    dataset: PathBuf,
+    /// Label store of the per-label table (default: `<dataset>/labels.flab`).
+    #[arg(long)]
+    labels: Option<PathBuf>,
+    /// The graph: a directory with `graph.flab`, a `graph.flab`, or a DiskANN index prefix
+    /// (vectors in `<prefix>.data`). Its starts become the global starts.
+    #[arg(long)]
+    graph: PathBuf,
+    /// Strategies, comma-separated or repeated: `medoid` (the member closest to the label's
+    /// centroid), `random(k)` (k seeded random members; `random` = 1), `kmeans(k)` (up to k
+    /// k-means representatives; `kmeans` = 4).
+    #[arg(long = "strategy", value_delimiter = ',', required = true)]
+    strategies: Vec<String>,
+    /// Labels with at most this many points use all of them (medoid, kmeans).
+    #[arg(long, default_value_t = 10_000)]
+    exact_max: usize,
+    /// Members sampled (seeded) from larger labels.
+    #[arg(long, default_value_t = 10_000)]
+    sample: usize,
+    /// Lloyd iterations of kmeans.
+    #[arg(long, default_value_t = 10)]
+    iters: usize,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    #[arg(short, long, default_value_t = 4)]
+    threads: usize,
+    /// Output directory (created if needed).
+    #[arg(long)]
+    out_dir: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum BitsetsCommand {
+    /// Build the bitsets of every label with at least θ points.
+    Build {
+        /// The label store.
+        #[arg(long)]
+        labels: PathBuf,
+        /// Threshold θ (points per label).
+        #[arg(long)]
+        theta: u64,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Memory of the bitsets for a list of thresholds (without building them).
+    Stats {
+        #[arg(long)]
+        labels: PathBuf,
+        /// Thresholds θ (points per label), comma-separated; default: n/1000, n/100, n/32,
+        /// n/10.
+        #[arg(long, value_delimiter = ',')]
+        theta: Vec<u64>,
+    },
+}
+
 #[derive(Args)]
 struct RunArgs {
     /// The experiment file (TOML).
@@ -286,6 +360,13 @@ fn main() -> Result<()> {
         Command::GtCompare(args) => run_compare(&args),
         Command::ImportGraph(args) => import_graph(&args),
         Command::ImportStarts(args) => import_starts(&args),
+        Command::Starts(StartsCommand::Build(args)) => {
+            match DType::from_path(&run::data::base_file(&args.dataset)?)? {
+                DType::U8 => build_starts::<u8>(&args),
+                DType::F32 => build_starts::<f32>(&args),
+            }
+        }
+        Command::Bitsets(c) => bitsets_command(c),
         Command::Info { path, dtype: d } => info(&path, d),
     }
 }
@@ -749,6 +830,191 @@ fn import_starts(a: &ImportStartsArgs) -> Result<()> {
     write_report(a.report.as_deref(), &report)
 }
 
+fn build_starts<T: Element>(a: &StartsBuildArgs) -> Result<()> {
+    let strategies = a
+        .strategies
+        .iter()
+        .map(|s| label_starts::Strategy::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+    let start = Instant::now();
+    let base_path = run::data::base_file(&a.dataset)?;
+    let labels_path = a
+        .labels
+        .clone()
+        .unwrap_or_else(|| a.dataset.join("labels.flab"));
+    let base = Matrix::<T>::read_bin(&base_path)?;
+    let store = LabelStore::read(&labels_path)?;
+    let g = run::data::load_graph(&a.graph, None, T::DTYPE)?;
+    ensure!(
+        g.graph.n_data() == base.nrows() && store.n_points() == base.nrows(),
+        "the graph has {} data points, the base {}, the labels {}",
+        g.graph.n_data(),
+        base.nrows(),
+        store.n_points()
+    );
+    let load_s = secs(start);
+    eprintln!(
+        "loaded {} ({} × {} {}), {} labels, graph {} ({} nodes, global starts {:?}) in {load_s:.1} s",
+        base_path.display(),
+        base.nrows(),
+        base.ncols(),
+        T::NAME,
+        store.n_labels(),
+        a.graph.display(),
+        g.graph.n_nodes(),
+        g.graph.starts()
+    );
+    std::fs::create_dir_all(&a.out_dir)
+        .with_context(|| format!("creating {}", a.out_dir.display()))?;
+    let params = label_starts::Params {
+        exact_max: a.exact_max,
+        sample: a.sample,
+        iters: a.iters,
+        seed: a.seed,
+        threads: a.threads,
+    };
+    for strategy in strategies {
+        let t = Instant::now();
+        let cpu0 = run::sys::process_cpu_s();
+        let built = label_starts::build(&base, &store, strategy, &params)?;
+        let wall = secs(t);
+        let cpu = match (cpu0, run::sys::process_cpu_s()) {
+            (Some(a), Some(b)) => Some(b - a),
+            _ => None,
+        };
+        let mut s = Starts::new(&g.graph);
+        s.set_label_starts(&store, &built.pairs())?;
+        let out = a.out_dir.join(format!("starts-{}.flab", strategy.tag()));
+        s.write(&out)?;
+        ensure!(
+            Starts::read(&out)? == s,
+            "{} does not read back identically",
+            out.display()
+        );
+        let mismatches = s.label_mismatches(&store)?;
+        ensure!(mismatches == 0, "{mismatches} starts lack their label");
+        let mut nodes: Vec<u32> = built.starts.iter().flatten().copied().collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        let with_start = built.starts.iter().filter(|v| !v.is_empty()).count();
+        eprintln!(
+            "{strategy}: {} entries for {with_start} of {} labels ({} distinct nodes, {} labels sampled), {:.1} s wall{} -> {}",
+            s.n_label_entries(),
+            store.n_labels(),
+            nodes.len(),
+            built.sampled,
+            wall,
+            cpu.map_or(String::new(), |c| format!(", {c:.1} s CPU on {} threads", a.threads)),
+            out.display()
+        );
+        let report = json!({
+            "tool": "flab starts build",
+            "flab_version": env!("CARGO_PKG_VERSION"),
+            "strategy": strategy.to_string(),
+            "params": {
+                "exact_max": a.exact_max,
+                "sample": a.sample,
+                "iters": a.iters,
+                "seed": a.seed,
+                "threads": a.threads,
+            },
+            "inputs": {
+                "dataset": a.dataset,
+                "base": file_info(&base_path)?,
+                "labels": file_info(&labels_path)?,
+                "graph": a.graph,
+            },
+            "dict_hash": format!("{:016x}", store.dict_hash()),
+            "graph": {
+                "n_data": g.graph.n_data(),
+                "n_nodes": g.graph.n_nodes(),
+                "global": s.global(),
+            },
+            "counts": {
+                "labels": store.n_labels(),
+                "labels_with_start": with_start,
+                "entries": s.n_label_entries(),
+                "distinct_nodes": nodes.len(),
+                "labels_sampled": built.sampled,
+                "distance_computations": built.n_dist,
+                "starts_without_their_label": mismatches,
+            },
+            "cost": {
+                "load_s": load_s,
+                "build_wall_s": wall,
+                "build_cpu_s": cpu,
+                "threads": a.threads,
+                "peak_rss_bytes": run::sys::peak_rss_bytes(),
+            },
+            "output": file_info(&out)?,
+        });
+        write_report(
+            Some(&a.out_dir.join(format!("starts-{}.json", strategy.tag()))),
+            &report,
+        )?;
+    }
+    Ok(())
+}
+
+fn bitsets_command(c: BitsetsCommand) -> Result<()> {
+    match c {
+        BitsetsCommand::Build {
+            labels,
+            theta,
+            output,
+        } => {
+            let store = LabelStore::read(&labels)?;
+            let t = Instant::now();
+            let b = LabelBitsets::build(&store, theta);
+            let build_s = secs(t);
+            b.write(&output)?;
+            ensure!(
+                LabelBitsets::read(&output)? == b,
+                "{} does not read back identically",
+                output.display()
+            );
+            println!(
+                "θ {}: {} of {} labels with a bitset, {:.1} MiB; built in {build_s:.2} s -> {}",
+                b.theta(),
+                b.n_bitsets(),
+                store.n_labels(),
+                b.bytes() as f64 / (1u64 << 20) as f64,
+                output.display()
+            );
+        }
+        BitsetsCommand::Stats { labels, theta } => {
+            let store = LabelStore::read(&labels)?;
+            let n = store.n_points() as u64;
+            let thetas = if theta.is_empty() {
+                vec![n / 1000, n / 100, n / 32, n / 10]
+            } else {
+                theta
+            };
+            let postings = 4 * store.n_entries() as u64;
+            println!(
+                "{} points, {} labels, {} entries (postings {:.1} MiB)",
+                n,
+                store.n_labels(),
+                store.n_entries(),
+                postings as f64 / (1u64 << 20) as f64
+            );
+            println!(
+                "{:>10} {:>10} {:>12} {:>16}",
+                "theta", "bitsets", "MiB", "entries covered"
+            );
+            for t in thetas {
+                let (k, bytes, covered) = bitsets::footprint(&store, t);
+                println!(
+                    "{t:>10} {k:>10} {:>12.1} {:>15.1}%",
+                    bytes as f64 / (1u64 << 20) as f64,
+                    100.0 * covered as f64 / store.n_entries().max(1) as f64
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn info(path: &Path, d: Option<DTypeArg>) -> Result<()> {
     let magic = container::peek_magic(path)?;
     if &magic == labels::MAGIC {
@@ -762,6 +1028,16 @@ fn info(path: &Path, d: Option<DTypeArg>) -> Result<()> {
         print_graph(&g, &g.stats());
     } else if &magic == starts::MAGIC {
         print_starts(&Starts::read(path)?);
+    } else if &magic == bitsets::MAGIC {
+        let b = LabelBitsets::read(path)?;
+        println!(
+            "static bitsets of {} points: θ {}, {} labels with a bitset, {:.1} MiB, dictionary hash {:016x}",
+            b.n_points(),
+            b.theta(),
+            b.n_bitsets(),
+            b.bytes() as f64 / (1u64 << 20) as f64,
+            b.dict_hash()
+        );
     } else {
         match dtype(d, path)? {
             DType::U8 => print_vectors(&Matrix::<u8>::read_bin(path)?),

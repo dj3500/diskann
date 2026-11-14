@@ -117,6 +117,11 @@ fn vector_file(dir: &Path, stem: &str) -> Result<(PathBuf, DType)> {
     bail!("no {stem}.u8bin or {stem}.fbin in {}", dir.display())
 }
 
+/// The base vectors of a dataset directory (`base.u8bin` or `base.fbin`).
+pub fn base_file(dir: &Path) -> Result<PathBuf> {
+    Ok(vector_file(dir, "base")?.0)
+}
+
 /// Reads the dictionary fingerprint, label count and posting offsets of a `labels.flab`
 /// without its rows and postings.
 pub fn read_view_postings(path: &Path) -> Result<(u64, usize, Vec<u64>)> {

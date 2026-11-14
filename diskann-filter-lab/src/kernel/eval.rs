@@ -18,13 +18,22 @@
 //!   sorted labels in the point's sorted row with a progressive lower bound; the Boolean form
 //!   stops at the first failing clause;
 //! - [`DenseBitmap`] / [`SparseList`] (`bitmap`): a lookup in a materialized match set; they
-//!   give the match bit only (no failed-clause count).
+//!   give the match bit only (no failed-clause count);
+//! - [`StaticBits`] (`static_bits(θ)`): labels with at least `θ` points are tested in static
+//!   per-label bitsets ([`crate::bitsets::LabelBitsets`], O(1) per label, most frequent label
+//!   of a clause first); the clauses that no bitset satisfies and that have rarer labels are
+//!   then checked on the row (one mode-1 scan, or galloping searches for long rows). A clause
+//!   made only of bitset labels never reads the row.
 //!
 //! The *complete* form returns the failed-clause count `g` (no early exit at a failing
 //! clause). Under a clause projection, navigation evaluates only the projected clauses; the
 //! full predicate (answer eligibility) is [`Eval::full`].
 
-use crate::{labels::LabelStore, predicate::Cnf};
+use crate::{
+    bitsets::{self, LabelBitsets},
+    labels::LabelStore,
+    predicate::Cnf,
+};
 
 /// Clause weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,6 +69,16 @@ pub struct Compiled {
     nav_weight: f32,
     max_nav_weight: f32,
     scratch: Vec<(u64, u32)>,
+    /// Static-bitset split per ordered clause (CSR): bitset slots of the clause's labels with
+    /// a bitset (most points first) and its other labels.
+    big_offsets: Vec<u32>,
+    big: Vec<u32>,
+    small_offsets: Vec<u32>,
+    small: Vec<u32>,
+    /// Ordered clauses with at least one label without a bitset.
+    small_mask: u64,
+    /// The first bitset slot of the first navigation clause (`u32::MAX` if none; prefetched).
+    static_first: u32,
 }
 
 impl Compiled {
@@ -90,6 +109,12 @@ impl Compiled {
         self.w.clear();
         self.nav.clear();
         self.scratch.clear();
+        self.big_offsets.clear();
+        self.big.clear();
+        self.small_offsets.clear();
+        self.small.clear();
+        self.small_mask = 0;
+        self.static_first = u32::MAX;
         for (i, clause) in cnf.clauses().enumerate() {
             if clause.is_empty() {
                 self.empty = true;
@@ -159,6 +184,60 @@ impl Compiled {
                 }
             }
         }
+    }
+
+    /// Splits every clause for the [`StaticBits`] evaluator: labels with at least `theta`
+    /// points that have a bitset in `sb` (ordered by decreasing posting length, so the label
+    /// most likely to hit is tested first), and the others (checked on the row). Called after
+    /// [`Self::compile`] (part of the per-query compilation); a no-op for queries with an empty
+    /// clause.
+    pub fn split_static(&mut self, labels: &LabelStore, sb: &LabelBitsets, theta: u64) {
+        self.big_offsets.clear();
+        self.big.clear();
+        self.small_offsets.clear();
+        self.small.clear();
+        self.small_mask = 0;
+        self.static_first = u32::MAX;
+        if self.empty {
+            return;
+        }
+        self.big_offsets.push(0);
+        self.small_offsets.push(0);
+        for j in 0..self.n_clauses {
+            let (a, b) = (self.offsets[j] as usize, self.offsets[j + 1] as usize);
+            let start = self.big.len();
+            for &l in &self.labels[a..b] {
+                match sb.slot(l) {
+                    Some(slot) if labels.posting_len(l) as u64 >= theta => self.big.push(slot),
+                    _ => self.small.push(l),
+                }
+            }
+            self.big[start..].sort_unstable_by_key(|&slot| {
+                (std::cmp::Reverse(labels.posting_len(sb.label(slot))), slot)
+            });
+            if self.small.len() > *self.small_offsets.last().unwrap_or(&0) as usize && j < 64 {
+                self.small_mask |= 1u64 << j;
+            }
+            self.big_offsets.push(self.big.len() as u32);
+            self.small_offsets.push(self.small.len() as u32);
+        }
+        if let Some(&j) = self.nav.first() {
+            if let Some(&slot) = self.static_slots(j as usize).first() {
+                self.static_first = slot;
+            }
+        }
+    }
+
+    /// Bitset slots of the clause at position `j` (after [`Self::split_static`]).
+    #[inline(always)]
+    pub fn static_slots(&self, j: usize) -> &[u32] {
+        &self.big[self.big_offsets[j] as usize..self.big_offsets[j + 1] as usize]
+    }
+
+    /// Labels of the clause at position `j` without a bitset (after [`Self::split_static`]).
+    #[inline(always)]
+    pub fn row_labels(&self, j: usize) -> &[u32] {
+        &self.small[self.small_offsets[j] as usize..self.small_offsets[j + 1] as usize]
     }
 
     /// Resets the clause bits set by [`Self::compile`].
@@ -273,6 +352,8 @@ pub struct EvalCtx<'a> {
     pub(crate) dense: &'a [u64],
     /// Materialized sorted match list.
     pub(crate) sparse: &'a [u32],
+    /// Static per-label bitsets (the query must be split against them).
+    pub(crate) stat: &'a LabelBitsets,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -299,7 +380,15 @@ impl<'a> EvalCtx<'a> {
             bits,
             dense,
             sparse,
+            stat: &bitsets::EMPTY,
         }
+    }
+
+    /// The context with static per-label bitsets (for [`StaticBits`]; the query must have
+    /// been split against them with [`Compiled::split_static`]).
+    #[inline]
+    pub fn with_static(self, stat: &'a LabelBitsets) -> Self {
+        Self { stat, ..self }
     }
 
     /// The compiled query.
@@ -339,6 +428,10 @@ pub struct DenseBitmap;
 /// Binary search in a materialized sorted match list.
 #[derive(Debug, Clone, Copy)]
 pub struct SparseList;
+
+/// Static per-label bitsets for frequent labels, the row for the others.
+#[derive(Debug, Clone, Copy)]
+pub struct StaticBits;
 
 #[inline(always)]
 fn from_failed(q: &Compiled, failed: u64, complete: bool) -> PredOut {
@@ -506,6 +599,101 @@ impl Eval for SparseList {
 
     #[inline(always)]
     fn prefetch_offsets(_cx: &EvalCtx<'_>, _v: u32) {}
+}
+
+/// Failed clauses among `mask` (ordered positions) under [`StaticBits`]: bitset lookups clause
+/// by clause in Boolean order, then one row pass for the unsatisfied clauses with labels
+/// without a bitset. With `early`, returns as soon as a clause is known to fail (the result
+/// is then nonzero but may omit other failed clauses).
+#[inline(always)]
+fn static_failed(cx: &EvalCtx<'_>, v: u32, mask: u64, early: bool) -> u64 {
+    let q = cx.q;
+    let sb = cx.stat;
+    let (w, b) = ((v >> 6) as usize, v & 63);
+    let mut sat = 0u64;
+    let mut m = mask;
+    while m != 0 {
+        let j = m.trailing_zeros() as usize;
+        m &= m - 1;
+        let bit = 1u64 << j;
+        for &s in q.static_slots(j) {
+            if (sb.word(s, w) >> b) & 1 != 0 {
+                sat |= bit;
+                break;
+            }
+        }
+        if early && sat & bit == 0 && q.small_mask & bit == 0 {
+            return bit;
+        }
+    }
+    let remaining = mask & !sat;
+    let need_row = remaining & q.small_mask;
+    let mut failed = remaining & !q.small_mask;
+    if need_row != 0 {
+        let row = cx.labels.row(v);
+        if row.len() > 4 * q.small.len() {
+            let mut r = need_row;
+            while r != 0 {
+                let j = r.trailing_zeros() as usize;
+                r &= r - 1;
+                if !gallop_intersects(row, q.row_labels(j)) {
+                    failed |= 1u64 << j;
+                    if early {
+                        return failed;
+                    }
+                }
+            }
+        } else {
+            // The clause-bit table covers every query label; the bitset labels of the
+            // clauses in `need_row` are absent from the row (their lookups failed).
+            failed |= scan(cx, row, need_row);
+        }
+    }
+    failed
+}
+
+impl Eval for StaticBits {
+    const NAME: &'static str = "static_bits";
+    const ROWS: bool = true;
+
+    #[inline(always)]
+    fn eval(cx: &EvalCtx<'_>, v: u32, complete: bool) -> PredOut {
+        let q = cx.q;
+        if !q.use_bits {
+            return ClauseSearch::eval(cx, v, complete);
+        }
+        from_failed(q, static_failed(cx, v, q.nav_mask, !complete), complete)
+    }
+
+    #[inline(always)]
+    fn full(cx: &EvalCtx<'_>, v: u32) -> bool {
+        let q = cx.q;
+        if !q.use_bits {
+            return ClauseSearch::full(cx, v);
+        }
+        static_failed(cx, v, q.full_mask, true) == 0
+    }
+
+    /// The row (when the query has labels without a bitset).
+    #[inline(always)]
+    fn prefetch(cx: &EvalCtx<'_>, v: u32) {
+        if !cx.q.small.is_empty() {
+            RowScan::prefetch(cx, v);
+        }
+    }
+
+    /// The row offsets (when the query has labels without a bitset) and the bitset word of
+    /// the first navigation clause's most frequent label.
+    #[inline(always)]
+    fn prefetch_offsets(cx: &EvalCtx<'_>, v: u32) {
+        let q = cx.q;
+        if !q.small.is_empty() {
+            RowScan::prefetch_offsets(cx, v);
+        }
+        if q.static_first != u32::MAX {
+            super::prefetch(cx.stat.word_ptr(q.static_first, (v >> 6) as usize));
+        }
+    }
 }
 
 /// Whether the sorted lists `row` and `clause` share an element: each clause label is searched
@@ -705,6 +893,87 @@ mod tests {
     }
 
     #[test]
+    fn static_bits_agree_with_the_row_modes() {
+        // 300 points over categories a (40 values, Zipf-like) and b (5 values); every 25th
+        // point carries 30 a-labels (a long row: the galloping path).
+        let mut state = 99u64;
+        let mut next = |n: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as u32) % n
+        };
+        let mut b = LabelStoreBuilder::new();
+        for i in 0..300 {
+            let mut row: Vec<String> = Vec::new();
+            let na = if i % 25 == 0 { 30 } else { 1 + next(3) };
+            for _ in 0..na {
+                let r = next(40);
+                row.push(format!("a={}", r * r / 40));
+            }
+            if next(4) != 0 {
+                row.push(format!("b={}", next(5)));
+            }
+            b.push_point(row.iter().map(|l| (&l[..1], l.as_str())))
+                .unwrap();
+        }
+        let s = b.finish().unwrap();
+        let mut pb = PredicateSetBuilder::new(&s);
+        for _ in 0..60 {
+            let nc = 1 + next(4);
+            let clauses: Vec<Vec<String>> = (0..nc)
+                .map(|c| {
+                    let width = 1 + next(5);
+                    (0..width)
+                        .map(|_| {
+                            if c % 2 == 0 {
+                                format!("a={}", next(40))
+                            } else {
+                                format!("b={}", next(5))
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            pb.push(&clauses);
+        }
+        let preds = pb.finish();
+        let all = LabelBitsets::build(&s, 1);
+        let mut bits = vec![0u64; s.n_labels()];
+        let mut q = Compiled::new();
+        let mut row_reads_avoided = 0;
+        for theta in [1, 5, 20, 60, 1000] {
+            let sb = LabelBitsets::build(&s, theta);
+            for (bitsets, t) in [(&sb, theta), (&all, theta)] {
+                for i in 0..preds.len() {
+                    q.compile(&s, preds.get(i), Weights::Surprisal, None, &mut bits);
+                    if q.is_empty() {
+                        q.clear_bits(&mut bits);
+                        continue;
+                    }
+                    q.split_static(&s, bitsets, t);
+                    if (0..q.n_clauses()).all(|j| q.row_labels(j).is_empty()) {
+                        row_reads_avoided += 1;
+                    }
+                    let cx = EvalCtx::new(&s, &q, &bits, &[], &[]).with_static(bitsets);
+                    for v in 0..300 {
+                        let want = RowScan::eval(&cx, v, true);
+                        assert_eq!(StaticBits::eval(&cx, v, true), want, "θ {t} q {i} v {v}");
+                        assert_eq!(StaticBits::eval(&cx, v, false).m, want.m);
+                        assert_eq!(StaticBits::full(&cx, v), want.m);
+                        assert_eq!(ClauseSearch::full(&cx, v), want.m);
+                    }
+                    q.clear_bits(&mut bits);
+                }
+            }
+        }
+        assert!(
+            row_reads_avoided > 0,
+            "some queries are decided by bitsets alone"
+        );
+    }
+
+    #[test]
     fn more_than_64_clauses_use_mode_2() {
         let mut b = LabelStoreBuilder::new();
         let names: Vec<String> = (0..70).map(|i| format!("c{i}=x")).collect();
@@ -734,5 +1003,10 @@ mod tests {
         let p = all_modes(&cx, 1, true);
         assert_eq!((p.m, p.unit), (false, 1));
         assert!(!RowScan::full(&cx, 1));
+        let sb = LabelBitsets::build(&s, 1);
+        q.split_static(&s, &sb, 1);
+        let cx = EvalCtx::new(&s, &q, &bits, &[], &[]).with_static(&sb);
+        assert_eq!(StaticBits::eval(&cx, 1, true), p);
+        assert!(StaticBits::full(&cx, 0) && !StaticBits::full(&cx, 1));
     }
 }

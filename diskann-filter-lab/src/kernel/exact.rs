@@ -7,17 +7,18 @@
 //! smallest clause upper bound is at most `T_exact`.
 //!
 //! - `scan_smallest_clause`: merge the postings of the clause with the smallest `U_c`
-//!   (distinct points in increasing id order), check the other clauses on each candidate's
-//!   label row (Boolean), compute distances for the survivors (prefetching their vectors) and
+//!   (distinct points in increasing id order), check the other clauses on each candidate
+//!   (Boolean, with the run's predicate evaluator: mode 1 or mode 2 on the label row, or the
+//!   static bitsets), compute distances for the survivors (prefetching their vectors) and
 //!   keep the exact top-K by (distance, id);
 //! - `intersect_then_scan`: galloping intersection of the clauses' posting unions first
 //!   ([`super::materialize::Materialized::build_sparse`]), then distances.
 
 use super::{
     collect::{Answers, Collector},
-    eval::{ClauseSearch, Eval, EvalCtx, RowScan},
+    eval::{ClauseSearch, Eval, EvalCtx, RowScan, StaticBits},
     materialize::{merge_distinct, Materialized},
-    search::Counters,
+    search::{Counters, EvalMode},
 };
 use crate::{graph::NodeVectors, vectors::Element};
 
@@ -63,13 +64,15 @@ fn flush<T: Element>(
 }
 
 /// Runs an exact path; the answers are left in `answers` (a `heap(K)` collector).
+/// `scan_smallest_clause` checks candidates with the evaluator of `eval` (mode 2 or the
+/// static bitsets; mode 1 otherwise, as no match set is materialized for exact queries).
 #[expect(
     clippy::too_many_arguments,
     reason = "the exact path reads every per-query input"
 )]
-pub(crate) fn run<T: Element>(
+pub fn run<T: Element>(
     path: ExactPath,
-    mode2: bool,
+    eval: EvalMode,
     cx: &EvalCtx<'_>,
     vectors: &NodeVectors<'_, T>,
     n_data: usize,
@@ -80,43 +83,17 @@ pub(crate) fn run<T: Element>(
     ctr: &mut Counters,
 ) {
     answers.reset(Collector::Heap, k, k);
-    let mut batch = [0u32; BATCH];
-    let mut n = 0;
     match path {
         ExactPath::None => {}
-        ExactPath::ScanSmallestClause(_) => {
-            let q = cx.q;
-            let c0 = q.clause(0);
-            let labels = cx.labels;
-            let others = q.n_clauses() > 1;
-            let (heap, pos) = mat.merge_scratch();
-            merge_distinct(
-                c0.len(),
-                |i| labels.postings(c0[i]),
-                heap,
-                pos,
-                |p| {
-                    ctr.n_exact_cand += 1;
-                    let ok = !others || {
-                        ctr.n_pred += 1;
-                        if mode2 {
-                            ClauseSearch::full(cx, p)
-                        } else {
-                            RowScan::full(cx, p)
-                        }
-                    };
-                    if ok {
-                        batch[n] = p;
-                        n += 1;
-                        if n == BATCH {
-                            flush(&batch, vectors, query, answers, ctr);
-                            n = 0;
-                        }
-                    }
-                    true
-                },
-            );
-        }
+        ExactPath::ScanSmallestClause(_) => match eval {
+            EvalMode::ClauseSearch => {
+                scan::<T, ClauseSearch>(cx, vectors, query, mat, answers, ctr)
+            }
+            EvalMode::StaticBits => scan::<T, StaticBits>(cx, vectors, query, mat, answers, ctr),
+            EvalMode::RowScan | EvalMode::Dense | EvalMode::Sparse => {
+                scan::<T, RowScan>(cx, vectors, query, mat, answers, ctr);
+            }
+        },
         ExactPath::IntersectThenScan(_) => {
             ctr.n_exact_cand += mat.build_sparse(cx.labels, cx.q, n_data);
             for chunk in mat.sparse.chunks(BATCH) {
@@ -124,5 +101,45 @@ pub(crate) fn run<T: Element>(
             }
         }
     }
+}
+
+/// `scan_smallest_clause` with the evaluator `P`.
+fn scan<T: Element, P: Eval>(
+    cx: &EvalCtx<'_>,
+    vectors: &NodeVectors<'_, T>,
+    query: &[T],
+    mat: &mut Materialized,
+    answers: &mut Answers,
+    ctr: &mut Counters,
+) {
+    let mut batch = [0u32; BATCH];
+    let mut n = 0;
+    let q = cx.q;
+    let c0 = q.clause(0);
+    let labels = cx.labels;
+    let others = q.n_clauses() > 1;
+    let (heap, pos) = mat.merge_scratch();
+    merge_distinct(
+        c0.len(),
+        |i| labels.postings(c0[i]),
+        heap,
+        pos,
+        |p| {
+            ctr.n_exact_cand += 1;
+            let ok = !others || {
+                ctr.n_pred += 1;
+                P::full(cx, p)
+            };
+            if ok {
+                batch[n] = p;
+                n += 1;
+                if n == BATCH {
+                    flush(&batch, vectors, query, answers, ctr);
+                    n = 0;
+                }
+            }
+            true
+        },
+    );
     flush(&batch[..n], vectors, query, answers, ctr);
 }
