@@ -106,8 +106,11 @@ fn median(v: &mut [f64]) -> f64 {
     v[v.len() / 2]
 }
 
-/// Calibration predicates from the labels of random base points.
-fn predicates(labels: &LabelStore, count: usize, rng: &mut Rng) -> PredicateSet {
+/// Calibration predicates from the labels of random base points: one of the point's labels,
+/// ANDed with a clause of a label of another category of the point (and possibly a second
+/// label of that category). With `within`, a point without another category's label ANDs two
+/// of its labels instead (singleton clauses, as the queries of single-category label sets).
+fn predicates(labels: &LabelStore, count: usize, within: bool, rng: &mut Rng) -> PredicateSet {
     let mut pb = PredicateSetBuilder::new(labels);
     let n = labels.n_points();
     let mut made = 0;
@@ -135,6 +138,12 @@ fn predicates(labels: &LabelStore, count: usize, rng: &mut Rng) -> PredicateSet 
                 c2.push(labels.label_name(extra).to_owned());
             }
             clauses.push(c2);
+        } else if within && row.len() > 1 {
+            let mut second = row[rng.below(row.len() - 1)];
+            if second == first {
+                second = row[row.len() - 1];
+            }
+            clauses.push(vec![labels.label_name(second).to_owned()]);
         }
         pb.push(&clauses);
         made += 1;
@@ -163,7 +172,7 @@ pub fn calibrate<T: Element>(
     let bitsets = (theta > 0).then(|| LabelBitsets::build(labels, theta));
     std::hint::black_box(data::touch(base.as_slice()));
     let mut rng = Rng(opts.seed);
-    let preds = predicates(labels, opts.queries, &mut rng);
+    let preds = predicates(labels, opts.queries, false, &mut rng);
     let mut compiled = Compiled::new();
     let mut bits = vec![0u64; labels.n_labels()];
     let mut mat = Materialized::new(n, true);
@@ -632,7 +641,8 @@ fn member_curves(
     rng: &mut Rng,
     fallback: &[f64],
 ) -> (Vec<f64>, Vec<f64>, Value) {
-    let preds = predicates(labels, 4 * opts.queries, rng);
+    // Residual checks need two clauses: single-category label sets AND two labels.
+    let preds = predicates(labels, 4 * opts.queries, labels.n_categories() == 1, rng);
     let nd = DENSITIES.len();
     let mut samples: [Vec<Vec<f64>>; 2] = [vec![Vec::new(); nd], vec![Vec::new(); nd]];
     let mut points = [vec![0usize; nd], vec![0usize; nd]];

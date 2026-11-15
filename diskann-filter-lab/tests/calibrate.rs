@@ -29,8 +29,8 @@ fn rng(state: &mut u64) -> u32 {
 
 /// 2,000 points; category `g`: g=0 on about 70 % of the points, then Zipf-like values (rare
 /// ones below the bitset threshold ⌈n/64⌉ = 32); category `m`: m=0 on about 60 %, m=1, m=2;
-/// a 10-NN graph with a ring, global start 0.
-fn write_dataset(dir: &Path) {
+/// a 10-NN graph with a ring, global start 0. `single`: the same labels in one category `w`.
+fn write_dataset(dir: &Path, single: bool) {
     std::fs::create_dir_all(dir).unwrap();
     let mut s = 7u64;
     let base = Matrix::<u8>::from_slice(
@@ -55,6 +55,9 @@ fn write_dataset(dir: &Path) {
             _ => 2,
         };
         row.push(format!("m={m}"));
+        if single {
+            row = row.into_iter().map(|l| format!("w{l}")).collect();
+        }
         b.push_point(row.iter().map(|l| (&l[..1], l.as_str())))
             .unwrap();
     }
@@ -88,7 +91,7 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("flab-calibrate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    write_dataset(&dir);
+    write_dataset(&dir, false);
     let opts = calibrate::Options {
         reps: 1,
         queries: 16,
@@ -140,5 +143,36 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
     let costs = run::read_costs(&path).unwrap();
     assert_eq!(costs.pred_row_ns.len(), densities);
     assert_eq!(costs.heap_bound_k, [10.0, 100.0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Single-category label sets have no AND across categories: the member checks are measured
+/// on ANDs of two labels instead of falling back to the random-point curve.
+#[test]
+fn single_category_calibration_measures_member_checks() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flab-calibrate-single-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_dataset(&dir, true);
+    let opts = calibrate::Options {
+        reps: 1,
+        queries: 16,
+        seed: 3,
+        theta: None,
+    };
+    let report = calibrate::calibrate::<u8>(&dir, None, None, &opts).unwrap();
+    let members = &report["details"]["member_checks"];
+    let measured: usize = ["rows", "bits"]
+        .iter()
+        .map(|class| {
+            members[class]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["ns"].is_number())
+                .count()
+        })
+        .sum();
+    assert!(measured > 0, "no member check measured: {members}");
     let _ = std::fs::remove_dir_all(&dir);
 }
