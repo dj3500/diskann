@@ -215,8 +215,8 @@ only): memory-access costs as functions of the candidate density on random point
 mostly misses of the first clause) and on members of the calibration predicates' `union(c0)`
 checked like the exact path's candidates, separately for predicates whose residual clauses
 read rows and bitset-only ones (`pred_row_ns`, `pred_bits_ns`; used for `scan` and `df`);
-merge and bitmap costs; galloping steps through long posting lists by gap (`gallop_gap_ns`:
-cache misses grow with the gap); graph-search costs per distance and per predicate, and the
+merge and bitmap costs; galloping steps by gap, measured with the gallop plan on label pairs
+whose posting lengths have that ratio (`gallop_gap_ns`: cache misses grow with the gap); graph-search costs per distance and per predicate, and the
 predicate evaluations of `heap_bound` and `distance_first` searches (below). It takes a few
 seconds (1M points) to two minutes (40M) per dataset; the costs are loaded with the experiment
 or configuration key `calibration`. Calibrations without the newer terms reproduce the batch-B6

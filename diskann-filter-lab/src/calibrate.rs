@@ -38,7 +38,7 @@ use crate::{
         collect::{Answers, Collector},
         config::{Collector as Coll, Kernel, Laziness},
         cost::UnitCosts,
-        eval::{gallop_lower_bound, Compiled, Eval, EvalCtx, RowScan, StaticBits, Weights},
+        eval::{Compiled, Eval, EvalCtx, RowScan, StaticBits, Weights},
         exact,
         materialize::{merge_distinct, Materialized},
         search::{Counters, Index, Plan, Query, Searcher},
@@ -383,7 +383,7 @@ pub fn calibrate<T: Element>(
     let (pred_row_ns, pred_bits_ns, member_doc) =
         member_curves(labels, bitsets.as_ref(), n, opts, &mut rng2, &pred_ns);
     details.insert("member_checks".into(), member_doc);
-    let (gallop_gap, gallop_gap_ns, gallop_doc) = gallop_curve(labels, &mut rng2);
+    let (gallop_gap, gallop_gap_ns, gallop_doc) = gallop_curve(labels, n, word_ns, &mut rng2);
     details.insert("gallop_by_gap".into(), gallop_doc);
 
     // Graph search.
@@ -749,55 +749,105 @@ const GALLOP_GAPS: [f64; 10] = [
     1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0,
 ];
 
-/// Galloping steps by gap: sorted uniform random ids galloped through a long posting list
-/// (at most 250,000 candidates; a prefix of the list beyond that), one list per measurement
-/// and every list used once (cold, as one query's lists), ns per modelled step
-/// `s·(1 + log2(1 + p/s))`; the median over up to five lists per gap. Gaps without two
-/// measurements are left out. Returns `(gaps, ns, report)`.
-fn gallop_curve(labels: &LabelStore, rng: &mut Rng) -> (Vec<f64>, Vec<f64>, Value) {
-    const LISTS: usize = 5;
-    const MAX_CANDS: usize = 250_000;
-    let mut big: Vec<u32> = (0..labels.n_labels() as u32)
-        .filter(|&l| labels.posting_len(l) >= 1024)
+/// Galloping steps by gap, with the gallop plan's own code
+/// ([`Materialized::build_sparse`]) on two-clause predicates `[ℓ₀] ∧ [ℓ₁]` of label pairs whose
+/// posting lengths have the ratio `p/s ≈ gap` (`s = |ℓ₀|` from 256, or 16, to 250,000): ns per modelled
+/// step `s·(1 + log2(1 + p/s))`, the copy of the candidates (`s` words) removed. Every label is
+/// used once (cold lists, as in one query); the median over up to five pairs per gap, made
+/// non-decreasing in the gap (a longer jump never costs less). Gaps without two measurements
+/// are left out. Returns `(gaps, ns, report)`.
+fn gallop_curve(
+    labels: &LabelStore,
+    n: usize,
+    word_ns: f64,
+    rng: &mut Rng,
+) -> (Vec<f64>, Vec<f64>, Value) {
+    const PAIRS: usize = 5;
+    const MIN_CANDS: f64 = 16.0;
+    const MAX_CANDS: f64 = 250_000.0;
+    let mut by_len: Vec<(usize, u32)> = (0..labels.n_labels() as u32)
+        .map(|l| (labels.posting_len(l), l))
+        .filter(|&(p, _)| p as f64 >= MIN_CANDS)
         .collect();
-    big.sort_unstable_by_key(|&l| (std::cmp::Reverse(labels.posting_len(l)), l));
-    let mut next = 0usize;
+    by_len.sort_unstable();
+    let range = |lo: f64, hi: f64| {
+        (
+            by_len.partition_point(|&(p, _)| (p as f64) < lo),
+            by_len.partition_point(|&(p, _)| (p as f64) <= hi),
+        )
+    };
+    // Pairs per gap (distinct labels throughout): candidate lists of at least 256 points when
+    // possible (less timing noise), else of at least 16; the longer list is drawn among those
+    // that can have a partner at this gap.
+    let smallest = by_len.first().map_or(MIN_CANDS, |&(p, _)| p as f64);
+    let mut used = vec![false; labels.n_labels()];
+    let mut pairs: Vec<(usize, u32, u32)> = Vec::new();
+    for (gi, &g) in GALLOP_GAPS.iter().enumerate() {
+        let mut found = 0;
+        for min_s in [256.0, MIN_CANDS] {
+            let (lo, hi) = range(min_s.max(smallest) * g / 1.5, MAX_CANDS * g);
+            for _ in 0..400 {
+                if found == PAIRS || lo >= hi {
+                    break;
+                }
+                let (p, l1) = by_len[lo + rng.below(hi - lo)];
+                let target = p as f64 / g;
+                let (a, b) = range((target / 1.5).max(min_s), target * 1.5);
+                if a >= b {
+                    continue;
+                }
+                let (_, l0) = by_len[a + rng.below(b - a)];
+                if l0 == l1 || used[l0 as usize] || used[l1 as usize] {
+                    continue;
+                }
+                used[l0 as usize] = true;
+                used[l1 as usize] = true;
+                pairs.push((gi, l0, l1));
+                found += 1;
+            }
+        }
+    }
+    let mut pb = PredicateSetBuilder::new(labels);
+    for &(_, l0, l1) in &pairs {
+        pb.push(&[vec![labels.label_name(l0)], vec![labels.label_name(l1)]]);
+    }
+    let set = pb.finish();
+    let mut compiled = Compiled::new();
+    let mut bits = vec![0u64; labels.n_labels()];
+    let mut mat = Materialized::new(n, false);
+    let mut per_gap: Vec<Vec<f64>> = vec![Vec::new(); GALLOP_GAPS.len()];
+    for (i, &(gi, _, _)) in pairs.iter().enumerate() {
+        compiled.compile(labels, set.get(i), Weights::Unit, None, &mut bits);
+        if compiled.is_empty() || compiled.n_clauses() != 2 {
+            compiled.clear_bits(&mut bits);
+            continue;
+        }
+        // The Boolean order puts the smaller list first: it gives the candidates.
+        let s = labels.posting_len(compiled.clause(0)[0]) as f64;
+        let p = labels.posting_len(compiled.clause(1)[0]) as f64;
+        let t = Instant::now();
+        mat.build_sparse(labels, &compiled, n);
+        let ns = t.elapsed().as_nanos() as f64 - s * word_ns;
+        compiled.clear_bits(&mut bits);
+        let steps = s * (1.0 + (1.0 + p / s).log2());
+        if ns > 0.0 {
+            per_gap[gi].push(ns / steps);
+        }
+    }
     let (mut gaps, mut ns, mut rows) = (Vec::new(), Vec::new(), Vec::new());
-    let mut cands = Vec::new();
-    for &g in &GALLOP_GAPS {
-        let mut v = Vec::new();
-        for &l in big.iter().cycle().skip(next).take(big.len()) {
-            if v.len() == LISTS {
-                break;
-            }
-            let post = labels.postings(l);
-            let s = ((post.len() as f64 / g) as usize).min(MAX_CANDS);
-            if s < 16 {
-                continue;
-            }
-            next += 1;
-            let list = &post[..((s as f64 * g) as usize).clamp(1, post.len())];
-            let (lo, hi) = (list[0] as usize, *list.last().unwrap_or(&0) as usize);
-            cands.clear();
-            cands.extend((0..s).map(|_| (lo + rng.below(hi - lo + 1)) as u32));
-            cands.sort_unstable();
-            let t = Instant::now();
-            let mut c = 0usize;
-            let mut acc = 0usize;
-            for &x in &cands {
-                c = gallop_lower_bound(list, c, x);
-                acc = acc.wrapping_add(c);
-            }
-            std::hint::black_box(acc);
-            let steps = s as f64 * (1.0 + (1.0 + list.len() as f64 / s as f64).log2());
-            v.push(t.elapsed().as_nanos() as f64 / steps);
+    let mut floor = 0.0f64;
+    for (gi, v) in per_gap.iter_mut().enumerate() {
+        if v.len() < 2 {
+            continue;
         }
-        if v.len() >= 2 {
-            let x = median(&mut v);
-            gaps.push(g);
-            ns.push(x);
-            rows.push(json!({"gap": g, "ns_per_step": x, "lists": v.len()}));
-        }
+        let m = median(v);
+        floor = floor.max(m);
+        gaps.push(GALLOP_GAPS[gi]);
+        ns.push(floor);
+        rows.push(
+            json!({"gap": GALLOP_GAPS[gi], "median_ns_per_step": m, "ns_per_step": floor,
+            "pairs": v.len()}),
+        );
     }
     (gaps, ns, json!(rows))
 }
