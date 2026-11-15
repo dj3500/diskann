@@ -239,7 +239,10 @@ impl State {
     fn n_dist(&self, r: &Record, n_start: u32) -> u64 {
         let start = match self.spec.algorithm {
             // Inline and multihop do not count the start-point distances in `cmps`.
-            Algorithm::Inline | Algorithm::InlineAdaptive { .. } | Algorithm::Multihop => n_start,
+            Algorithm::Inline
+            | Algorithm::InlineAdaptive { .. }
+            | Algorithm::Multihop
+            | Algorithm::PathSeer => n_start,
             _ => 0,
         };
         u64::from(r.stats.up_cmps) + u64::from(start) + u64::from(r.stats.extra_dist)
@@ -255,7 +258,7 @@ impl State {
     ) -> Result<()> {
         // Multihop's `hops` mixes expansions with second-hop adjacency fetches.
         let n_expand = match self.spec.algorithm {
-            Algorithm::Multihop => String::new(),
+            Algorithm::Multihop | Algorithm::PathSeer => String::new(),
             _ => r.stats.up_hops.to_string(),
         };
         let n_dist = self.n_dist(r, n_start);

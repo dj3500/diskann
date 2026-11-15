@@ -67,6 +67,8 @@ enum AlgorithmArg {
     Multihop,
     /// The `BetaFilter` layer over `Knn`, post-filtered to matches with true distances.
     Beta,
+    /// `PathSeer` (open upstream PR #1506; needs that PR in the `diskann` crate).
+    Pathseer,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -238,6 +240,7 @@ fn run_typed<T: VectorRepr + Element>(args: &RunArgs) -> Result<()> {
             }
             AlgorithmArg::Multihop => Algorithm::Multihop,
             AlgorithmArg::Beta => Algorithm::beta(args.beta)?,
+            AlgorithmArg::Pathseer => Algorithm::PathSeer,
         };
         for &provider in &args.providers {
             for k_spec in &args.k {

@@ -9,6 +9,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -146,7 +147,8 @@ pub struct Dataset<T> {
     pub dir: PathBuf,
     pub base: Matrix<T>,
     pub base_file: PathBuf,
-    pub labels: LabelStore,
+    /// Shared with external engines that evaluate predicates themselves.
+    pub labels: Arc<LabelStore>,
     pub qsets: BTreeMap<String, QuerySet<T>>,
     /// Per view: dictionary fingerprint, label count and posting offsets.
     pub views: BTreeMap<String, (u64, usize, Vec<u64>)>,
@@ -163,7 +165,7 @@ impl<T: Element> Dataset<T> {
         let (base_file, dtype) = vector_file(dir, "base")?;
         ensure!(dtype == T::DTYPE, "the base is {}", dtype.name());
         let base = Matrix::<T>::read_bin(&base_file)?;
-        let labels = LabelStore::read(&dir.join("labels.flab"))?;
+        let labels = Arc::new(LabelStore::read(&dir.join("labels.flab"))?);
         ensure!(
             labels.n_points() == base.nrows(),
             "{} label rows for {} base vectors",

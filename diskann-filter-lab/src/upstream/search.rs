@@ -12,6 +12,7 @@
 //! | `InlineAdaptive` | [`InlineFilterSearch`] with [`AdaptiveL`] | `labeled::Filtered<FullPrecision>` | best `K` matches |
 //! | `Multihop` | [`MultihopFilterSearch`] | `labeled::Filtered<FullPrecision>` | best `K` matches |
 //! | `Beta` | [`Knn`] | `BetaFilter<FullPrecision>` | the `L` candidates (matches with distances scaled by β), post-filtered here to the best `K` matches with recomputed true distances |
+//! | `PathSeer` | [`PathSeer`] (open upstream PR #1506, not in upstream `main`) | `labeled::Filtered<FullPrecision>` | best `K` of its `L` matches |
 //!
 //! Every search uses beam width 1 and the strategy's default post-processor (start points and
 //! deleted ids removed). Searches run on the calling thread: the in-memory provider's futures
@@ -28,7 +29,7 @@ use diskann::{
     graph::{
         ext::labeled::{Filtered, QueryLabelProvider},
         index::SearchStats,
-        search::{AdaptiveL, InlineFilterSearch, Knn, MultihopFilterSearch},
+        search::{AdaptiveL, InlineFilterSearch, Knn, MultihopFilterSearch, PathSeer},
         strategy::FullPrecision,
         DiskANNIndex, IdDistance, SearchOutputBuffer,
     },
@@ -55,6 +56,9 @@ pub enum Algorithm {
     Beta {
         beta: f32,
     },
+    /// Two-phase filtered search: bounded second-hop exploration until `L` matches are
+    /// found, then parent-aware filtering (`L` = size of its result heap).
+    PathSeer,
 }
 
 impl Algorithm {
@@ -80,6 +84,7 @@ impl Algorithm {
             Self::InlineAdaptive { .. } => "inline-adaptive",
             Self::Multihop => "multihop",
             Self::Beta { .. } => "beta",
+            Self::PathSeer => "pathseer",
         }
     }
 
@@ -201,6 +206,19 @@ impl<'a, T: VectorRepr> Searcher<'a, T> {
                 let mut out = IdDistance::new(ids, distances);
                 let s = block_on(index.search(
                     MultihopFilterSearch::new(knn),
+                    &strategy,
+                    &context,
+                    query,
+                    &mut out,
+                ))?;
+                record(&mut stats, s);
+                out.current_len()
+            }
+            Algorithm::PathSeer => {
+                let strategy = Filtered::new(FullPrecision, labels);
+                let mut out = IdDistance::new(ids, distances);
+                let s = block_on(index.search(
+                    PathSeer::new(knn),
                     &strategy,
                     &context,
                     query,
@@ -354,6 +372,7 @@ mod tests {
             Algorithm::Inline,
             Algorithm::inline_adaptive(10, 16.0).unwrap(),
             Algorithm::Multihop,
+            Algorithm::PathSeer,
             Algorithm::beta(0.5).unwrap(),
             Algorithm::beta(0.3).unwrap(),
         ]
@@ -417,7 +436,10 @@ mod tests {
                     }
                     if q == 2 {
                         assert_eq!(n, 10);
-                        all_match.push(ids);
+                        // PathSeer's second-hop exploration is not plain greedy search.
+                        if !matches!(algorithm, Algorithm::PathSeer) {
+                            all_match.push(ids);
+                        }
                     }
                 }
                 // Every point matches: all algorithms reduce to the same unfiltered search.
