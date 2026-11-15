@@ -301,6 +301,36 @@ beam_width = 4                   # any role key of the table above
 #                                # exact path)
 ```
 
+**External engines.** A configuration with an `engine` key is answered by code outside the lab
+kernel, inside the same timed loop (timer scope, warm-up, shuffled interleaving, repetitions and
+outputs), so that it can be compared with kernel configurations within one invocation (module
+`run::external`; timed mode only; no preset, kernel roles or view):
+
+```toml
+[[config]]
+name = "pathseer"
+engine = "upstream"              # upstream search code through the adapter (see "Upstream adapter")
+algorithm = "pathseer"           # knn-postfilter | inline | inline-adaptive(s, f) | multihop | beta(β) | pathseer
+provider = "forward"             # forward (default) | bitmap
+graph = "/path/to/index"         # a DiskANN index prefix saved by upstream
+
+[[config]]
+name = "other"
+engine = "dylib"                 # a shared library implementing the C ABI of run::external
+library = "/path/to/libengine.so"
+index = "/path/to/its/index"
+params = "key=value;key=value"   # passed to the library as is
+```
+
+The C ABI (version 1) has five functions: `flab_ext_abi_version`, `flab_ext_open` (dataset
+directory, index, parameters, element type and dimension), `flab_ext_describe` (a JSON object
+recorded in `run.json`), `flab_ext_search` (one query: the vector, the predicate's clauses as
+offsets into sorted label ids of the dataset's `labels.flab`, the effort and K; it writes at most
+K matches in increasing true squared-L2 distance and fills a counter struct) and `flab_ext_close`.
+The per-query timer encloses the whole call. Engines' extra counters are written as `ext_*` columns
+of `perquery.tsv`. External engines return at most their effort's worth of answers, so efforts
+below K are skipped.
+
 Timed mode refuses to run unless the process is pinned to one CPU. It pre-faults the inputs,
 records the CPU, NUMA node, memory policy, niceness, load and a calibration at the start and
 the end, warms every configuration up at the median effort, then for each repetition and effort
@@ -611,6 +641,7 @@ providers, a per-query timer and the lab's run outputs (module `upstream`).
 | `inline-adaptive` | `InlineFilterSearch` + `AdaptiveL` (`--adaptive-samples`, `--adaptive-scale`) | best K matches |
 | `multihop` | `MultihopFilterSearch` | best K matches |
 | `beta` | `BetaFilter` layer over `Knn` (`--beta`) | L candidates post-filtered to the best K matches, with recomputed true distances |
+| `pathseer` | `PathSeer` (open upstream PR #1506, applied to this branch's `diskann` crate) | best K of its L matches |
 
 Predicate providers (`--providers`) implement upstream's `QueryLabelProvider`:
 
