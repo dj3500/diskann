@@ -44,6 +44,13 @@
 //!                                  # for an L-independent exact path)
 //! calibration = "<costs.json>"     # per-configuration unit costs (e.g. another calibration)
 //! sketches_sidecar = "<sketches.flab>" # per-configuration sketches (e.g. another priority seed)
+//!
+//! [[config]]
+//! name = "pathseer"
+//! engine = "upstream"              # an external engine (`run::external`), timed in the same
+//! algorithm = "pathseer"           #   loop: upstream code through the adapter on the DiskANN
+//! provider = "forward"             #   index at `graph`, or engine = "dylib" with `library`,
+//! graph = "<DiskANN index prefix>" #   `index` and `params` (no preset or kernel roles)
 //! ```
 
 use std::{
@@ -54,6 +61,7 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use serde::Deserialize;
 
+use super::external::ExternalSpec;
 use crate::kernel::{Kernel, Preset};
 
 /// Run mode.
@@ -141,6 +149,8 @@ pub struct ConfigSpec {
     pub sketches_sidecar: Option<PathBuf>,
     /// The overrides as given (for the record).
     pub overrides: BTreeMap<String, String>,
+    /// An external engine answering this configuration's queries instead of the kernel.
+    pub external: Option<ExternalSpec>,
 }
 
 /// A parsed and validated experiment file.
@@ -266,6 +276,31 @@ impl Experiment {
                     t.remove(key).map(|v| value_text(key, &v)).transpose()
                 };
             let preset = text(&mut table, "preset")?;
+            let external = match text(&mut table, "engine")?.as_deref() {
+                None => None,
+                Some("upstream") => Some(ExternalSpec::Upstream {
+                    algorithm: text(&mut table, "algorithm")?.with_context(|| {
+                        format!("config {name:?}: engine \"upstream\" needs `algorithm`")
+                    })?,
+                    provider: text(&mut table, "provider")?.unwrap_or_else(|| "forward".into()),
+                }),
+                Some("dylib") => Some(ExternalSpec::Dylib {
+                    library: resolve(
+                        dir,
+                        Path::new(&text(&mut table, "library")?.with_context(|| {
+                            format!("config {name:?}: engine \"dylib\" needs `library`")
+                        })?),
+                    ),
+                    index: resolve(
+                        dir,
+                        Path::new(&text(&mut table, "index")?.with_context(|| {
+                            format!("config {name:?}: engine \"dylib\" needs `index`")
+                        })?),
+                    ),
+                    params: text(&mut table, "params")?.unwrap_or_default(),
+                }),
+                Some(e) => bail!("config {name:?}: unknown engine {e:?} (upstream, dylib)"),
+            };
             let graph = text(&mut table, "graph")?
                 .map(PathBuf::from)
                 .or_else(|| e.graph.clone())
@@ -273,7 +308,12 @@ impl Experiment {
             let starts_sidecar = text(&mut table, "starts_sidecar")?
                 .map(PathBuf::from)
                 .or_else(|| e.starts_sidecar.clone());
-            let view = text(&mut table, "view")?.or_else(|| e.view.clone());
+            let own_view = text(&mut table, "view")?;
+            ensure!(
+                external.is_none() || own_view.is_none(),
+                "config {name:?}: external engines read the dataset's own predicates (no view)"
+            );
+            let view = own_view.or_else(|| e.view.clone()).filter(|_| external.is_none());
             let calibration = text(&mut table, "calibration")?
                 .map(PathBuf::from)
                 .or_else(|| e.calibration.clone());
@@ -304,6 +344,14 @@ impl Experiment {
                     .kernel(),
                 None => Kernel::default(),
             };
+            if let Some(x) = &external {
+                ensure!(
+                    preset.is_none() && table.is_empty(),
+                    "config {name:?}: an external engine ({}) takes no preset or kernel roles (got {:?})",
+                    x.to_json(),
+                    table.keys().collect::<Vec<_>>()
+                );
+            }
             let mut overrides = BTreeMap::new();
             for (key, value) in &table {
                 let v = value_text(key, value)?;
@@ -334,6 +382,7 @@ impl Experiment {
                 calibration: calibration.map(|p| resolve(dir, &p)),
                 sketches_sidecar: sketches_sidecar.map(|p| resolve(dir, &p)),
                 overrides,
+                external,
             });
         }
         let panel = e.panel.as_ref().map(|p| {
@@ -438,5 +487,18 @@ mod tests {
             "not an experiment effort"
         );
         assert!(bad("[[config]]\nname='a'\nefforts=[]"));
+        assert!(!bad(
+            "[[config]]\nname='a'\nengine='upstream'\nalgorithm='pathseer'"
+        ));
+        assert!(bad("[[config]]\nname='a'\nengine='upstream'"), "no algorithm");
+        assert!(
+            bad("[[config]]\nname='a'\nengine='upstream'\nalgorithm='inline'\ncollector='heap'"),
+            "kernel roles on an external engine"
+        );
+        assert!(!bad(
+            "[[config]]\nname='a'\nengine='dylib'\nlibrary='l.so'\nindex='i'\nparams='v=1'"
+        ));
+        assert!(bad("[[config]]\nname='a'\nengine='dylib'\nindex='i'"), "no library");
+        assert!(bad("[[config]]\nname='a'\nengine='nope'"));
     }
 }

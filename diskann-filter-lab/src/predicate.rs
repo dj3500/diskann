@@ -65,6 +65,12 @@ impl<'a> Cnf<'a> {
         (0..this.n_clauses()).map(move |i| this.clause(i))
     }
 
+    /// The raw representation: clause `i` is `labels[bounds[i]..bounds[i + 1]]`
+    /// (`bounds.len() == n_clauses() + 1`; the offsets index the whole `labels` slice).
+    pub fn raw(&self) -> (&'a [u64], &'a [u32]) {
+        (self.bounds, self.labels)
+    }
+
     /// Whether some clause is empty, so that no point can match.
     pub fn is_unsatisfiable(&self) -> bool {
         self.clauses().any(<[u32]>::is_empty)

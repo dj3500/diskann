@@ -31,6 +31,7 @@
 //! used (`panel.tsv`), traces (trace mode); and one line per run in the ledger.
 
 pub mod data;
+pub mod external;
 pub mod spec;
 pub mod sys;
 
@@ -47,6 +48,7 @@ use serde_json::{json, Value};
 
 use self::{
     data::{fnv1a, Dataset, LoadedGraph, Rows},
+    external::External,
     spec::{ConfigSpec, Experiment, Mode},
 };
 use crate::{
@@ -139,6 +141,8 @@ struct Rec {
     cpu_ns: Option<u64>,
     ctr: Counters,
     reference: Option<(u64, u64)>,
+    /// External engines' extra outputs ([`external::EXTRA_NAMES`]).
+    ext: Option<[u64; 5]>,
 }
 
 /// Results of one configuration at one K.
@@ -506,6 +510,26 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
 
+    ensure!(
+        exp.mode == Mode::Timed || exp.configs.iter().all(|c| c.external.is_none()),
+        "external engines run in timed mode only"
+    );
+    let max_l = exp.efforts.iter().copied().max().unwrap_or(1);
+    let mut externals: Vec<Option<Box<dyn External<T>>>> = Vec::new();
+    for c in &exp.configs {
+        externals.push(match &c.external {
+            None => None,
+            Some(x) => Some(
+                external::open(x, &c.graph, &ds, max_l)
+                    .with_context(|| format!("config {:?}: opening its engine", c.name))?,
+            ),
+        });
+    }
+    let ext_desc: Vec<Option<Value>> = externals
+        .iter()
+        .map(|e| e.as_ref().map(|e| e.describe()))
+        .collect();
+
     let mut searchers: HashMap<GraphKey, Searcher> = HashMap::new();
     for (c, ix) in exp.configs.iter().zip(&indices) {
         let key = graph_key(c);
@@ -535,7 +559,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
     let mut per_k = Vec::new();
     for &k in &exp.ks {
         let load_start = sys::load_average();
-        let outcomes = run_k(&cx, &mut searchers, k)?;
+        let outcomes = run_k(&cx, &mut searchers, &mut externals, k)?;
         per_k.push((k, outcomes, load_start, sys::load_average()));
     }
     let calib_end = (exp.mode == Mode::Timed).then(|| cx.calibrate_search(&mut searchers));
@@ -548,19 +572,32 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         for (ci, out) in outcomes.into_iter().enumerate() {
             let c = &exp.configs[ci];
             let g = &graphs[&graph_key(c)];
-            let config_json = json!({
-                "name": c.name,
-                "preset": c.preset,
-                "overrides": c.overrides,
-                "kernel": cx.plans[ci].kernel.to_json(),
-                "two_hop_cap": cx.plans[ci].two_hop_cap(),
-                "view": c.view,
-                // Trace and reference searches always run the configurable loop.
-                "fast_path": match exp.mode {
-                    Mode::Timed => cx.plans[ci].fast_path().name(),
-                    Mode::Trace | Mode::Reference => FastPath::None.name(),
-                },
-            });
+            let config_json = match &ext_desc[ci] {
+                Some(desc) => json!({
+                    "name": c.name,
+                    "preset": Value::Null,
+                    "overrides": c.overrides,
+                    "kernel": Value::Null,
+                    "two_hop_cap": Value::Null,
+                    "view": Value::Null,
+                    "fast_path": "external",
+                    "external": c.external.as_ref().map(external::ExternalSpec::to_json),
+                    "engine": desc,
+                }),
+                None => json!({
+                    "name": c.name,
+                    "preset": c.preset,
+                    "overrides": c.overrides,
+                    "kernel": cx.plans[ci].kernel.to_json(),
+                    "two_hop_cap": cx.plans[ci].two_hop_cap(),
+                    "view": c.view,
+                    // Trace and reference searches always run the configurable loop.
+                    "fast_path": match exp.mode {
+                        Mode::Timed => cx.plans[ci].fast_path().name(),
+                        Mode::Trace | Mode::Reference => FastPath::None.name(),
+                    },
+                }),
+            };
             let hash_input = json!({
                 "experiment": exp.name, "config": config_json, "K": k, "efforts": out.efforts,
                 "dataset": exp.dataset, "graph": c.graph, "starts": g.starts_path,
@@ -588,8 +625,9 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 })
                 .collect();
             let run_id = format!(
-                "{}-lab-{}-k{}-{}",
+                "{}-{}-{}-k{}-{}",
                 sys::utc_timestamp(true),
+                if c.external.is_some() { "ext" } else { "lab" },
                 safe,
                 k,
                 &config_hash[..8]
@@ -831,6 +869,7 @@ fn split_values(rows: &Rows) -> Vec<String> {
 fn run_k<T: Element>(
     cx: &Ctx<'_, T>,
     searchers: &mut HashMap<GraphKey, Searcher>,
+    externals: &mut [Option<Box<dyn External<T>>>],
     k: usize,
 ) -> Result<Vec<Outcome>> {
     let exp = cx.exp;
@@ -842,9 +881,11 @@ fn run_k<T: Element>(
         .iter()
         .enumerate()
         .map(|(ci, p)| {
+            // External engines return at most their effort's worth of answers too.
+            let at_least_k = p.kernel.needs_l_at_least_k() || exp.configs[ci].external.is_some();
             let (efforts, skipped): (Vec<usize>, Vec<usize>) =
                 exp.efforts.iter().partition(|&&l| {
-                    !(p.kernel.needs_l_at_least_k() && l < k)
+                    !(at_least_k && l < k)
                         && own_efforts[ci].as_ref().is_none_or(|v| v.contains(&l))
                 });
             Outcome {
@@ -877,15 +918,22 @@ fn run_k<T: Element>(
                     let l = efforts[efforts.len() / 2];
                     let st = searchers.get_mut(&graph_key(c)).expect("searcher");
                     for q in &cx.queries[ci] {
-                        st.search(
-                            &cx.plans[ci],
-                            &cx.indices[ci],
-                            q,
-                            l,
-                            &mut tmp_ids,
-                            &mut tmp_d,
-                            None,
-                        );
+                        match &mut externals[ci] {
+                            Some(e) => {
+                                e.search(q, l, &mut tmp_ids, &mut tmp_d)?;
+                            }
+                            None => {
+                                st.search(
+                                    &cx.plans[ci],
+                                    &cx.indices[ci],
+                                    q,
+                                    l,
+                                    &mut tmp_ids,
+                                    &mut tmp_d,
+                                    None,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -902,6 +950,7 @@ fn run_k<T: Element>(
                         let c = &exp.configs[ci];
                         let st = searchers.get_mut(&graph_key(c)).expect("searcher");
                         let (plan, ix) = (&cx.plans[ci], &cx.indices[ci]);
+                        let ext = &mut externals[ci];
                         let out = &mut outs[ci];
                         let mut nondet = 0;
                         for (row, q) in cx.queries[ci].iter().enumerate() {
@@ -917,7 +966,13 @@ fn run_k<T: Element>(
                             };
                             let cpu0 = sys::thread_cpu_ns();
                             let wall0 = Instant::now();
-                            let ctr = st.search(plan, ix, q, l, ids, dists, None);
+                            let (ctr, extra) = match ext {
+                                Some(e) => {
+                                    let (ctr, x) = e.search(q, l, ids, dists)?;
+                                    (ctr, Some(x))
+                                }
+                                None => (st.search(plan, ix, q, l, ids, dists, None), None),
+                            };
                             let wall = wall0.elapsed().as_nanos() as u64;
                             let cpu = sys::thread_cpu_ns() - cpu0;
                             if rep > 0
@@ -937,6 +992,7 @@ fn run_k<T: Element>(
                                 cpu_ns: Some(cpu),
                                 ctr,
                                 reference: None,
+                                ext: extra,
                             });
                         }
                         *out.nondeterministic.entry(l).or_insert(0) += nondet;
@@ -985,6 +1041,7 @@ fn run_k<T: Element>(
                             cpu_ns: None,
                             ctr,
                             reference,
+                            ext: None,
                         });
                     }
                 }
@@ -1041,6 +1098,13 @@ fn write_run_files(dir: &Path, rows: &Rows, k: usize, out: &Outcome) -> Result<V
     if reference {
         tsv.push_str("\tref_budget\tbase_n_dist");
     }
+    let ext = out.recs.iter().any(|r| r.ext.is_some());
+    if ext {
+        for name in external::EXTRA_NAMES {
+            tsv.push('\t');
+            tsv.push_str(name);
+        }
+    }
     tsv.push('\n');
     for r in &out.recs {
         let v = r.ctr.values();
@@ -1065,6 +1129,13 @@ fn write_run_files(dir: &Path, rows: &Rows, k: usize, out: &Outcome) -> Result<V
             tsv.push_str(&format!("\t{b}\t{d}"));
         } else if reference {
             tsv.push_str("\t\t");
+        }
+        if let Some(x) = r.ext {
+            for v in x {
+                tsv.push_str(&format!("\t{v}"));
+            }
+        } else if ext {
+            tsv.push_str("\t\t\t\t\t");
         }
         tsv.push('\n');
     }
