@@ -38,7 +38,7 @@ use crate::{
         collect::{Answers, Collector},
         config::{Collector as Coll, Kernel, Laziness},
         cost::UnitCosts,
-        eval::{Compiled, Eval, EvalCtx, RowScan, StaticBits, Weights},
+        eval::{gallop_lower_bound, Compiled, Eval, EvalCtx, RowScan, StaticBits, Weights},
         exact,
         materialize::{merge_distinct, Materialized},
         search::{Counters, Index, Plan, Query, Searcher},
@@ -377,8 +377,19 @@ pub fn calibrate<T: Element>(
         median(&mut pv)
     };
 
+    // Checks of members of union(c0) (as the exact path checks its candidates) and galloping
+    // steps by gap, on a separate random stream (the measurements above keep batch B6's).
+    let mut rng2 = Rng(opts.seed ^ 0x5eed_a1a1);
+    let (pred_row_ns, pred_bits_ns, member_doc) =
+        member_curves(labels, bitsets.as_ref(), n, opts, &mut rng2, &pred_ns);
+    details.insert("member_checks".into(), member_doc);
+    let (gallop_gap, gallop_gap_ns, gallop_doc) = gallop_curve(labels, &mut rng2);
+    details.insert("gallop_by_gap".into(), gallop_doc);
+
     // Graph search.
     let mut graph_doc = Value::Null;
+    let (mut heap_bound_k, mut heap_bound_extra) = (Vec::new(), Vec::new());
+    let mut distance_first_frac = 0.0;
     let (mut graph_dist_ns, mut graph_pred_ns, mut graph_alpha, mut graph_beta) = {
         let d = UnitCosts::default();
         (
@@ -482,7 +493,64 @@ pub fn calibrate<T: Element>(
         let sxx: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
         graph_alpha = (sxy / sxx).max(0.0);
         graph_beta = (my - graph_alpha * mx).max(0.0);
-        graph_doc = json!({"graph": gpath, "queries": qrows.len(), "by_L": by_l});
+
+        // Laziness: predicate evaluations of `heap_bound` searches beyond K/r (r: the
+        // predicate's match rate on random points; searches capped by their distance count
+        // or with r < 1 % left out) and the share of distances evaluated by `distance_first`.
+        let rates: Vec<f64> = (0..preds.len())
+            .map(|qi| sampled_rate(labels, &preds, qi, &mut rng2, &mut compiled, &mut bits))
+            .collect();
+        let lazy = |laziness| Kernel {
+            collector: Coll::Heap,
+            laziness,
+            ..Kernel::default()
+        };
+        let (hb, dfk) = (lazy(Laziness::HeapBound), lazy(Laziness::DistanceFirst));
+        let lazy_plans = [
+            Plan::new(&hb, &ix)?.generic(),
+            Plan::new(&dfk, &ix)?.generic(),
+        ];
+        let mut st = Searcher::for_index(&ix, &[&lazy_plans[0], &lazy_plans[1]]);
+        let mut fracs = Vec::new();
+        let mut lazy_rows = Vec::new();
+        for &kk in &[10usize, 100] {
+            let (mut ids, mut ds) = (vec![0u32; kk], vec![0f32; kk]);
+            let mut extra = Vec::new();
+            for &l in &[100usize, 400, 1600] {
+                let (mut hp, mut hd) = (0.0, 0.0);
+                for i in 0..qrows.len() {
+                    let pi = i % preds.len().max(1);
+                    let q = Query {
+                        vector: qm.row(i),
+                        cnf: preds.get(pi),
+                        view: None,
+                    };
+                    let c = st.search(&lazy_plans[0], &ix, &q, l, &mut ids, &mut ds, None);
+                    hp += c.n_pred as f64;
+                    hd += c.n_dist as f64;
+                    if rates[pi] >= 0.01 && c.n_pred < c.n_dist {
+                        extra.push(c.n_pred as f64 - kk as f64 / rates[pi]);
+                    }
+                    let c = st.search(&lazy_plans[1], &ix, &q, l, &mut ids, &mut ds, None);
+                    if c.n_dist > 0 {
+                        fracs.push(c.n_pred as f64 / c.n_dist as f64);
+                    }
+                }
+                let q = qrows.len().max(1) as f64;
+                lazy_rows.push(json!({"K": kk, "L": l, "heap_bound_n_pred": hp / q,
+                    "heap_bound_n_dist": hd / q}));
+            }
+            if !extra.is_empty() {
+                heap_bound_k.push(kk as f64);
+                heap_bound_extra.push(median(&mut extra).max(0.0));
+            }
+        }
+        if !fracs.is_empty() {
+            distance_first_frac = median(&mut fracs).clamp(0.0, 1.0);
+        }
+        graph_doc = json!({"graph": gpath, "queries": qrows.len(), "by_L": by_l,
+            "laziness": {"rates": rates, "by_K_L": lazy_rows, "heap_bound_k": heap_bound_k,
+                "heap_bound_extra": heap_bound_extra, "distance_first_frac": distance_first_frac}});
     }
 
     let costs = UnitCosts {
@@ -500,6 +568,13 @@ pub fn calibrate<T: Element>(
         graph_pred_ns,
         graph_alpha,
         graph_beta,
+        pred_row_ns,
+        pred_bits_ns,
+        gallop_gap,
+        gallop_gap_ns,
+        heap_bound_k,
+        heap_bound_extra,
+        distance_first_frac,
     };
     costs.validate()?;
     details.insert("graph".into(), graph_doc);
@@ -521,6 +596,234 @@ pub fn calibrate<T: Element>(
         "time": sys::utc_timestamp(false),
         "elapsed_s": t_all.elapsed().as_secs_f64(),
     }))
+}
+
+/// A sorted sample of about `m` elements of the sorted list `u` (all of it if `m ≥ |u|`).
+fn sample_sorted(u: &[u32], m: usize, rng: &mut Rng, out: &mut Vec<u32>) {
+    out.clear();
+    if m >= u.len() {
+        out.extend_from_slice(u);
+    } else if 4 * m >= u.len() {
+        let cut = (m as f64 / u.len() as f64 * u64::MAX as f64) as u64;
+        out.extend(u.iter().copied().filter(|_| rng.next() < cut));
+    } else {
+        let mut idx: Vec<usize> = (0..m).map(|_| rng.below(u.len())).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        out.extend(idx.into_iter().map(|i| u[i]));
+    }
+}
+
+/// Points and predicates measured per (class, density) before a member-check value counts.
+const MEMBER_POINTS: usize = 20_000;
+const MEMBER_PREDICATES: usize = 3;
+
+/// Checks of members of `union(c0)`, the way the exact path checks its `scan` and `df`
+/// candidates (residual clauses, prefetched for them), at each density of [`DENSITIES`]:
+/// fresh calibration predicates, each sampled at the densities its union reaches, split into
+/// predicates whose residual clauses read rows and bitset-only ones. Densities no predicate
+/// reaches take the nearest measured density of the class; a class without measurements
+/// takes the other class's curve, and `fallback` without any. Returns `(rows, bits, report)`.
+fn member_curves(
+    labels: &LabelStore,
+    bitsets: Option<&LabelBitsets>,
+    n: usize,
+    opts: &Options,
+    rng: &mut Rng,
+    fallback: &[f64],
+) -> (Vec<f64>, Vec<f64>, Value) {
+    let preds = predicates(labels, 4 * opts.queries, rng);
+    let nd = DENSITIES.len();
+    let mut samples: [Vec<Vec<f64>>; 2] = [vec![Vec::new(); nd], vec![Vec::new(); nd]];
+    let mut points = [vec![0usize; nd], vec![0usize; nd]];
+    let mut used = [vec![0usize; nd], vec![0usize; nd]];
+    let mut compiled = Compiled::new();
+    let mut bits = vec![0u64; labels.n_labels()];
+    let mut mat = Materialized::new(n, false);
+    let (mut union, mut cands) = (Vec::new(), Vec::new());
+    let (mut heap, mut pos) = (Vec::new(), Vec::new());
+    let mut ctr = Counters::default();
+    for qi in 0..preds.len() {
+        compiled.compile(labels, preds.get(qi), Weights::Unit, None, &mut bits);
+        if compiled.is_empty() || compiled.n_clauses() < 2 {
+            compiled.clear_bits(&mut bits);
+            continue;
+        }
+        if let Some(b) = bitsets {
+            compiled.split_static(labels, b, b.theta(), false);
+        }
+        let class = usize::from(!compiled.residual_reads_rows(bitsets.is_some()));
+        let upper = compiled.upper_bound(0) as usize;
+        let need: Vec<usize> = (0..nd)
+            .filter(|&di| {
+                let m = (DENSITIES[di] * n as f64) as usize;
+                m <= upper
+                    && (points[class][di] < MEMBER_POINTS || used[class][di] < MEMBER_PREDICATES)
+            })
+            .collect();
+        if need.is_empty() {
+            compiled.clear_bits(&mut bits);
+            continue;
+        }
+        let c0 = compiled.clause(0);
+        union.clear();
+        merge_distinct(
+            c0.len(),
+            |i| labels.postings(c0[i]),
+            &mut heap,
+            &mut pos,
+            |p| {
+                union.push(p);
+                true
+            },
+        );
+        let mut cx = EvalCtx::new(labels, &compiled, &bits, &[], &[]).cstar_members();
+        if let Some(b) = bitsets {
+            cx = cx.with_static(b);
+        }
+        for di in need {
+            let m = ((DENSITIES[di] * n as f64) as usize).max(64);
+            if m > union.len() {
+                continue;
+            }
+            used[class][di] += 1;
+            for _ in 0..opts.reps.max(MEMBER_POINTS.div_ceil(m).min(64)) {
+                sample_sorted(&union, m, rng, &mut cands);
+                let t = Instant::now();
+                match bitsets {
+                    Some(_) => exact::filter::<StaticBits>(&cx, &cands, &mut mat.matches, &mut ctr),
+                    None => exact::filter::<RowScan>(&cx, &cands, &mut mat.matches, &mut ctr),
+                }
+                samples[class][di].push(t.elapsed().as_nanos() as f64 / cands.len().max(1) as f64);
+                points[class][di] += cands.len();
+                if points[class][di] >= MEMBER_POINTS && samples[class][di].len() >= opts.reps {
+                    break;
+                }
+            }
+        }
+        compiled.clear_bits(&mut bits);
+    }
+    let measured: Vec<Vec<Option<f64>>> = samples
+        .iter_mut()
+        .map(|cls| {
+            cls.iter_mut()
+                .map(|v| (!v.is_empty()).then(|| median(v)))
+                .collect()
+        })
+        .collect();
+    let fill = |cls: &[Option<f64>]| -> Option<Vec<f64>> {
+        let have: Vec<usize> = (0..cls.len()).filter(|&i| cls[i].is_some()).collect();
+        if have.is_empty() {
+            return None;
+        }
+        Some(
+            (0..cls.len())
+                .map(|i| {
+                    let j = *have
+                        .iter()
+                        .min_by_key(|&&j| (j as isize - i as isize).unsigned_abs())
+                        .unwrap_or(&have[0]);
+                    cls[j].unwrap_or(0.0)
+                })
+                .collect(),
+        )
+    };
+    let (rows, bitsv) = match (fill(&measured[0]), fill(&measured[1])) {
+        (Some(r), Some(b)) => (r, b),
+        (Some(r), None) => (r.clone(), r),
+        (None, Some(b)) => (b.clone(), b),
+        (None, None) => (fallback.to_vec(), fallback.to_vec()),
+    };
+    let report = json!({
+        "predicates": preds.len(),
+        "rows": (0..nd).map(|di| json!({"density": DENSITIES[di], "ns": measured[0][di],
+            "points": points[0][di], "predicates": used[0][di]})).collect::<Vec<_>>(),
+        "bits": (0..nd).map(|di| json!({"density": DENSITIES[di], "ns": measured[1][di],
+            "points": points[1][di], "predicates": used[1][di]})).collect::<Vec<_>>(),
+    });
+    (rows, bitsv, report)
+}
+
+/// Gaps (posting entries per galloped candidate) of the galloping-step curve.
+const GALLOP_GAPS: [f64; 10] = [
+    1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0,
+];
+
+/// Galloping steps by gap: sorted uniform random ids galloped through a long posting list
+/// (at most 250,000 candidates; a prefix of the list beyond that), one list per measurement
+/// and every list used once (cold, as one query's lists), ns per modelled step
+/// `s·(1 + log2(1 + p/s))`; the median over up to five lists per gap. Gaps without two
+/// measurements are left out. Returns `(gaps, ns, report)`.
+fn gallop_curve(labels: &LabelStore, rng: &mut Rng) -> (Vec<f64>, Vec<f64>, Value) {
+    const LISTS: usize = 5;
+    const MAX_CANDS: usize = 250_000;
+    let mut big: Vec<u32> = (0..labels.n_labels() as u32)
+        .filter(|&l| labels.posting_len(l) >= 1024)
+        .collect();
+    big.sort_unstable_by_key(|&l| (std::cmp::Reverse(labels.posting_len(l)), l));
+    let mut next = 0usize;
+    let (mut gaps, mut ns, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cands = Vec::new();
+    for &g in &GALLOP_GAPS {
+        let mut v = Vec::new();
+        for &l in big.iter().cycle().skip(next).take(big.len()) {
+            if v.len() == LISTS {
+                break;
+            }
+            let post = labels.postings(l);
+            let s = ((post.len() as f64 / g) as usize).min(MAX_CANDS);
+            if s < 16 {
+                continue;
+            }
+            next += 1;
+            let list = &post[..((s as f64 * g) as usize).clamp(1, post.len())];
+            let (lo, hi) = (list[0] as usize, *list.last().unwrap_or(&0) as usize);
+            cands.clear();
+            cands.extend((0..s).map(|_| (lo + rng.below(hi - lo + 1)) as u32));
+            cands.sort_unstable();
+            let t = Instant::now();
+            let mut c = 0usize;
+            let mut acc = 0usize;
+            for &x in &cands {
+                c = gallop_lower_bound(list, c, x);
+                acc = acc.wrapping_add(c);
+            }
+            std::hint::black_box(acc);
+            let steps = s as f64 * (1.0 + (1.0 + list.len() as f64 / s as f64).log2());
+            v.push(t.elapsed().as_nanos() as f64 / steps);
+        }
+        if v.len() >= 2 {
+            let x = median(&mut v);
+            gaps.push(g);
+            ns.push(x);
+            rows.push(json!({"gap": g, "ns_per_step": x, "lists": v.len()}));
+        }
+    }
+    (gaps, ns, json!(rows))
+}
+
+/// Match rate of predicate `qi` of `preds` on 4,096 random points (mode 1).
+fn sampled_rate(
+    labels: &LabelStore,
+    preds: &PredicateSet,
+    qi: usize,
+    rng: &mut Rng,
+    compiled: &mut Compiled,
+    bits: &mut [u64],
+) -> f64 {
+    const POINTS: usize = 4096;
+    compiled.compile(labels, preds.get(qi), Weights::Unit, None, bits);
+    if compiled.is_empty() {
+        compiled.clear_bits(bits);
+        return 0.0;
+    }
+    let cx = EvalCtx::new(labels, compiled, bits, &[], &[]);
+    let n = labels.n_points();
+    let hits = (0..POINTS)
+        .filter(|_| RowScan::full(&cx, rng.below(n) as u32))
+        .count();
+    compiled.clear_bits(bits);
+    hits as f64 / POINTS as f64
 }
 
 /// Every clause of the query on `pts` (rows prefetched ahead, as the probe does).

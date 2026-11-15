@@ -25,11 +25,23 @@
 //! ```
 //!
 //! with `merge(c*) = P*·merge·log2 k` for a clause of `k ≥ 2` labels (a single posting list is
-//! read in place). Graph search at list size `L` costs `(α·L + β)·(dist_g + pred_g)`.
+//! read in place). The candidates checked by `scan` and `distance_first` are members of
+//! `union(c*)`: `pred` is the cost of checking a member (the residual clauses), calibrated on
+//! such members for queries whose residual clauses read rows and for bitset-only ones
+//! (`pred_row`, `pred_bits`); the cost of a galloping step depends on the gap `p/s`
+//! (`gallop(p/s)`, cache misses in long lists). Calibrations without these curves (batch B6)
+//! use the miss-dominated `pred` curve and a constant `gallop`.
+//!
+//! Graph search at list size `L` computes `D = α·L + β` distances and evaluates `P`
+//! predicates: `P = D` when every distance pays one (eager), `P = min(D, K/r + extra(K))`
+//! under `heap_bound` laziness (the heap fills after about `K/r` evaluations at match rate
+//! `r`; afterwards only nodes inside the K-th distance are checked, a number that hardly
+//! grows with `L`), `P = φ·D` under `distance_first`; it costs `D·dist_g + P·pred_g`. The
+//! laziness terms are calibrated; without them `P = D` (batch B6).
 
 use serde::{Deserialize, Serialize};
 
-use super::eval::Compiled;
+use super::{config::Laziness, eval::Compiled};
 use crate::{bitsets::LabelBitsets, labels::LabelStore};
 
 /// Unit costs in nanoseconds (see the module documentation).
@@ -63,6 +75,29 @@ pub struct UnitCosts {
     pub graph_alpha: f64,
     /// Distance computations of a graph search at `L = 0` (starts, first steps).
     pub graph_beta: f64,
+    /// Per check of a member of `union(c*)` (the residual clauses) at each density, for
+    /// queries whose residual clauses read rows (labels without a static bitset) and for
+    /// bitset-only ones; empty in older calibrations (then `pred_ns`).
+    #[serde(default)]
+    pub pred_row_ns: Vec<f64>,
+    #[serde(default)]
+    pub pred_bits_ns: Vec<f64>,
+    /// Gaps `p/s` (posting entries per galloped candidate, increasing) and the cost of one
+    /// modelled galloping step at each; empty in older calibrations (then `gallop_ns`).
+    #[serde(default)]
+    pub gallop_gap: Vec<f64>,
+    #[serde(default)]
+    pub gallop_gap_ns: Vec<f64>,
+    /// `heap_bound` graph searches: predicate evaluations beyond `K/r` (`extra(K)`) at each
+    /// heap size `K` (increasing); empty in older calibrations (then one per distance).
+    #[serde(default)]
+    pub heap_bound_k: Vec<f64>,
+    #[serde(default)]
+    pub heap_bound_extra: Vec<f64>,
+    /// `distance_first` graph searches: predicate evaluations per distance computation (0:
+    /// not calibrated, then one per distance).
+    #[serde(default)]
+    pub distance_first_frac: f64,
 }
 
 impl Default for UnitCosts {
@@ -84,6 +119,13 @@ impl Default for UnitCosts {
             graph_pred_ns: 80.0,
             graph_alpha: 10.0,
             graph_beta: 200.0,
+            pred_row_ns: Vec::new(),
+            pred_bits_ns: Vec::new(),
+            gallop_gap: Vec::new(),
+            gallop_gap_ns: Vec::new(),
+            heap_bound_k: Vec::new(),
+            heap_bound_extra: Vec::new(),
+            distance_first_frac: 0.0,
         }
     }
 }
@@ -115,10 +157,32 @@ impl UnitCosts {
             self.graph_beta,
         ];
         anyhow::ensure!(
+            (self.pred_row_ns.is_empty() && self.pred_bits_ns.is_empty())
+                || (self.pred_row_ns.len() == n && self.pred_bits_ns.len() == n),
+            "the member check curves need one value per density"
+        );
+        anyhow::ensure!(
+            self.gallop_gap.len() == self.gallop_gap_ns.len()
+                && self.gallop_gap.windows(2).all(|w| w[0] < w[1])
+                && self.gallop_gap.iter().all(|&g| g >= 1.0),
+            "galloping gaps must increase from at least 1, one cost each"
+        );
+        anyhow::ensure!(
+            self.heap_bound_k.len() == self.heap_bound_extra.len()
+                && self.heap_bound_k.windows(2).all(|w| w[0] < w[1])
+                && self.heap_bound_k.iter().all(|&k| k >= 1.0),
+            "heap_bound sizes must increase from at least 1, one value each"
+        );
+        anyhow::ensure!(
             scalars
                 .iter()
+                .chain(&[self.distance_first_frac])
                 .chain(&self.dist_ns)
                 .chain(&self.pred_ns)
+                .chain(&self.pred_row_ns)
+                .chain(&self.pred_bits_ns)
+                .chain(&self.gallop_gap_ns)
+                .chain(&self.heap_bound_extra)
                 .all(|x| x.is_finite() && *x >= 0.0),
             "unit costs must be finite and non-negative"
         );
@@ -146,9 +210,45 @@ impl UnitCosts {
         self.curve(&self.dist_ns, rho)
     }
 
-    /// Cost of one exact-path predicate check at density `rho`.
+    /// Cost of one exact-path predicate check at density `rho` (random points; batch B6).
     pub fn pred(&self, rho: f64) -> f64 {
         self.curve(&self.pred_ns, rho)
+    }
+
+    /// Cost of checking one member of `union(c*)` at density `rho`, for a query whose
+    /// residual clauses read rows (`rows`) or are bitset-only; `pred` without the curves.
+    pub fn pred_member(&self, rows: bool, rho: f64) -> f64 {
+        if self.pred_row_ns.is_empty() {
+            return self.pred(rho);
+        }
+        self.curve(
+            if rows {
+                &self.pred_row_ns
+            } else {
+                &self.pred_bits_ns
+            },
+            rho,
+        )
+    }
+
+    /// Cost of one modelled galloping step at gap `gap` (posting entries per galloped
+    /// candidate): log-linear in the gap, clamped at the calibrated ends.
+    pub fn gallop(&self, gap: f64) -> f64 {
+        let g = &self.gallop_gap;
+        if g.is_empty() {
+            return self.gallop_ns;
+        }
+        let v = &self.gallop_gap_ns;
+        if gap <= g[0] {
+            return v[0];
+        }
+        let last = g.len() - 1;
+        if gap >= g[last] {
+            return v[last];
+        }
+        let i = g.partition_point(|&x| x <= gap);
+        let t = (gap.ln() - g[i - 1].ln()) / (g[i].ln() - g[i - 1].ln());
+        v[i - 1] + t * (v[i] - v[i - 1])
     }
 
     /// Distance computations of a graph search at list size `l`.
@@ -156,9 +256,54 @@ impl UnitCosts {
         self.graph_alpha * l + self.graph_beta
     }
 
-    /// Nominal cost of a graph search at list size `l` (every distance with a predicate).
+    /// Nominal cost of an eager graph search at list size `l` (every distance with a
+    /// predicate).
     pub fn graph(&self, l: f64) -> f64 {
         self.graph_dists(l) * (self.graph_dist_ns + self.graph_pred_ns)
+    }
+
+    /// `extra(K)` of `heap_bound`: power-law interpolation between the calibrated heap
+    /// sizes, extended with the nearest segment's slope (a single size scales with `K`).
+    fn heap_bound_extra(&self, k: f64) -> f64 {
+        let (ks, xs) = (&self.heap_bound_k, &self.heap_bound_extra);
+        if let Some(i) = ks.iter().position(|&x| x == k) {
+            return xs[i];
+        }
+        if ks.len() == 1 {
+            return xs[0] * k / ks[0];
+        }
+        let i = ks.partition_point(|&x| x <= k).clamp(1, ks.len() - 1);
+        let (k0, k1) = (ks[i - 1], ks[i]);
+        let (x0, x1) = (xs[i - 1].max(1e-9), xs[i].max(1e-9));
+        let slope = (x1.ln() - x0.ln()) / (k1.ln() - k0.ln());
+        (x0.ln() + slope * (k.max(1.0).ln() - k0.ln())).exp()
+    }
+
+    /// Predicate evaluations of a graph search at list size `l` with heap size `k`, match
+    /// rate `rate` and laziness `laziness` (see the module documentation).
+    pub fn graph_preds(&self, l: f64, k: usize, rate: f64, laziness: Laziness) -> f64 {
+        let d = self.graph_dists(l);
+        match laziness {
+            Laziness::HeapBound if !self.heap_bound_k.is_empty() => {
+                if rate > 0.0 {
+                    let k = k.max(1) as f64;
+                    d.min(k / rate.min(1.0) + self.heap_bound_extra(k))
+                } else {
+                    d
+                }
+            }
+            Laziness::DistanceFirst if self.distance_first_frac > 0.0 => {
+                d * self.distance_first_frac.min(1.0)
+            }
+            _ => d,
+        }
+    }
+
+    /// Nominal cost of a graph search at list size `l` (heap size `k`, match rate `rate`,
+    /// laziness `laziness`): the distances and the predicate evaluations they lead to.
+    pub fn graph_cost(&self, l: f64, k: usize, rate: f64, laziness: Laziness) -> f64 {
+        self.graph_dists(l) * self.graph_dist_ns
+            + self.graph_preds(l, k, rate, laziness) * self.graph_pred_ns
     }
 
     /// The model cost of graph work already done.
@@ -437,9 +582,14 @@ impl PlanInputs<'_> {
         let checks = self.q.n_clauses() > 1;
         let k = self.k as f64;
         let dist_m = m * c.dist(m / n);
+        let rows = self.q.residual_reads_rows(self.bitsets.is_some());
         match plan {
             ExactPlan::Scan => {
-                let pred = if checks { a * c.pred(a / n) } else { 0.0 };
+                let pred = if checks {
+                    a * c.pred_member(rows, a / n)
+                } else {
+                    0.0
+                };
                 self.merge(c) + pred + dist_m
             }
             ExactPlan::DistanceFirst => {
@@ -452,7 +602,7 @@ impl PlanInputs<'_> {
                 } else {
                     (k * a / m * (1.0 + (m / k).ln())).min(a)
                 };
-                self.merge(c) + a * c.dist(a / n) + evals * c.pred(evals / n)
+                self.merge(c) + a * c.dist(a / n) + evals * c.pred_member(rows, evals / n)
             }
             ExactPlan::Gallop => {
                 let mut cost = self.merge(c) + a * c.word_ns;
@@ -461,7 +611,7 @@ impl PlanInputs<'_> {
                     for &l in self.q.clause(j) {
                         let p = self.labels.posting_len(l) as f64;
                         if s >= 1.0 {
-                            cost += c.gallop_ns * s * (1.0 + (1.0 + p / s).log2());
+                            cost += c.gallop(p / s) * s * (1.0 + (1.0 + p / s).log2());
                         }
                     }
                     s = a * e.survival.get(j - 1).copied().unwrap_or(1.0);
@@ -525,6 +675,97 @@ pub fn l_multiplier(rate: f64, scale: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::{kernel::eval::Weights, labels::LabelStoreBuilder, predicate::PredicateSetBuilder};
+
+    #[test]
+    fn calibrations_without_the_new_terms_keep_the_b6_model() {
+        let c = UnitCosts::default();
+        assert_eq!(c.pred_member(true, 0.01), c.pred(0.01));
+        assert_eq!(c.pred_member(false, 0.5), c.pred(0.5));
+        assert_eq!(c.gallop(1000.0), c.gallop_ns);
+        for lz in [
+            Laziness::HeapBound,
+            Laziness::DistanceFirst,
+            Laziness::Eager,
+        ] {
+            assert_eq!(c.graph_preds(100.0, 10, 0.5, lz), c.graph_dists(100.0));
+            assert!((c.graph_cost(100.0, 10, 0.5, lz) - c.graph(100.0)).abs() < 1e-9);
+        }
+        // An older calibration file (no new members) reads with empty terms.
+        let mut v = serde_json::to_value(&c).unwrap();
+        for key in [
+            "pred_row_ns",
+            "pred_bits_ns",
+            "gallop_gap",
+            "gallop_gap_ns",
+            "heap_bound_k",
+            "heap_bound_extra",
+            "distance_first_frac",
+        ] {
+            v.as_object_mut().unwrap().remove(key);
+        }
+        let old: UnitCosts = serde_json::from_value(v).unwrap();
+        old.validate().unwrap();
+        assert_eq!(old, c);
+    }
+
+    #[test]
+    fn member_gallop_and_lazy_graph_terms() {
+        let mut c = UnitCosts {
+            pred_row_ns: vec![100.0, 90.0, 80.0, 70.0, 60.0, 50.0],
+            pred_bits_ns: vec![10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+            gallop_gap: vec![1.0, 100.0],
+            gallop_gap_ns: vec![2.0, 20.0],
+            heap_bound_k: vec![10.0, 100.0],
+            heap_bound_extra: vec![100.0, 400.0],
+            distance_first_frac: 0.3,
+            ..UnitCosts::default()
+        };
+        c.validate().unwrap();
+        assert_eq!(c.pred_member(true, 1e-4), 100.0);
+        assert_eq!(c.pred_member(false, 1e-4), 10.0);
+        assert!((c.pred_member(true, 0.03) - c.curve(&c.pred_row_ns, 0.03)).abs() < 1e-12);
+        assert!(
+            (c.gallop(10.0) - 11.0).abs() < 1e-9,
+            "log-linear in the gap"
+        );
+        assert_eq!(c.gallop(0.5), 2.0);
+        assert_eq!(c.gallop(1e6), 20.0);
+        // D = 10·100 + 200 = 1,200 distances at L = 100.
+        let d = c.graph_dists(100.0);
+        assert_eq!(
+            c.graph_preds(100.0, 10, 0.5, Laziness::HeapBound),
+            20.0 + 100.0
+        );
+        assert_eq!(
+            c.graph_preds(100.0, 100, 1.0, Laziness::HeapBound),
+            100.0 + 400.0
+        );
+        let mid = c.graph_preds(1000.0, 1000, 1.0, Laziness::HeapBound);
+        assert!(
+            (mid - (1000.0 + 1600.0)).abs() < 1e-6,
+            "power law in K: {mid}"
+        );
+        assert_eq!(
+            c.graph_preds(100.0, 10, 0.001, Laziness::HeapBound),
+            d,
+            "capped by D"
+        );
+        assert_eq!(c.graph_preds(100.0, 10, 0.0, Laziness::HeapBound), d);
+        assert!((c.graph_preds(100.0, 10, 0.5, Laziness::DistanceFirst) - 0.3 * d).abs() < 1e-9);
+        assert_eq!(c.graph_preds(100.0, 10, 0.5, Laziness::Eager), d);
+        let lazy = c.graph_cost(100.0, 10, 0.5, Laziness::HeapBound);
+        assert!((lazy - (d * c.graph_dist_ns + 120.0 * c.graph_pred_ns)).abs() < 1e-6);
+        assert!(lazy < c.graph(100.0));
+        // Shapes are checked.
+        c.pred_bits_ns.pop();
+        assert!(c.validate().is_err());
+        c.pred_bits_ns.push(5.0);
+        c.gallop_gap = vec![100.0, 1.0];
+        assert!(c.validate().is_err());
+        c.gallop_gap = vec![1.0, 100.0];
+        c.heap_bound_extra.pop();
+        assert!(c.validate().is_err());
+    }
 
     #[test]
     fn curves_interpolate_and_clamp() {

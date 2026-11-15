@@ -42,6 +42,7 @@
 //! graph = "<other graph>"          # per-configuration graph, starts sidecar and view
 //! efforts = [100]                  # per-configuration subset of the efforts (e.g. one effort
 //!                                  # for an L-independent exact path)
+//! calibration = "<costs.json>"     # per-configuration unit costs (e.g. another calibration)
 //! ```
 
 use std::{
@@ -133,6 +134,8 @@ pub struct ConfigSpec {
     pub view: Option<String>,
     /// The efforts of this configuration (a subset of the experiment's; all if `None`).
     pub efforts: Option<Vec<usize>>,
+    /// Unit costs of this configuration (the experiment's unless overridden).
+    pub calibration: Option<PathBuf>,
     /// The overrides as given (for the record).
     pub overrides: BTreeMap<String, String>,
 }
@@ -268,6 +271,9 @@ impl Experiment {
                 .map(PathBuf::from)
                 .or_else(|| e.starts_sidecar.clone());
             let view = text(&mut table, "view")?.or_else(|| e.view.clone());
+            let calibration = text(&mut table, "calibration")?
+                .map(PathBuf::from)
+                .or_else(|| e.calibration.clone());
             let efforts = match table.remove("efforts") {
                 None => None,
                 Some(toml::Value::Array(items)) => {
@@ -319,6 +325,7 @@ impl Experiment {
                 starts_sidecar: starts_sidecar.map(|p| resolve(dir, &p)),
                 view,
                 efforts,
+                calibration: calibration.map(|p| resolve(dir, &p)),
                 overrides,
             });
         }

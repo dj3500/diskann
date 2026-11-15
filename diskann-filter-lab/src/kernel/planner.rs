@@ -23,7 +23,7 @@
 
 use super::{
     cost::{Estimates, ExactPlan},
-    eval::{Eval, EvalCtx},
+    eval::{check, Eval, EvalCtx},
     search::Counters,
 };
 use crate::sketches::LabelSketches;
@@ -144,7 +144,7 @@ impl Probe {
                 }
                 failed == 0
             } else {
-                let ok = P::full(cx, v);
+                let ok = check::<P>(cx, v);
                 if ok {
                     for s in &mut self.surv {
                         *s += 1;

@@ -389,15 +389,18 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         }
     };
 
-    // Unit costs of the cost model and bottom-b sketches (untimed sidecars).
-    let (costs, costs_json) = match &exp.calibration {
-        None => (None, Value::Null),
-        Some(path) => {
-            let c = read_costs(path)?;
-            let doc = json!({"source": path, "costs": &c});
-            (Some(c), doc)
+    // Unit costs of the cost model (per configuration) and bottom-b sketches (untimed
+    // sidecars).
+    let mut cost_files: BTreeMap<PathBuf, (UnitCosts, Value)> = BTreeMap::new();
+    for c in &exp.configs {
+        if let Some(path) = &c.calibration {
+            if !cost_files.contains_key(path) {
+                let u = read_costs(path)?;
+                let doc = json!({"source": path, "costs": &u});
+                cost_files.insert(path.clone(), (u, doc));
+            }
         }
-    };
+    }
     let (sketches, sketches_json) = match &exp.sketches_sidecar {
         None => (None, Value::Null),
         Some(path) => {
@@ -445,7 +448,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             view_postings,
             eps_min: eps,
             bitsets: bitsets.as_ref(),
-            costs: costs.as_ref(),
+            costs: c.calibration.as_ref().map(|p| &cost_files[p].0),
             sketches: sketches.as_ref(),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
@@ -560,7 +563,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     || c.kernel.materializer == Materializer::DenseStatic
                     || uses_exact_bitsets(c))
                     .then(|| bitsets_json["source"].clone()),
-                "calibration": uses_costs(c).then(|| costs_json["source"].clone()),
+                "calibration": uses_costs(c).then(|| c.calibration.clone()).flatten(),
                 "sketches": (c.kernel.estimates == EstimateSource::Sketch)
                     .then(|| sketches_json["source"].clone()),
             });
@@ -639,7 +642,8 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "sample": g.sample.as_ref().map(SampleIndex::len),
                 "sample_index_bytes": g.sample.as_ref().map(SampleIndex::bytes),
                 "bitsets": bitsets_json,
-                "calibration": if uses_costs(c) { costs_json.clone() } else { Value::Null },
+                "calibration": c.calibration.as_ref().filter(|_| uses_costs(c))
+                    .map_or(Value::Null, |p| cost_files[p].1.clone()),
                 "sketches": if c.kernel.estimates == EstimateSource::Sketch {
                     sketches_json.clone()
                 } else {

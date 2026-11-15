@@ -83,6 +83,12 @@ pub struct Compiled {
     /// labels (complete evaluation), or the first one has (Boolean evaluation, where a
     /// first clause made of bitset labels decides most nodes without the row).
     static_row_prefetch: bool,
+    /// For members of `union(c*)` (the exact path's candidates, the probe's samples), which
+    /// satisfy clause 0 and are decided by the residual clauses: whether some residual
+    /// clause has row labels (rows are then prefetched), and the first bitset slot of the
+    /// first residual clause (`u32::MAX` if none; prefetched).
+    residual_rows: bool,
+    residual_first: u32,
 }
 
 impl Compiled {
@@ -120,6 +126,8 @@ impl Compiled {
         self.small_mask = 0;
         self.static_first = u32::MAX;
         self.static_row_prefetch = false;
+        self.residual_rows = false;
+        self.residual_first = u32::MAX;
         for (i, clause) in cnf.clauses().enumerate() {
             if clause.is_empty() {
                 self.empty = true;
@@ -211,6 +219,8 @@ impl Compiled {
         self.small_mask = 0;
         self.static_first = u32::MAX;
         self.static_row_prefetch = false;
+        self.residual_rows = false;
+        self.residual_first = u32::MAX;
         if self.empty {
             return;
         }
@@ -245,6 +255,19 @@ impl Compiled {
         } else {
             self.nav.first().is_some_and(|&j| has_row(j))
         };
+        self.residual_rows = (1..self.n_clauses as u32).any(has_row);
+        if self.n_clauses > 1 {
+            if let Some(&slot) = self.static_slots(1).first() {
+                self.residual_first = slot;
+            }
+        }
+    }
+
+    /// Whether checking a member of `union(c*)` reads its row: without static bitsets
+    /// (`split` false) always, otherwise when some residual clause has labels without a
+    /// bitset (after [`Self::split_static`]).
+    pub fn residual_reads_rows(&self, split: bool) -> bool {
+        !split || self.residual_rows
     }
 
     /// Bitset slots of the clause at position `j` (after [`Self::split_static`]).
@@ -373,6 +396,8 @@ pub struct EvalCtx<'a> {
     pub(crate) sparse: &'a [u32],
     /// Static per-label bitsets (the query must be split against them).
     pub(crate) stat: &'a LabelBitsets,
+    /// The evaluated points are members of `union(c*)` (see [`Self::cstar_members`]).
+    pub(crate) members: bool,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -400,6 +425,7 @@ impl<'a> EvalCtx<'a> {
             dense,
             sparse,
             stat: &bitsets::EMPTY,
+            members: false,
         }
     }
 
@@ -410,9 +436,31 @@ impl<'a> EvalCtx<'a> {
         Self { stat, ..self }
     }
 
+    /// The context for points known to be members of `union(c*)` (the exact path's
+    /// candidates, the probe's samples): [`check`] evaluates only the residual clauses
+    /// (clause 0 holds), and [`StaticBits`] prefetches what they read.
+    #[inline]
+    pub fn cstar_members(self) -> Self {
+        Self {
+            members: true,
+            ..self
+        }
+    }
+
     /// The compiled query.
     pub fn query(&self) -> &'a Compiled {
         self.q
+    }
+}
+
+/// Whether data point `v` satisfies the full predicate: [`Eval::full`], or
+/// [`Eval::residual`] when `cx` holds members of `union(c*)` ([`EvalCtx::cstar_members`]).
+#[inline(always)]
+pub fn check<P: Eval>(cx: &EvalCtx<'_>, v: u32) -> bool {
+    if cx.members {
+        P::residual(cx, v)
+    } else {
+        P::full(cx, v)
     }
 }
 
@@ -426,6 +474,11 @@ pub trait Eval: Copy + Send + Sync + 'static {
     fn eval(cx: &EvalCtx<'_>, v: u32, complete: bool) -> PredOut;
     /// Whether `v` satisfies the full predicate (answer eligibility).
     fn full(cx: &EvalCtx<'_>, v: u32) -> bool;
+    /// Whether `v`, a member of `union(c*)` (clause 0 holds), satisfies the other clauses.
+    #[inline(always)]
+    fn residual(cx: &EvalCtx<'_>, v: u32) -> bool {
+        Self::full(cx, v)
+    }
     /// Prefetches what [`Self::eval`] will read for `v` (second stage: the row itself).
     fn prefetch(cx: &EvalCtx<'_>, v: u32);
     /// First prefetch stage (the row offsets).
@@ -438,7 +491,7 @@ pub trait Eval: Copy + Send + Sync + 'static {
         let q = cx.q;
         let row = cx.labels.row(v);
         let mut failed = 0u64;
-        for j in 0..q.n_clauses.min(64) {
+        for j in usize::from(cx.members)..q.n_clauses.min(64) {
             if !gallop_intersects(row, q.clause(j)) {
                 failed |= 1u64 << j;
             }
@@ -466,6 +519,16 @@ pub struct SparseList;
 /// Static per-label bitsets for frequent labels, the row for the others.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticBits;
+
+/// The clauses a full check covers: all, or the residual ones for members of `union(c*)`.
+#[inline(always)]
+fn check_mask(cx: &EvalCtx<'_>) -> u64 {
+    if cx.members {
+        cx.q.full_mask & !1
+    } else {
+        cx.q.full_mask
+    }
+}
 
 #[inline(always)]
 fn from_failed(q: &Compiled, failed: u64, complete: bool) -> PredOut {
@@ -528,6 +591,16 @@ impl Eval for RowScan {
     }
 
     #[inline(always)]
+    fn residual(cx: &EvalCtx<'_>, v: u32) -> bool {
+        let q = cx.q;
+        let row = cx.labels.row(v);
+        if !q.use_bits || row.len() > 4 * q.labels.len() {
+            return ClauseSearch::residual(cx, v);
+        }
+        scan(cx, row, q.full_mask & !1) == 0
+    }
+
+    #[inline(always)]
     fn prefetch(cx: &EvalCtx<'_>, v: u32) {
         let (offsets, rows) = cx.labels.forward();
         super::prefetch(rows.as_ptr().wrapping_add(offsets[v as usize] as usize));
@@ -545,7 +618,7 @@ impl Eval for RowScan {
         if !q.use_bits || row.len() > 4 * q.labels.len() {
             return ClauseSearch::failed_all(cx, v);
         }
-        scan(cx, row, q.full_mask)
+        scan(cx, row, check_mask(cx))
     }
 }
 
@@ -580,6 +653,13 @@ impl Eval for ClauseSearch {
         let q = cx.q;
         let row = cx.labels.row(v);
         (0..q.n_clauses).all(|j| gallop_intersects(row, q.clause(j)))
+    }
+
+    #[inline(always)]
+    fn residual(cx: &EvalCtx<'_>, v: u32) -> bool {
+        let q = cx.q;
+        let row = cx.labels.row(v);
+        (1..q.n_clauses).all(|j| gallop_intersects(row, q.clause(j)))
     }
 
     #[inline(always)]
@@ -718,10 +798,25 @@ impl Eval for StaticBits {
         static_failed(cx, v, q.full_mask, true) == 0
     }
 
-    /// The row, when it is likely to be read (see [`Compiled::split_static`]).
+    #[inline(always)]
+    fn residual(cx: &EvalCtx<'_>, v: u32) -> bool {
+        let q = cx.q;
+        if !q.use_bits {
+            return ClauseSearch::residual(cx, v);
+        }
+        static_failed(cx, v, q.full_mask & !1, true) == 0
+    }
+
+    /// The row, when it is likely to be read (see [`Compiled::split_static`]; for members of
+    /// `union(c*)`, when a residual clause has row labels).
     #[inline(always)]
     fn prefetch(cx: &EvalCtx<'_>, v: u32) {
-        if cx.q.static_row_prefetch {
+        let rows = if cx.members {
+            cx.q.residual_rows
+        } else {
+            cx.q.static_row_prefetch
+        };
+        if rows {
             RowScan::prefetch(cx, v);
         }
     }
@@ -731,19 +826,25 @@ impl Eval for StaticBits {
         if !cx.q.use_bits {
             return ClauseSearch::failed_all(cx, v);
         }
-        static_failed(cx, v, cx.q.full_mask, false)
+        static_failed(cx, v, check_mask(cx), false)
     }
 
-    /// The row offsets (when the row is likely to be read) and the bitset word of the first
-    /// navigation clause's most frequent label.
+    /// The row offsets (when the row is likely to be read) and the bitset word of the most
+    /// frequent label of the first clause evaluated (the first navigation clause; for
+    /// members of `union(c*)`, the first residual clause).
     #[inline(always)]
     fn prefetch_offsets(cx: &EvalCtx<'_>, v: u32) {
         let q = cx.q;
-        if q.static_row_prefetch {
+        let (rows, first) = if cx.members {
+            (q.residual_rows, q.residual_first)
+        } else {
+            (q.static_row_prefetch, q.static_first)
+        };
+        if rows {
             RowScan::prefetch_offsets(cx, v);
         }
-        if q.static_first != u32::MAX {
-            super::prefetch(cx.stat.word_ptr(q.static_first, (v >> 6) as usize));
+        if first != u32::MAX {
+            super::prefetch(cx.stat.word_ptr(first, (v >> 6) as usize));
         }
     }
 }
@@ -944,10 +1045,10 @@ mod tests {
         assert_eq!(all_modes(&cx, 2, true).unit, 1);
     }
 
-    #[test]
-    fn static_bits_agree_with_the_row_modes() {
-        // 300 points over categories a (40 values, Zipf-like) and b (5 values); every 25th
-        // point carries 30 a-labels (a long row: the galloping path).
+    /// 300 points over categories a (40 values, Zipf-like) and b (5 values); every 25th
+    /// point carries 30 a-labels (a long row: the galloping path); 60 predicates of 1-4
+    /// clauses.
+    fn zipf_fixture() -> (LabelStore, crate::predicate::PredicateSet) {
         let mut state = 99u64;
         let mut next = |n: u32| {
             state = state
@@ -990,6 +1091,12 @@ mod tests {
             pb.push(&clauses);
         }
         let preds = pb.finish();
+        (s, preds)
+    }
+
+    #[test]
+    fn static_bits_agree_with_the_row_modes() {
+        let (s, preds) = zipf_fixture();
         let all = LabelBitsets::build(&s, 1);
         let mut bits = vec![0u64; s.n_labels()];
         let mut q = Compiled::new();
@@ -1023,6 +1130,101 @@ mod tests {
             row_reads_avoided > 0,
             "some queries are decided by bitsets alone"
         );
+    }
+
+    #[test]
+    fn members_of_cstar_need_only_the_residual_clauses() {
+        let (s, preds) = zipf_fixture();
+        let mut bits = vec![0u64; s.n_labels()];
+        let mut q = Compiled::new();
+        for theta in [1, 5, 20, 60, 1000] {
+            let sb = LabelBitsets::build(&s, theta);
+            for i in 0..preds.len() {
+                q.compile(&s, preds.get(i), Weights::Unit, None, &mut bits);
+                if q.is_empty() {
+                    q.clear_bits(&mut bits);
+                    continue;
+                }
+                q.split_static(&s, &sb, theta, false);
+                let residual = (1..q.n_clauses()).any(|j| !q.row_labels(j).is_empty());
+                assert_eq!(q.residual_reads_rows(true), residual, "θ {theta} q {i}");
+                assert!(q.residual_reads_rows(false));
+                let first = if q.n_clauses() > 1 {
+                    q.static_slots(1).first().copied().unwrap_or(u32::MAX)
+                } else {
+                    u32::MAX
+                };
+                assert_eq!(q.residual_first, first);
+                let plain = EvalCtx::new(&s, &q, &bits, &[], &[]).with_static(&sb);
+                let members = plain.cstar_members();
+                for v in 0..300u32 {
+                    if !gallop_intersects(s.row(v), q.clause(0)) {
+                        continue;
+                    }
+                    let want = RowScan::full(&plain, v);
+                    for (cx, what) in [(&plain, "plain"), (&members, "members")] {
+                        assert_eq!(
+                            check::<StaticBits>(cx, v),
+                            want,
+                            "{what} θ {theta} q {i} v {v}"
+                        );
+                        assert_eq!(check::<RowScan>(cx, v), want, "{what}");
+                        assert_eq!(check::<ClauseSearch>(cx, v), want, "{what}");
+                    }
+                    let failed = StaticBits::failed_all(&plain, v) & !1;
+                    assert_eq!(StaticBits::failed_all(&members, v), failed);
+                    assert_eq!(RowScan::failed_all(&members, v) & !1, failed);
+                    assert_eq!(ClauseSearch::failed_all(&members, v), failed);
+                }
+                q.clear_bits(&mut bits);
+            }
+        }
+    }
+
+    #[test]
+    fn members_prefetch_for_the_residual_clauses() {
+        // c* = [a=1] (40 points, a bitset); the residual clause [b=1 | b=2] has a rare label
+        // (b=2, 2 points): navigation prefetches no row (its first clause is bitset-only),
+        // the exact path does, and its first bitset word is the residual clause's.
+        let mut b = LabelStoreBuilder::new();
+        for i in 0..100 {
+            let mut row = Vec::new();
+            if i < 40 {
+                row.push("a=1".to_owned());
+            }
+            if i % 5 != 0 {
+                row.push("b=1".to_owned());
+            } else if i < 10 {
+                row.push("b=2".to_owned());
+            }
+            b.push_point(row.iter().map(|l| (&l[..1], l.as_str())))
+                .unwrap();
+        }
+        let s = b.finish().unwrap();
+        let mut pb = PredicateSetBuilder::new(&s);
+        pb.push(&[
+            vec!["b=1".to_owned(), "b=2".to_owned()],
+            vec!["a=1".to_owned()],
+        ]);
+        let preds = pb.finish();
+        let sb = LabelBitsets::build(&s, 10);
+        let mut bits = vec![0u64; s.n_labels()];
+        let mut q = Compiled::new();
+        q.compile(&s, preds.get(0), Weights::Unit, None, &mut bits);
+        q.split_static(&s, &sb, 10, false);
+        assert_eq!(
+            s.label_name(q.clause(0)[0]),
+            "a=1",
+            "c* is the smaller clause"
+        );
+        assert!(
+            !q.static_row_prefetch,
+            "navigation: a bitset-only first clause"
+        );
+        assert!(q.residual_reads_rows(true));
+        let names = s.name_index();
+        assert_eq!(Some(q.residual_first), sb.slot(names["b=1"]));
+        assert_eq!(Some(q.static_first), sb.slot(names["a=1"]));
     }
 
     #[test]

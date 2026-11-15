@@ -16,7 +16,11 @@
 //!
 //! Version 2 (`planned`, [`run_planned`]): one of the plans of [`super::cost::ExactPlan`],
 //! chosen per query by the cost model; candidate rows and vectors are prefetched in a software
-//! pipeline, and checks use the static bitsets when the index has them:
+//! pipeline, and checks use the static bitsets when the index has them. With
+//! `exact_checks = "residual"` (the default) the candidates, all members of `union(c*)`, are
+//! checked on the residual clauses only, and the prefetches serve those clauses (the rows
+//! when one of them has labels without a bitset, the first residual clause's bitset word);
+//! `"full"` checks every clause with the graph search's prefetch policy (batch B6):
 //! - `scan`: candidates of `c*` (its posting list, or the k-way merge of its labels'
 //!   postings), predicate first, distances of the matches;
 //! - `df` (distance first): distances of every candidate; the predicate only for candidates
@@ -34,7 +38,7 @@
 use super::{
     collect::{Answers, Collector},
     cost::ExactPlan,
-    eval::{ClauseSearch, Eval, EvalCtx, RowScan, StaticBits},
+    eval::{check, ClauseSearch, Eval, EvalCtx, RowScan, StaticBits},
     materialize::{merge_distinct, Materialized},
     search::{Counters, EvalMode},
 };
@@ -244,7 +248,7 @@ pub(crate) fn filter<P: Eval>(
             P::prefetch(cx, cands[i + AHEAD_ROWS]);
         }
         let v = cands[i];
-        if P::full(cx, v) {
+        if check::<P>(cx, v) {
             out.push(v);
         }
     }
@@ -285,7 +289,7 @@ fn distance_first<T: Element, P: Eval>(
         }
         if checks {
             ctr.n_pred += 1;
-            if !P::full(cx, v) {
+            if !check::<P>(cx, v) {
                 continue;
             }
         }

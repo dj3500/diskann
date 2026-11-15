@@ -439,6 +439,13 @@ materializer = "dense_static"
         serde_json::json!({"costs": UnitCosts::default()}).to_string(),
     )
     .unwrap();
+    let other = d.dir.join("costs-other.json");
+    std::fs::write(
+        &other,
+        serde_json::json!({"costs": UnitCosts { graph_alpha: 99.0, ..UnitCosts::default() }})
+            .to_string(),
+    )
+    .unwrap();
     let sk = d.dir.join("sketches.flab");
     LabelSketches::build(&d.labels, 16, 1, 2)
         .write(&sk)
@@ -479,14 +486,28 @@ exact = "planned"
 crossover = "guarded"
 estimates = "sketch"
 terminator = "posting_l(16)"
+
+[[config]]
+name = "s3-other-costs"
+starts = "label(c*)+global"
+collector = "heap"
+laziness = "heap_bound"
+exact = "planned"
+crossover = "guarded"
+estimates = "sketch"
+terminator = "posting_l(16)"
+exact_checks = "full"
+calibration = "{other}"
+efforts = [10]
 "#,
         ds = d.dir.display(),
         costs = costs.display(),
+        other = other.display(),
         sk = sk.display(),
     );
     std::fs::write(&p, text).unwrap();
     let dirs = run::run(&p, &opts).unwrap();
-    assert_eq!(dirs.len(), 3);
+    assert_eq!(dirs.len(), 4);
     assert_eq!(
         read_res(&dirs[0].join("res_10.bin")),
         read_res(&dirs[1].join("res_10.bin"))
@@ -497,6 +518,22 @@ terminator = "posting_l(16)"
         serde_json::from_str(&std::fs::read_to_string(dirs[2].join("run.json")).unwrap()).unwrap();
     assert_eq!(run["index"]["sketches"]["b"], 16);
     assert!(run["index"]["calibration"]["costs"]["graph_alpha"].is_number());
+    assert_eq!(
+        run["index"]["calibration"]["source"],
+        costs.display().to_string()
+    );
+    assert_eq!(run["config"]["kernel"]["exact_checks"], "residual");
+    let other_run: Value =
+        serde_json::from_str(&std::fs::read_to_string(dirs[3].join("run.json")).unwrap()).unwrap();
+    assert_eq!(
+        other_run["index"]["calibration"]["source"],
+        other.display().to_string()
+    );
+    assert_eq!(
+        other_run["index"]["calibration"]["costs"]["graph_alpha"],
+        99.0
+    );
+    assert_eq!(other_run["config"]["kernel"]["exact_checks"], "full");
     assert_eq!(run["skipped_efforts"], serde_json::json!([]));
     let pq = std::fs::read_to_string(dirs[2].join("perquery.tsv")).unwrap();
     let header: Vec<&str> = pq.lines().next().unwrap().split('\t').collect();

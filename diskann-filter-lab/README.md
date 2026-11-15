@@ -152,6 +152,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector) |
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
+| `exact_checks` | what the planned exact path and the probe check on their points, all members of `union(c*)`: `residual` (default: the clauses after `c*`, with prefetches for them) or `full` (every clause with the graph search's prefetch policy, as in batch B6) |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
 | `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`, C++ OR-filtered search), `exact` (capacity `L`, C++ multi-filter search) |
@@ -203,11 +204,23 @@ costs: `scan` (candidates of the smallest clause, predicate first), `df` (distan
 predicate only within the answer heap's K-th distance), `gallop` (galloping intersection of
 the clauses' postings) and `bitmap` (a dense match bitmap built with the static bitsets).
 Candidate rows and vectors are prefetched in a software pipeline, and checks use the static
-bitsets when the run has them. A *seeded* exact path keeps the answers of another search and
-still processes every candidate. The unit costs come from `flab calibrate` (module
-`calibrate`: memory-access costs as functions of the candidate density, merge, galloping and
-bitmap costs, graph-search costs per distance and per predicate; a few seconds to a minute per
-dataset) and are loaded with the experiment key `calibration`.
+bitsets when the run has them. Every candidate of `scan` and `df` (and every point of the probe
+below) is a member of `union(c*)`, so with `exact_checks = "residual"` only the residual
+clauses are checked, and the pipeline prefetches what they read: the row when a residual
+clause has labels without a bitset, and the first residual clause's bitset word (the graph
+search's policy, which looks at the first clause, would prefetch nothing when `c*` is made of
+bitset labels). A *seeded* exact path keeps the answers of another search and still processes
+every candidate. The unit costs come from `flab calibrate` (module `calibrate`; base data
+only): memory-access costs as functions of the candidate density on random points (`pred_ns`,
+mostly misses of the first clause) and on members of the calibration predicates' `union(c0)`
+checked like the exact path's candidates, separately for predicates whose residual clauses
+read rows and bitset-only ones (`pred_row_ns`, `pred_bits_ns`; used for `scan` and `df`);
+merge and bitmap costs; galloping steps through long posting lists by gap (`gallop_gap_ns`:
+cache misses grow with the gap); graph-search costs per distance and per predicate, and the
+predicate evaluations of `heap_bound` and `distance_first` searches (below). It takes a few
+seconds (1M points) to two minutes (40M) per dataset; the costs are loaded with the experiment
+or configuration key `calibration`. Calibrations without the newer terms reproduce the batch-B6
+cost model.
 
 **Estimates and the cost crossover** (`kernel::planner`, module `sketches`): every data point
 has a fixed hash priority and every label keeps its `b` lowest-priority members (sidecar
@@ -217,8 +230,12 @@ members). The probe checks the sampled points against every clause (the first 32
 rest only if the estimated match rate is below 1/2) and estimates `A` (bottom-k estimator),
 `M`, the residual clauses' survival and confidence bounds. `crossover = "cost"` takes the
 exact path when the cheapest plan's estimated cost is at most the nominal graph cost of the
-planned list size (calibrated distances per `L` plus the starts); queries whose exact path is
-cheaper than the cheapest graph search even with posting-bound counts skip the probe.
+planned list size: the calibrated distances per `L`, the predicate evaluations they lead to
+under the configuration's laziness (every distance when eager; under `heap_bound` about `K/r`
+until the heap is full plus a calibrated number `extra(K)` inside the K-th distance, at the
+estimated match rate `r`; a calibrated share under `distance_first`), plus the starts; queries
+whose exact path is cheaper than the cheapest graph search even with posting-bound counts skip
+the probe.
 `crossover = "guarded"` runs the graph search as a bounded trial: at checkpoints (64 distance
 computations after the starts, then at doubling intervals) it falls back when, with the heap
 incomplete, the remaining graph cost forecast from the arrival rate of answers exceeds the
@@ -279,7 +296,7 @@ preset = "upstream-inline"
 name = "inline-w4"
 preset = "upstream-inline"
 beam_width = 4                   # any role key of the table above
-# graph / starts_sidecar / view override the experiment's
+# graph / starts_sidecar / view / calibration override the experiment's
 # efforts = [100]                # a subset of the experiment's efforts (e.g. an L-independent
 #                                # exact path)
 ```

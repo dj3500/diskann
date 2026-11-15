@@ -162,6 +162,35 @@ pub enum EstimateSource {
     Sketch,
 }
 
+/// What the planned exact path and the probe check on their points, all members of
+/// `union(c*)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExactChecks {
+    /// The residual clauses (clause 0 holds), with prefetches for them.
+    Residual,
+    /// Every clause, with the graph search's prefetch policy (batch B6).
+    Full,
+}
+
+impl ExactChecks {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "residual" => Self::Residual,
+            "full" => Self::Full,
+            _ => bail!("unknown exact_checks {s:?} (residual, full)"),
+        })
+    }
+}
+
+impl fmt::Display for ExactChecks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Residual => "residual",
+            Self::Full => "full",
+        })
+    }
+}
+
 /// Fallback signals of the `guarded` crossover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fallbacks {
@@ -276,6 +305,7 @@ pub struct Kernel {
     /// Plans the exact path v2 may choose from.
     pub exact_plans: PlanSet,
     pub fallback: Fallbacks,
+    pub exact_checks: ExactChecks,
 }
 
 impl Default for Kernel {
@@ -303,6 +333,7 @@ impl Default for Kernel {
             estimates: EstimateSource::Bounds,
             exact_plans: PlanSet::ALL,
             fallback: Fallbacks::ALL,
+            exact_checks: ExactChecks::Residual,
         }
     }
 }
@@ -771,6 +802,7 @@ impl Kernel {
             "estimates" => self.estimates = EstimateSource::parse(value)?,
             "exact_plans" => self.exact_plans = PlanSet::parse(value)?,
             "fallback" => self.fallback = Fallbacks::parse(value)?,
+            "exact_checks" => self.exact_checks = ExactChecks::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -927,6 +959,7 @@ impl Kernel {
             "estimates": self.estimates.to_string(),
             "exact_plans": self.exact_plans.to_string(),
             "fallback": self.fallback.to_string(),
+            "exact_checks": self.exact_checks.to_string(),
         })
     }
 

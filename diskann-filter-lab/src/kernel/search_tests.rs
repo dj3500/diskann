@@ -986,6 +986,56 @@ fn planned_exact_plans_are_exact() {
 }
 
 #[test]
+fn residual_checks_keep_answers_routes_and_estimates() {
+    use super::cost::UnitCosts;
+    let f = fixture(300, 5, false);
+    let costs = UnitCosts::default();
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 16, 3, 1);
+    for with_bits in [false, true] {
+        let ix = Index {
+            bitsets: with_bits.then_some(&f.bitsets),
+            costs: Some(&costs),
+            sketches: Some(&sketches),
+            ..f.index()
+        };
+        let exact_v2 = [
+            ("exact", "planned(18446744073709551615)"),
+            ("estimates", "sketch"),
+        ];
+        let s2 = [
+            ("laziness", "heap_bound"),
+            ("exact", "planned"),
+            ("crossover", "cost"),
+            ("estimates", "sketch"),
+            ("terminator", "posting_l(16)"),
+        ];
+        for (name, edits) in [("exact-v2", &exact_v2[..]), ("s2", &s2[..])] {
+            let plans: Vec<Plan> = ["residual", "full"]
+                .iter()
+                .map(|m| {
+                    let mut e = edits.to_vec();
+                    e.push(("exact_checks", m));
+                    Plan::new(&khpad(&e), &ix).unwrap()
+                })
+                .collect();
+            let mut st = Searcher::for_index(&ix, &[&plans[0], &plans[1]]);
+            for q in 0..f.preds.len() {
+                for kk in [1, 7, 10] {
+                    let (a, ca) = search_ix(&f, &ix, &mut st, &plans[0], q, 10, kk);
+                    let (b, cb) = search_ix(&f, &ix, &mut st, &plans[1], q, 10, kk);
+                    let what = format!("{name} bits={with_bits} q={q} K={kk}");
+                    assert_eq!(a, b, "{what}");
+                    assert_eq!(ca, cb, "{what}: counters");
+                    if ca.route == Route::Exact {
+                        assert_eq!(a, f.truth(q, kk), "{what}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn seeded_exact_paths_exhaust_every_candidate() {
     use super::{
         collect::{Answers, Collector},

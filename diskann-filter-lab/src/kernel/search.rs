@@ -15,7 +15,7 @@ use super::{
     config::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
-    config::{Crossover, EstimateSource, StartAdmission, StartSource, Terminator},
+    config::{Crossover, EstimateSource, ExactChecks, StartAdmission, StartSource, Terminator},
     cost::{l_multiplier, Estimates, ExactPlan, PlanInputs, UnitCosts},
     entry::{self, SampleIndex, StartPredicate},
     eval::{
@@ -797,6 +797,9 @@ impl Searcher {
         let est = match (plan.kernel.estimates, ix.sketches) {
             (EstimateSource::Sketch, Some(sk)) if self.compiled.n_clauses() > 0 => {
                 let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+                if plan.kernel.exact_checks == ExactChecks::Residual {
+                    cx = cx.cstar_members();
+                }
                 match exact_stat {
                     Some(b) => {
                         cx = cx.with_static(b);
@@ -827,10 +830,13 @@ impl Searcher {
         let kernel = &plan.kernel;
         let costs = plan.costs.as_ref().expect("validated");
         let n = ix.graph.n_data();
-        // Nominal graph cost: the list-size line of the calibration plus the starts.
+        // Nominal graph cost: the calibrated distances at the list size, the predicate
+        // evaluations they lead to under the configured laziness (match rate from the
+        // posting bounds before the probe, from the estimates after it), plus the starts.
         let starts = start_count(kernel, ix, &self.compiled) as f64
             * (costs.graph_dist_ns + costs.graph_pred_ns);
-        let g0 = costs.graph(l as f64) + starts;
+        let bounds = Estimates::from_bounds(&self.compiled, n);
+        let g0 = costs.graph_cost(l as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
         let pi = PlanInputs {
             q: &self.compiled,
             labels: ix.labels,
@@ -847,7 +853,7 @@ impl Searcher {
             true,
         );
         if e_up <= g0 {
-            let est = Estimates::from_bounds(&self.compiled, n);
+            let est = bounds;
             let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
             record(ctr, p, e.min(e_up), g0, &est);
             self.last_estimates = est;
@@ -873,7 +879,8 @@ impl Searcher {
             _ => 1.0,
         };
         let l_plan = planned_l(l, &est, scale);
-        let g = costs.graph(l_plan as f64) + starts;
+        let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
+        let g = costs.graph_cost(l_plan as f64, k, rate, kernel.laziness) + starts;
         record(ctr, p, e, g, &est);
         Decision {
             exact: e <= g,
@@ -903,6 +910,9 @@ impl Searcher {
         ctr: &mut Counters,
     ) {
         let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+        if plan.kernel.exact_checks == ExactChecks::Residual {
+            cx = cx.cstar_members();
+        }
         let eval = match exact_stat {
             Some(b) => {
                 cx = cx.with_static(b);
