@@ -45,6 +45,13 @@
 //!   predicate-free search also gives ns per distance by list size (`graph_dist_ns_curve` at
 //!   `graph_dist_ns_l`), extended to L = 40,960 with a quarter of the queries: maintaining a
 //!   long beam costs more per distance.
+//! - **Effort curve** (when a graph is given; `calibrate/effort.rs`): the unfiltered list size for mean
+//!   recall R at K' neighbours on midpoints of random base pairs (`effort_r`, `effort_k`,
+//!   `effort_l`), read by `terminator = effort_curve`.
+
+mod effort;
+
+pub use effort::EffortOptions;
 
 use std::{path::Path, time::Instant};
 
@@ -78,6 +85,8 @@ pub struct Options {
     pub seed: u64,
     /// Static bitsets threshold (`None`: ⌈n/64⌉, the exact path's default; `Some(0)`: none).
     pub theta: Option<u64>,
+    /// The effort curve (with a graph; no queries and no pairs: none).
+    pub effort: EffortOptions,
 }
 
 impl Default for Options {
@@ -87,6 +96,7 @@ impl Default for Options {
             queries: 64,
             seed: 7,
             theta: None,
+            effort: EffortOptions::default(),
         }
     }
 }
@@ -427,6 +437,7 @@ pub fn calibrate<T: Element>(
     let (mut graph_l, mut graph_l_dists) = (Vec::new(), Vec::new());
     let mut distance_first_frac = 0.0;
     let (mut graph_dist_ns_l, mut graph_dist_ns_curve) = (Vec::new(), Vec::new());
+    let (mut effort_r, mut effort_k, mut effort_l) = (Vec::new(), Vec::new(), Vec::new());
     let (mut graph_dist_ns, mut graph_pred_ns, mut graph_alpha, mut graph_beta) = {
         let d = UnitCosts::default();
         (
@@ -662,6 +673,11 @@ pub fn calibrate<T: Element>(
                 "heap_bound_extra": heap_bound_extra, "heap_bound_l": heap_bound_l,
                 "heap_bound_extra_kl": heap_bound_extra_kl,
                 "distance_first_frac": distance_first_frac}});
+        if opts.effort.queries > 0 || opts.effort.pairs.is_some() {
+            let e = effort::effort_curve(base, &ix, labels, &opts.effort)?;
+            (effort_r, effort_k, effort_l) = (e.r, e.k, e.l);
+            details.insert("effort".into(), e.doc);
+        }
     }
 
     let costs = UnitCosts {
@@ -697,7 +713,10 @@ pub fn calibrate<T: Element>(
         query_ns,
         graph_dist_ns_l,
         graph_dist_ns_curve,
-        // The effort curve is calibrated separately (base-derived queries).
+        effort_r,
+        effort_k,
+        effort_l,
+        // `reads_at_reach` comes from the kernel configuration (`row_reads`), not calibrated.
         ..UnitCosts::default()
     };
     costs.validate()?;

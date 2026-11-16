@@ -374,6 +374,19 @@ struct CalibrateArgs {
     queries: usize,
     #[arg(long, default_value_t = 7)]
     seed: u64,
+    /// Midpoint queries of the effort curve (with a graph; 0: no effort curve).
+    #[arg(long, default_value_t = 200)]
+    effort_queries: usize,
+    /// Seed of the effort curve's base pairs.
+    #[arg(long, default_value_t = 0)]
+    effort_seed: u64,
+    /// Largest list size the effort curve measures (above it the curve is extrapolated).
+    #[arg(long, default_value_t = 40_960)]
+    effort_lmax: usize,
+    /// JSON file with the effort curve's base pairs (`{"pairs": [[a, b], ...]}`) instead of
+    /// random ones.
+    #[arg(long)]
+    effort_pairs: Option<PathBuf>,
     /// Output JSON.
     #[arg(short, long)]
     output: PathBuf,
@@ -441,6 +454,15 @@ fn main() -> Result<()> {
                 queries: a.queries,
                 seed: a.seed,
                 theta: a.theta,
+                effort: calibrate::EffortOptions {
+                    queries: a.effort_queries,
+                    seed: a.effort_seed,
+                    l_max: a.effort_lmax,
+                    pairs: match &a.effort_pairs {
+                        Some(p) => Some(read_pairs(p)?),
+                        None => None,
+                    },
+                },
             };
             let base = run::data::base_file(&a.dataset)?;
             let report = match DType::from_path(&base)? {
@@ -476,6 +498,32 @@ fn main() -> Result<()> {
 
 fn secs(since: Instant) -> f64 {
     since.elapsed().as_secs_f64()
+}
+
+/// The base pairs of an effort calibration from a JSON file `{"pairs": [[a, b], ...]}`.
+fn read_pairs(path: &Path) -> Result<Vec<(u32, u32)>> {
+    let v: Value = serde_json::from_str(
+        &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+    )?;
+    let pairs = v["pairs"]
+        .as_array()
+        .with_context(|| format!("{}: no \"pairs\" array", path.display()))?;
+    pairs
+        .iter()
+        .map(|p| {
+            let ab: Vec<u32> = p
+                .as_array()
+                .map(|x| {
+                    x.iter()
+                        .filter_map(|y| y.as_u64())
+                        .map(|y| y as u32)
+                        .collect()
+                })
+                .unwrap_or_default();
+            ensure!(ab.len() == 2, "{}: a pair must be [a, b]", path.display());
+            Ok((ab[0], ab[1]))
+        })
+        .collect()
 }
 
 fn convert(c: Convert) -> Result<()> {

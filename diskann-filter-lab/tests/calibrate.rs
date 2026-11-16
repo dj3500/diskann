@@ -97,6 +97,10 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
         queries: 16,
         seed: 3,
         theta: None,
+        effort: calibrate::EffortOptions {
+            queries: 40,
+            ..calibrate::EffortOptions::default()
+        },
     };
     let report = calibrate::calibrate::<u8>(&dir, Some(&dir.join("graph")), None, &opts).unwrap();
     let c = &report["costs"];
@@ -148,6 +152,19 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
     let dl = curve("graph_dist_ns_l");
     assert_eq!(dl.last(), Some(&40960.0), "{dl:?}");
     assert!(curve("graph_dist_ns_curve").iter().all(|x| *x > 0.0));
+    // The effort curve: list sizes non-decreasing in the target recall, every K' up to n.
+    assert_eq!(curve("effort_k"), [10.0, 30.0, 100.0, 300.0, 1000.0]);
+    let rows = c["effort_l"].as_array().unwrap();
+    assert_eq!(rows.len(), curve("effort_r").len());
+    let col = |j: usize| -> Vec<f64> { rows.iter().map(|r| r[j].as_f64().unwrap()).collect() };
+    for j in 0..5 {
+        let l = col(j);
+        assert!(
+            l.windows(2).all(|w| w[0] <= w[1]) && l[0] >= 10.0,
+            "K' column {j}: {l:?}"
+        );
+    }
+    assert_eq!(report["details"]["effort"]["queries"], 40);
     // Cold member checks by residual shape and the per-query cost.
     for key in [
         "check_base_ns",
@@ -189,6 +206,10 @@ fn single_category_calibration_measures_member_checks() {
         queries: 16,
         seed: 3,
         theta: None,
+        effort: calibrate::EffortOptions {
+            queries: 40,
+            ..calibrate::EffortOptions::default()
+        },
     };
     let report = calibrate::calibrate::<u8>(&dir, None, None, &opts).unwrap();
     let members = &report["details"]["member_checks"];
