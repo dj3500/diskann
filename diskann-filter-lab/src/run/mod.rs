@@ -401,19 +401,27 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             }
         }
     }
-    let (sketches, sketches_json) = match &exp.sketches_sidecar {
-        None => (None, Value::Null),
-        Some(path) => {
-            let t = Instant::now();
-            let sk = LabelSketches::read(path)?;
-            sk.check_sample(&ds.labels, 97)
-                .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
-            let doc = json!({
-                "source": path, "b": sk.b(), "seed": sk.seed(), "entries": sk.n_entries(),
-                "bytes": sk.bytes(), "load_s": t.elapsed().as_secs_f64(),
-            });
-            (Some(sk), doc)
+    // Sketches per file (the experiment's, or a configuration's own).
+    let mut sketch_files: BTreeMap<PathBuf, (LabelSketches, Value)> = BTreeMap::new();
+    for c in &exp.configs {
+        if let Some(path) = &c.sketches_sidecar {
+            if !sketch_files.contains_key(path) {
+                let t = Instant::now();
+                let sk = LabelSketches::read(path)?;
+                sk.check_sample(&ds.labels, 97)
+                    .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
+                let doc = json!({
+                    "source": path, "b": sk.b(), "seed": sk.seed(), "entries": sk.n_entries(),
+                    "bytes": sk.bytes(), "load_s": t.elapsed().as_secs_f64(),
+                });
+                sketch_files.insert(path.clone(), (sk, doc));
+            }
         }
+    }
+    let sketches_doc = |c: &ConfigSpec| -> Value {
+        c.sketches_sidecar
+            .as_ref()
+            .map_or(Value::Null, |p| sketch_files[p].1.clone())
     };
 
     // Indices, plans and per-row queries.
@@ -449,7 +457,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             eps_min: eps,
             bitsets: bitsets.as_ref(),
             costs: c.calibration.as_ref().map(|p| &cost_files[p].0),
-            sketches: sketches.as_ref(),
+            sketches: c.sketches_sidecar.as_ref().map(|p| &sketch_files[p].0),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
         if !exp.fast_paths {
@@ -565,7 +573,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     .then(|| bitsets_json["source"].clone()),
                 "calibration": uses_costs(c).then(|| c.calibration.clone()).flatten(),
                 "sketches": (c.kernel.estimates == EstimateSource::Sketch)
-                    .then(|| sketches_json["source"].clone()),
+                    .then(|| sketches_doc(c)["source"].clone()),
             });
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));
             let safe: String = c
@@ -645,7 +653,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "calibration": c.calibration.as_ref().filter(|_| uses_costs(c))
                     .map_or(Value::Null, |p| cost_files[p].1.clone()),
                 "sketches": if c.kernel.estimates == EstimateSource::Sketch {
-                    sketches_json.clone()
+                    sketches_doc(c)
                 } else {
                     Value::Null
                 },

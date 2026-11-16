@@ -450,6 +450,10 @@ materializer = "dense_static"
     LabelSketches::build(&d.labels, 16, 1, 2)
         .write(&sk)
         .unwrap();
+    let sk2 = d.dir.join("sketches-seed7.flab");
+    LabelSketches::build(&d.labels, 16, 7, 2)
+        .write(&sk2)
+        .unwrap();
     let p = d.dir.join("b6.toml");
     let text = format!(
         r#"
@@ -498,12 +502,14 @@ estimates = "sketch"
 terminator = "posting_l(16)"
 exact_checks = "full"
 calibration = "{other}"
+sketches_sidecar = "{sk2}"
 efforts = [10]
 "#,
         ds = d.dir.display(),
         costs = costs.display(),
         other = other.display(),
         sk = sk.display(),
+        sk2 = sk2.display(),
     );
     std::fs::write(&p, text).unwrap();
     let dirs = run::run(&p, &opts).unwrap();
@@ -534,6 +540,13 @@ efforts = [10]
         99.0
     );
     assert_eq!(other_run["config"]["kernel"]["exact_checks"], "full");
+    // Per-configuration sketches (another priority seed).
+    assert_eq!(run["index"]["sketches"]["seed"], 1);
+    assert_eq!(other_run["index"]["sketches"]["seed"], 7);
+    assert_eq!(
+        other_run["index"]["sketches"]["source"],
+        sk2.display().to_string()
+    );
     assert_eq!(run["skipped_efforts"], serde_json::json!([]));
     let pq = std::fs::read_to_string(dirs[2].join("perquery.tsv")).unwrap();
     let header: Vec<&str> = pq.lines().next().unwrap().split('\t').collect();
