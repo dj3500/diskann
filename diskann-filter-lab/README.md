@@ -139,7 +139,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `starts` | `+`-joined sources: `global`, `label(c*)` (the smallest clause's per-label starts), `label(all)` (alias `product`), `sample(k)`, `aux` |
 | `start_admission` | `force`, `obey` (starts must pass admission) |
 | `sample_start` | `intended` (sample points that match fully, via per-label sample postings), `recorded` (the sample ids stored in the start table) |
-| `admission` | `all`, `strict`, `projection(<category>, ...)` (navigate on the clauses of these categories), `cutoff(τ)` (at most `τ` failed clauses) |
+| `admission` | `all`, `strict`, `projection(<category>, ...)` (navigate on the clauses of these categories), `projection(c*)` (navigate on the query's clause with the smallest summed posting size; answers are full matches), `cutoff(τ)` (at most `τ` failed clauses) |
 | `laziness` | `eager`, `deferred` (predicate only at collection), `predicate_first`, `distance_first` (skips nodes that can enter neither the beam nor the answers), `heap_bound` (skips the predicate of every node that cannot be an answer: `heap` collector full and distance beyond its K-th; the node still navigates; needs admission `all` and the `distance` scorer) |
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |

@@ -355,6 +355,23 @@ impl Compiled {
         self.labels.len()
     }
 
+    /// Restricts navigation to the clause with the smallest `U_c` (position 0 of the Boolean
+    /// order; admission `projection(c*)`). Called right after [`Self::compile`] without a
+    /// projection; a no-op for queries with an empty clause or a single clause.
+    pub fn project_smallest(&mut self) {
+        if self.empty || self.n_clauses <= 1 {
+            return;
+        }
+        self.projected = true;
+        self.nav.clear();
+        self.nav.push(0);
+        self.nav_weight = self.w[0];
+        self.max_nav_weight = self.w[0];
+        if self.use_bits {
+            self.nav_mask = 1;
+        }
+    }
+
     /// Whether navigation evaluates a strict subset of the clauses.
     pub fn is_projected(&self) -> bool {
         self.projected
