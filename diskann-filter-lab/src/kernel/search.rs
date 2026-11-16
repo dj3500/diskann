@@ -1039,8 +1039,11 @@ impl Searcher {
         };
         let mut g = costs.graph_cost(l_plan as f64, k, rate, kernel.laziness) + starts;
         // A search that, at the upper confidence bound of the match count, meets less than one
-        // match is no alternative to the exact path, however cheap.
-        let hopeless = kernel.hopeless_gate && costs.graph_hopeless(l_plan as f64, &est);
+        // match is no alternative to the exact path, however cheap. Graph only has no exact
+        // path to send it to: the gate does not apply (forcing the post-filter route instead
+        // would search with a list up to `n`).
+        let hopeless =
+            kernel.hopeless_gate && !graph_only && costs.graph_hopeless(l_plan as f64, &est);
         let mut l_run = if matches!(
             kernel.terminator,
             Terminator::PostingL { .. } | Terminator::EffortCurve { .. }

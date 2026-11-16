@@ -159,7 +159,8 @@ pub enum Crossover {
     /// `heap` collector).
     Guarded,
     /// Graph only (track G): the cost model's estimates set the list size (`posting_l`,
-    /// `effort_curve`) and choose the post-filter route, but the exact path is never taken.
+    /// `effort_curve`) and choose the post-filter route, but the exact path is never taken
+    /// (the hopeless gate does not apply).
     Graph,
 }
 
@@ -386,7 +387,7 @@ pub struct Kernel {
     pub postfilter_starts: PostfilterStarts,
     /// The cost crossovers route to the exact path when the planned graph search is hopeless
     /// (fewer than one match met at the upper confidence bound of the match count; A1c);
-    /// `off` for the ablation.
+    /// `off` for the ablation. Inert under the graph crossover.
     pub hopeless_gate: bool,
     /// How the cost model counts the row reads of member checks.
     pub row_reads: RowReads,

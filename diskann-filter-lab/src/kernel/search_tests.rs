@@ -1493,9 +1493,14 @@ fn hopeless_graph_searches_take_the_exact_path() {
     ];
     let mut off = s2.to_vec();
     off.push(("hopeless_gate", "off"));
-    // The graph-only crossover keeps hopeless searches on the graph.
+    // The graph-only crossover keeps hopeless searches on the graph; with the post-filter route
+    // the gate does not force it (its list would reach n): gate on and off decide alike.
     let mut graph_only = s2.to_vec();
     graph_only[1] = ("crossover", "graph");
+    let mut graph_pf = graph_only.clone();
+    graph_pf.push(("postfilter", "cost"));
+    let mut graph_pf_off = graph_pf.clone();
+    graph_pf_off.push(("hopeless_gate", "off"));
     let (gated, ungated) = (khpad(&s2), khpad(&off));
     assert_eq!(gated.to_json().get("hopeless_gate"), None);
     assert_eq!(ungated.to_json()["hopeless_gate"], "off");
@@ -1504,7 +1509,11 @@ fn hopeless_graph_searches_take_the_exact_path() {
         Plan::new(&ungated, &ix).unwrap(),
         Plan::new(&khpad(&graph_only), &ix).unwrap(),
     );
-    let mut st = Searcher::for_index(&ix, &[&pg, &pu, &po]);
+    let (ppf, ppf_off) = (
+        Plan::new(&khpad(&graph_pf), &ix).unwrap(),
+        Plan::new(&khpad(&graph_pf_off), &ix).unwrap(),
+    );
+    let mut st = Searcher::for_index(&ix, &[&pg, &pu, &po, &ppf, &ppf_off]);
     let (mut exact, mut graph) = (0, 0);
     for q in 0..f.preds.len() {
         let m = (0..300u32)
@@ -1517,6 +1526,13 @@ fn hopeless_graph_searches_take_the_exact_path() {
             let (_, cu) = search_ix(&f, &ix, &mut st, &pu, q, l0, 3);
             let (oo, co) = search_ix(&f, &ix, &mut st, &po, q, l0, 3);
             check_properties(&f, q, &oo, "graph only");
+            let (op, cp) = search_ix(&f, &ix, &mut st, &ppf, q, l0, 3);
+            let (op_off, cp_off) = search_ix(&f, &ix, &mut st, &ppf_off, q, l0, 3);
+            assert_eq!(
+                (cp.route, cp.final_l, &op),
+                (cp_off.route, cp_off.final_l, &op_off),
+                "q={q} L0={l0}: the gate under the graph crossover"
+            );
             if q == 7 {
                 continue;
             }
