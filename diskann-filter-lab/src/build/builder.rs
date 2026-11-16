@@ -303,13 +303,14 @@ pub fn build<T: BuildElement>(
             subset,
             budget,
             l_filter,
+            order,
         } => {
             let store = store.expect("checked to have labels");
             let plan = FilterPlan::new(
                 base,
                 store,
                 subset,
-                budget.unwrap_or(rule.degree()),
+                (budget.unwrap_or(rule.degree()), order),
                 l_filter.unwrap_or(params.l_build),
                 params.threads,
             )?;
@@ -887,12 +888,14 @@ mod tests {
             subset: crate::build::LabelSubset::Cap(100),
             budget: None,
             l_filter: None,
+            order: crate::build::BudgetOrder::Rarest,
         };
         let sc = PruneRule::SourceContainment {
             r,
             alpha: 1.2,
             theta: Some(100),
             budget: None,
+            order: crate::build::BudgetOrder::Rarest,
         };
         let one = build(&base, Some(&store), &labeled_params(1, gen, sc)).unwrap();
         let three = build(&base, Some(&store), &labeled_params(3, gen, sc)).unwrap();

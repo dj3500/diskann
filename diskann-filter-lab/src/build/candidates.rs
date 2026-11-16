@@ -91,6 +91,75 @@ impl FromStr for LabelSubset {
     }
 }
 
+/// The order in which a point's labels below the cap are taken against a budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetOrder {
+    /// The rarest first (fewest points, then smallest id).
+    #[default]
+    Rarest,
+    /// The rarest label of every category first (categories ordered by that label's size),
+    /// then the second rarest of every category, and so on: an AND-of-ORs predicate has one
+    /// clause per category, so a point's rarest label in each category is a candidate binding
+    /// clause, whereas many tiny labels of one category would fill a rarest-first budget.
+    PerCategory,
+}
+
+impl fmt::Display for BudgetOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Rarest => "rarest",
+            Self::PerCategory => "categories",
+        })
+    }
+}
+
+impl FromStr for BudgetOrder {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "rarest" => Ok(Self::Rarest),
+            "categories" => Ok(Self::PerCategory),
+            other => bail!("budget order {other:?}: expected rarest or categories"),
+        }
+    }
+}
+
+/// Sorts a point's labels into budget order (`keys` is scratch).
+pub(crate) fn budget_order(
+    store: &LabelStore,
+    labels: &mut [u32],
+    order: BudgetOrder,
+    keys: &mut Vec<(u32, u64, u32)>,
+) {
+    match order {
+        BudgetOrder::Rarest => labels.sort_unstable_by_key(|&l| (store.posting_len(l), l)),
+        BudgetOrder::PerCategory => {
+            keys.clear();
+            keys.extend(
+                labels
+                    .iter()
+                    .map(|&l| (store.category(l), store.posting_len(l) as u64, l)),
+            );
+            keys.sort_unstable();
+            // re-key as (rank within the category, size, id)
+            let (mut prev, mut rank) = (u32::MAX, 0u32);
+            for k in keys.iter_mut() {
+                if k.0 == prev {
+                    rank += 1;
+                } else {
+                    (prev, rank) = (k.0, 0);
+                }
+                k.0 = rank;
+            }
+            keys.sort_unstable();
+            for (slot, &(_, _, l)) in labels.iter_mut().zip(keys.iter()) {
+                *slot = l;
+            }
+        }
+    }
+}
+
 /// The weight of a failed category in the penalized insertion search.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Lambda {
@@ -165,6 +234,8 @@ pub enum Candidates {
         budget: Option<usize>,
         /// List size of the filtered searches (`None`: `L_build`).
         l_filter: Option<usize>,
+        /// Which labels a budget keeps.
+        order: BudgetOrder,
     },
     Penalized {
         lambda: Lambda,
@@ -185,6 +256,7 @@ impl Candidates {
                 subset,
                 budget,
                 l_filter,
+                order,
             } => {
                 let mut t = format!("filtered-{}", subset.to_string().replace('/', ""));
                 if let Some(b) = budget {
@@ -192,6 +264,9 @@ impl Candidates {
                 }
                 if let Some(l) = l_filter {
                     t += &format!("-l{l}");
+                }
+                if order == BudgetOrder::PerCategory {
+                    t += "-cat";
                 }
                 t
             }
@@ -206,11 +281,13 @@ impl Candidates {
                 subset,
                 budget,
                 l_filter,
+                order,
             } => json!({
                 "kind": "filtered",
                 "subset": subset.to_string(),
                 "budget": budget,
                 "l_filter": l_filter,
+                "budget_order": order.to_string(),
             }),
             Self::Penalized { lambda, key } => json!({
                 "kind": "penalized",
@@ -229,13 +306,17 @@ impl fmt::Display for Candidates {
                 subset,
                 budget,
                 l_filter,
+                order,
             } => {
                 write!(f, "filtered({subset}")?;
-                match (budget, l_filter) {
-                    (None, None) => {}
-                    (Some(b), None) => write!(f, ", {b}")?,
-                    (b, Some(l)) => {
-                        write!(f, ", {}, {l}", b.map_or("R".into(), |b| b.to_string()))?
+                let b = budget.map_or("R".into(), |b| b.to_string());
+                match (budget, l_filter, order) {
+                    (None, None, BudgetOrder::Rarest) => {}
+                    (Some(_), None, BudgetOrder::Rarest) => write!(f, ", {b}")?,
+                    (_, Some(l), BudgetOrder::Rarest) => write!(f, ", {b}, {l}")?,
+                    (_, l, BudgetOrder::PerCategory) => {
+                        let l = l.map_or("L".into(), |l| l.to_string());
+                        write!(f, ", {b}, {l}, {order}")?;
                     }
                 }
                 write!(f, ")")
@@ -248,8 +329,8 @@ impl fmt::Display for Candidates {
 impl FromStr for Candidates {
     type Err = anyhow::Error;
 
-    /// `blind`, `filtered(<subset>[, <budget>|R[, <L_f>]])` with subset `all`, `<θ>` or
-    /// `n/<k>`, `penalized(<λ>|inf[, raw|penalized])`.
+    /// `blind`, `filtered(<subset>[, <budget>|R[, <L_f>|L[, rarest|categories]]])` with
+    /// subset `all`, `<θ>` or `n/<k>`, `penalized(<λ>|inf[, raw|penalized])`.
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
         if s == "blind" {
@@ -265,8 +346,8 @@ impl FromStr for Candidates {
         match name.trim() {
             "filtered" => {
                 ensure!(
-                    (1..=3).contains(&args.len()),
-                    "candidates {s:?}: filtered(<subset>[, <budget>[, <L_f>]])"
+                    (1..=4).contains(&args.len()),
+                    "candidates {s:?}: filtered(<subset>[, <budget>[, <L_f>[, <order>]]])"
                 );
                 let subset: LabelSubset = args[0].parse()?;
                 let budget = match args.get(1) {
@@ -277,7 +358,7 @@ impl FromStr for Candidates {
                     ),
                 };
                 let l_filter = match args.get(2) {
-                    None => None,
+                    None | Some(&"L") => None,
                     Some(l) => Some(
                         l.parse::<usize>()
                             .ok()
@@ -289,6 +370,10 @@ impl FromStr for Candidates {
                     subset,
                     budget,
                     l_filter,
+                    order: match args.get(3) {
+                        None => BudgetOrder::Rarest,
+                        Some(o) => o.parse()?,
+                    },
                 })
             }
             "penalized" => {
@@ -332,7 +417,7 @@ impl FilterPlan {
         base: &Matrix<T>,
         store: &LabelStore,
         subset: LabelSubset,
-        budget: usize,
+        (budget, order): (usize, BudgetOrder),
         l_filter: usize,
         threads: usize,
     ) -> Result<Self> {
@@ -344,12 +429,13 @@ impl FilterPlan {
         offsets.push(0u64);
         let mut labels = Vec::new();
         let mut row = Vec::new();
+        let mut keys = Vec::new();
         let (mut truncated_points, mut truncated_labels, mut with_any) = (0u64, 0u64, 0u64);
         let mut used = vec![false; store.n_labels()];
         for p in 0..n as u32 {
             row.clear();
             row.extend(store.row(p).iter().copied().filter(|&l| in_subset(l)));
-            row.sort_unstable_by_key(|&l| (store.posting_len(l), l));
+            budget_order(store, &mut row, order, &mut keys);
             if row.len() > budget {
                 truncated_points += 1;
                 truncated_labels += (row.len() - budget) as u64;
@@ -396,6 +482,7 @@ impl FilterPlan {
         let stats = json!({
             "theta": theta,
             "budget": budget,
+            "budget_order": order.to_string(),
             "l_filter": l_filter,
             "labels_in_subset": (0..store.n_labels() as u32).filter(|&l| in_subset(l)).count(),
             "labels_searched": used.iter().filter(|&&u| u).count(),
@@ -788,7 +875,8 @@ mod tests {
         let ix = s.name_index();
         let (f, m, r) = (ix["f"], ix["m"], ix["r"]);
         let base = crate::build::test_util::random_points(n, 4, 1);
-        let plan = FilterPlan::new(&base, &s, LabelSubset::All, 2, 10, 1).unwrap();
+        let plan =
+            FilterPlan::new(&base, &s, LabelSubset::All, (2, BudgetOrder::Rarest), 10, 1).unwrap();
         assert_eq!(plan.labels_of(0), &[r, m]);
         assert_eq!(plan.labels_of(1), &[m, f]);
         assert_eq!(plan.labels_of(5), &[f]);
@@ -801,10 +889,67 @@ mod tests {
             let st = plan.starts[l as usize];
             assert!(s.postings(l).contains(&st));
         }
-        let capped = FilterPlan::new(&base, &s, LabelSubset::Cap(4), 8, 10, 1).unwrap();
+        let capped = FilterPlan::new(
+            &base,
+            &s,
+            LabelSubset::Cap(4),
+            (8, BudgetOrder::Rarest),
+            10,
+            1,
+        )
+        .unwrap();
         assert_eq!(capped.labels_of(0), &[r, m]);
         assert_eq!(capped.labels_of(5), &[] as &[u32]);
         assert_eq!(capped.stats["filtered_searches"], 4 + 2);
+    }
+
+    #[test]
+    fn per_category_budget_order_takes_each_category_s_rarest_label_first() {
+        // Point 0: three tiny labels in category g (on 1, 2, 3 points) and one larger label in
+        // m (on 4 points). Rarest first keeps g's two tiniest; per category keeps g's tiniest
+        // and m's label first.
+        let rows: Vec<Vec<(&str, &str)>> = vec![
+            vec![("g", "g1"), ("g", "g2"), ("g", "g3"), ("m", "m1")],
+            vec![("g", "g2"), ("g", "g3"), ("m", "m1")],
+            vec![("g", "g3"), ("m", "m1")],
+            vec![("m", "m1")],
+        ];
+        let refs: Vec<&[(&str, &str)]> = rows.iter().map(|r| r.as_slice()).collect();
+        let s = store(&refs);
+        let ix = s.name_index();
+        let (g1, g2, g3, m1) = (ix["g1"], ix["g2"], ix["g3"], ix["m1"]);
+        let mut keys = Vec::new();
+        let mut row = s.row(0).to_vec();
+        budget_order(&s, &mut row, BudgetOrder::Rarest, &mut keys);
+        assert_eq!(row, vec![g1, g2, g3, m1]);
+        budget_order(&s, &mut row, BudgetOrder::PerCategory, &mut keys);
+        assert_eq!(row, vec![g1, m1, g2, g3]);
+        let base = crate::build::test_util::random_points(4, 4, 1);
+        let plan = FilterPlan::new(
+            &base,
+            &s,
+            LabelSubset::All,
+            (2, BudgetOrder::PerCategory),
+            10,
+            1,
+        )
+        .unwrap();
+        assert_eq!(plan.labels_of(0), &[g1, m1]);
+        let rule = crate::build::PruneRule::SourceContainment {
+            r: 4,
+            alpha: 1.2,
+            theta: None,
+            budget: Some(2),
+            order: BudgetOrder::PerCategory,
+        };
+        assert_eq!(
+            rule.to_string(),
+            "source_containment(4, 1.2, inf, 2, categories)"
+        );
+        assert_eq!(
+            rule.to_string().parse::<crate::build::PruneRule>().unwrap(),
+            rule
+        );
     }
 
     #[test]
@@ -830,6 +975,8 @@ mod tests {
             "filtered(n/100)",
             "filtered(1000, 16)",
             "filtered(n/1000, R, 50)",
+            "filtered(n/100, 2, L, categories)",
+            "filtered(n/100, R, 32, categories)",
             "penalized(1, raw)",
             "penalized(inf, penalized)",
             "penalized(0.25, raw)",
@@ -854,7 +1001,8 @@ mod tests {
             Candidates::Filtered {
                 subset: LabelSubset::Fraction(100),
                 budget: None,
-                l_filter: None
+                l_filter: None,
+                order: BudgetOrder::Rarest,
             }
             .tag(),
             "filtered-n100"
