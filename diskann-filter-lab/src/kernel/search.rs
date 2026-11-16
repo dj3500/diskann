@@ -159,6 +159,43 @@ pub struct Counters {
     pub m_hat: u64,
     /// Model cost of the graph work of a guarded trial (ns).
     pub graph_ns: u64,
+    /// Model cost of the sketch probe (ns; 0 without a probe).
+    pub est_probe_ns: u64,
+    /// Clauses of the compiled predicate, and the shape of its residual clauses (clauses
+    /// `1..` of the Boolean order, which the exact path checks on members of `union(c*)`):
+    /// labels checked by static-bitset word (`res_words`) and in the row (`res_rows`), in
+    /// all residual clauses and in clause 1.
+    pub n_clauses: u64,
+    pub res_words: u64,
+    pub res_rows: u64,
+    pub c1_words: u64,
+    pub c1_rows: u64,
+    /// Wall-clock phase times (ns) with the kernel's `phase_times` (0 otherwise): the probe,
+    /// the exact path (candidate generation; checks, or the match-set construction of
+    /// `gallop` and `bitmap`; distances, which for `df` include its lazy checks) and the graph
+    /// search.
+    pub t_probe_ns: u64,
+    pub t_exact_ns: u64,
+    pub t_cand_ns: u64,
+    pub t_check_ns: u64,
+    pub t_dist_ns: u64,
+    pub t_graph_ns: u64,
+    /// The phase timers are on (set per query; not a counter).
+    pub timing: bool,
+}
+
+/// Starts a phase timer when the query's timers are on.
+#[inline(always)]
+pub(crate) fn tic(ctr: &Counters) -> Option<std::time::Instant> {
+    ctr.timing.then(std::time::Instant::now)
+}
+
+/// Adds the time since `t` (if started) to `slot`.
+#[inline(always)]
+pub(crate) fn toc(t: Option<std::time::Instant>, slot: &mut u64) {
+    if let Some(t) = t {
+        *slot += t.elapsed().as_nanos() as u64;
+    }
 }
 
 impl Counters {
@@ -180,7 +217,7 @@ impl Counters {
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 22] = [
+    pub const NAMES: [&'static str; 35] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -203,10 +240,23 @@ impl Counters {
         "a_hat",
         "m_hat",
         "graph_ns",
+        "est_probe_ns",
+        "n_clauses",
+        "res_words",
+        "res_rows",
+        "c1_words",
+        "c1_rows",
+        "t_probe_ns",
+        "t_exact_ns",
+        "t_cand_ns",
+        "t_check_ns",
+        "t_dist_ns",
+        "t_graph_ns",
+        "timing",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 22] {
+    pub fn values(&self) -> [u64; 35] {
         [
             self.n_dist,
             self.n_pred,
@@ -230,6 +280,19 @@ impl Counters {
             self.a_hat,
             self.m_hat,
             self.graph_ns,
+            self.est_probe_ns,
+            self.n_clauses,
+            self.res_words,
+            self.res_rows,
+            self.c1_words,
+            self.c1_rows,
+            self.t_probe_ns,
+            self.t_exact_ns,
+            self.t_cand_ns,
+            self.t_check_ns,
+            self.t_dist_ns,
+            self.t_graph_ns,
+            u64::from(self.timing),
         ]
     }
 }
@@ -646,7 +709,10 @@ impl Searcher {
         assert_eq!(ids.len(), dists.len());
         let k = ids.len();
         let kernel = &plan.kernel;
-        let mut ctr = Counters::default();
+        let mut ctr = Counters {
+            timing: kernel.phase_times,
+            ..Counters::default()
+        };
         self.compiled.compile(
             ix.labels,
             q.cnf,
@@ -672,6 +738,9 @@ impl Searcher {
             }
             _ => None,
         };
+        ctr.n_clauses = self.compiled.n_clauses() as u64;
+        [ctr.res_words, ctr.res_rows, ctr.c1_words, ctr.c1_rows] =
+            self.compiled.residual_shape(exact_stat.is_some());
         let n = if self.compiled.is_empty() {
             ctr.route = Route::Empty;
             0
@@ -719,8 +788,12 @@ impl Searcher {
                     let est = self.estimates(plan, ix, exact_stat, &mut ctr);
                     l_run = planned_l(l, &est, scale);
                 }
-                self.graph(plan, ix, q, l_run, reference, &mut ctr, ids, dists, None)
-                    .expect("an unguarded graph search finishes")
+                let t = tic(&ctr);
+                let n = self
+                    .graph(plan, ix, q, l_run, reference, &mut ctr, ids, dists, None)
+                    .expect("an unguarded graph search finishes");
+                toc(t, &mut ctr.t_graph_ns);
+                n
             }
         } else {
             let d = self.decide(plan, ix, l, k, exact_stat, &mut ctr);
@@ -740,7 +813,8 @@ impl Searcher {
                             costs.graph_pred_ns,
                         )
                     });
-                match self.graph(
+                let t = tic(&ctr);
+                let trial = self.graph(
                     plan,
                     ix,
                     q,
@@ -750,7 +824,9 @@ impl Searcher {
                     ids,
                     dists,
                     guard.as_mut(),
-                ) {
+                );
+                toc(t, &mut ctr.t_graph_ns);
+                match trial {
                     Some(n) => {
                         if guard.is_some() {
                             ctr.graph_ns = costs.charged(ctr.n_dist, ctr.n_pred) as u64;
@@ -794,8 +870,21 @@ impl Searcher {
         ctr: &mut Counters,
     ) -> Estimates {
         let n = ix.graph.n_data();
+        let t = tic(ctr);
+        let probed = ctr.n_probe;
         let est = match (plan.kernel.estimates, ix.sketches) {
             (EstimateSource::Sketch, Some(sk)) if self.compiled.n_clauses() > 0 => {
+                if let Some(c) = plan.costs.as_ref() {
+                    let b = sk.b();
+                    let merged: usize = self
+                        .compiled
+                        .clause(0)
+                        .iter()
+                        .map(|&l| ix.labels.posting_len(l).min(b))
+                        .sum();
+                    // The evaluated points are known after the probe (below).
+                    ctr.est_probe_ns = c.probe(merged as f64, 0.0) as u64;
+                }
                 let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
                 if plan.kernel.exact_checks == ExactChecks::Residual {
                     cx = cx.cstar_members();
@@ -813,6 +902,10 @@ impl Searcher {
                 Estimates::from_bounds(&self.compiled, n)
             }
         };
+        toc(t, &mut ctr.t_probe_ns);
+        if let Some(c) = plan.costs.as_ref() {
+            ctr.est_probe_ns += c.probe(0.0, (ctr.n_probe - probed) as f64) as u64;
+        }
         self.last_estimates = est.clone();
         est
     }
@@ -921,6 +1014,7 @@ impl Searcher {
             None => ExactEval::RowScan,
         };
         debug_assert!(plan.kernel.exact.is_planned());
+        let t = tic(ctr);
         exact::run_planned(
             p,
             eval,
@@ -934,6 +1028,7 @@ impl Searcher {
             seeded,
             ctr,
         );
+        toc(t, &mut ctr.t_exact_ns);
     }
 
     /// The graph search (start selection, then the loop): `Some(answers written)`, or `None`

@@ -306,6 +306,9 @@ pub struct Kernel {
     pub exact_plans: PlanSet,
     pub fallback: Fallbacks,
     pub exact_checks: ExactChecks,
+    /// Per-phase wall-clock timers of a query (probe, exact path phases, graph search) into
+    /// its counters: a diagnostic, off by default (a few clock reads per query).
+    pub phase_times: bool,
 }
 
 impl Default for Kernel {
@@ -334,6 +337,7 @@ impl Default for Kernel {
             exact_plans: PlanSet::ALL,
             fallback: Fallbacks::ALL,
             exact_checks: ExactChecks::Residual,
+            phase_times: false,
         }
     }
 }
@@ -803,6 +807,13 @@ impl Kernel {
             "exact_plans" => self.exact_plans = PlanSet::parse(value)?,
             "fallback" => self.fallback = Fallbacks::parse(value)?,
             "exact_checks" => self.exact_checks = ExactChecks::parse(value)?,
+            "phase_times" => {
+                self.phase_times = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown phase_times {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -934,7 +945,7 @@ impl Kernel {
 
     /// The configuration as JSON (text forms of every role).
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut j = json!({
             "starts": self.starts.iter().map(ToString::to_string).collect::<Vec<_>>().join("+"),
             "start_admission": self.start_admission.to_string(),
             "sample_start": self.sample_start.to_string(),
@@ -960,7 +971,12 @@ impl Kernel {
             "exact_plans": self.exact_plans.to_string(),
             "fallback": self.fallback.to_string(),
             "exact_checks": self.exact_checks.to_string(),
-        })
+        });
+        // Only when on: the hashes of configurations without timers do not change.
+        if self.phase_times {
+            j["phase_times"] = json!("on");
+        }
+        j
     }
 
     /// Whether efforts below `k` are not applicable (the collector returns at most `L`

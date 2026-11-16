@@ -21,11 +21,15 @@
 //!   probe), bitmap word operations, scatters and enumeration.
 //! - **Probe**: ns per sampled point of a sketch probe (every clause evaluated on random points,
 //!   prefetched like the probe).
-//! - **Graph search** (when a graph is given): random base points as queries, global start,
-//!   heap(K = 10) collection, mode-1 predicate; list sizes 10…2560. A predicate-free search
-//!   (deferred evaluation) gives ns per distance computation (adjacency, visited set and beam
-//!   included); the eager search with the calibration predicates gives ns per predicate
-//!   evaluation; a least-squares line of distance computations against L gives `α`, `β`.
+//! - **Graph search** (when a graph is given): random base points as queries, starting as the
+//!   crossover's graph route does (`label(c*)+global` when the start table has per-label
+//!   starts, else the global start), heap(K = 10) collection, mode-1 predicate; list sizes
+//!   10…2560. A predicate-free search (deferred evaluation) gives ns per distance computation
+//!   (adjacency, visited set and beam included); the eager search with the calibration
+//!   predicates gives ns per predicate evaluation and the distance computations per list size
+//!   (`D(L)`, also summarized by a least-squares line `α`, `β`); `heap_bound` searches at
+//!   K = 10 and 100 give the predicate evaluations beyond `K/r` per list size
+//!   (`extra(K, L)`), `distance_first` searches their share of the distances.
 
 use std::{path::Path, time::Instant};
 
@@ -36,7 +40,7 @@ use crate::{
     bitsets::LabelBitsets,
     kernel::{
         collect::{Answers, Collector},
-        config::{Collector as Coll, Kernel, Laziness},
+        config::{Collector as Coll, Kernel, Laziness, StartSource},
         cost::UnitCosts,
         eval::{Compiled, Eval, EvalCtx, RowScan, StaticBits, Weights},
         exact,
@@ -398,6 +402,8 @@ pub fn calibrate<T: Element>(
     // Graph search.
     let mut graph_doc = Value::Null;
     let (mut heap_bound_k, mut heap_bound_extra) = (Vec::new(), Vec::new());
+    let (mut heap_bound_l, mut heap_bound_extra_kl) = (Vec::new(), Vec::new());
+    let (mut graph_l, mut graph_l_dists) = (Vec::new(), Vec::new());
     let mut distance_first_frac = 0.0;
     let (mut graph_dist_ns, mut graph_pred_ns, mut graph_alpha, mut graph_beta) = {
         let d = UnitCosts::default();
@@ -411,12 +417,19 @@ pub fn calibrate<T: Element>(
     if let Some(gpath) = graph {
         let g = data::load_graph(gpath, starts, T::DTYPE)?;
         ensure!(g.graph.n_data() == n, "the graph has another point count");
+        // With per-label starts, the searches start as the crossover's graph route does.
+        let label_starts = g.starts.as_ref().filter(|s| s.n_labels() > 0);
+        let start_policy = if label_starts.is_some() {
+            vec![StartSource::LabelSmallest, StartSource::Global]
+        } else {
+            vec![StartSource::Global]
+        };
         let ix = Index {
             graph: &g.graph,
             vectors: g.graph.vectors(base)?,
             labels,
             global: &g.global,
-            label_starts: None,
+            label_starts,
             sample: None,
             label_view: false,
             view_postings: None,
@@ -427,11 +440,13 @@ pub fn calibrate<T: Element>(
         };
         let mut eager = Kernel {
             collector: Coll::Heap,
+            starts: start_policy.clone(),
             ..Kernel::default()
         };
         eager.laziness = Laziness::Eager;
         let deferred = Kernel {
             laziness: Laziness::Deferred,
+            starts: start_policy.clone(),
             ..Kernel::default()
         };
         let plans = [
@@ -502,6 +517,11 @@ pub fn calibrate<T: Element>(
         let sxx: f64 = xs.iter().map(|x| (x - mx) * (x - mx)).sum();
         graph_alpha = (sxy / sxx).max(0.0);
         graph_beta = (my - graph_alpha * mx).max(0.0);
+        // The measured curve itself (the line misses its curvature: ×0.5–1.4 at the ends).
+        if ys.iter().all(|&y| y > 0.0) {
+            graph_l = xs.clone();
+            graph_l_dists = ys.clone();
+        }
 
         // Laziness: predicate evaluations of `heap_bound` searches beyond K/r (r: the
         // predicate's match rate on random points; searches capped by their distance count
@@ -512,6 +532,7 @@ pub fn calibrate<T: Element>(
         let lazy = |laziness| Kernel {
             collector: Coll::Heap,
             laziness,
+            starts: start_policy.clone(),
             ..Kernel::default()
         };
         let (hb, dfk) = (lazy(Laziness::HeapBound), lazy(Laziness::DistanceFirst));
@@ -522,11 +543,14 @@ pub fn calibrate<T: Element>(
         let mut st = Searcher::for_index(&ix, &[&lazy_plans[0], &lazy_plans[1]]);
         let mut fracs = Vec::new();
         let mut lazy_rows = Vec::new();
+        let mut table = Vec::new();
         for &kk in &[10usize, 100] {
             let (mut ids, mut ds) = (vec![0u32; kk], vec![0f32; kk]);
             let mut extra = Vec::new();
-            for &l in &[100usize, 400, 1600] {
+            let mut row = Vec::new();
+            for &l in &ls {
                 let (mut hp, mut hd) = (0.0, 0.0);
+                let mut extra_l = Vec::new();
                 for i in 0..qrows.len() {
                     let pi = i % preds.len().max(1);
                     let q = Query {
@@ -538,13 +562,15 @@ pub fn calibrate<T: Element>(
                     hp += c.n_pred as f64;
                     hd += c.n_dist as f64;
                     if rates[pi] >= 0.01 && c.n_pred < c.n_dist {
-                        extra.push(c.n_pred as f64 - kk as f64 / rates[pi]);
+                        extra_l.push(c.n_pred as f64 - kk as f64 / rates[pi]);
                     }
                     let c = st.search(&lazy_plans[1], &ix, &q, l, &mut ids, &mut ds, None);
                     if c.n_dist > 0 {
                         fracs.push(c.n_pred as f64 / c.n_dist as f64);
                     }
                 }
+                extra.extend_from_slice(&extra_l);
+                row.push((!extra_l.is_empty()).then(|| median(&mut extra_l).max(0.0)));
                 let q = qrows.len().max(1) as f64;
                 lazy_rows.push(json!({"K": kk, "L": l, "heap_bound_n_pred": hp / q,
                     "heap_bound_n_dist": hd / q}));
@@ -552,14 +578,29 @@ pub fn calibrate<T: Element>(
             if !extra.is_empty() {
                 heap_bound_k.push(kk as f64);
                 heap_bound_extra.push(median(&mut extra).max(0.0));
+                table.push(row);
             }
+        }
+        // extra(K, L) where every heap size has a value at the list size.
+        let full: Vec<usize> = (0..ls.len())
+            .filter(|&j| table.iter().all(|r| r[j].is_some()))
+            .collect();
+        if !table.is_empty() && full.len() >= 2 {
+            heap_bound_l = full.iter().map(|&j| ls[j] as f64).collect();
+            heap_bound_extra_kl = table
+                .iter()
+                .map(|r| full.iter().map(|&j| r[j].unwrap_or(0.0)).collect())
+                .collect();
         }
         if !fracs.is_empty() {
             distance_first_frac = median(&mut fracs).clamp(0.0, 1.0);
         }
         graph_doc = json!({"graph": gpath, "queries": qrows.len(), "by_L": by_l,
+            "starts": if label_starts.is_some() { "label(c*)+global" } else { "global" },
             "laziness": {"rates": rates, "by_K_L": lazy_rows, "heap_bound_k": heap_bound_k,
-                "heap_bound_extra": heap_bound_extra, "distance_first_frac": distance_first_frac}});
+                "heap_bound_extra": heap_bound_extra, "heap_bound_l": heap_bound_l,
+                "heap_bound_extra_kl": heap_bound_extra_kl,
+                "distance_first_frac": distance_first_frac}});
     }
 
     let costs = UnitCosts {
@@ -584,6 +625,10 @@ pub fn calibrate<T: Element>(
         heap_bound_k,
         heap_bound_extra,
         distance_first_frac,
+        graph_l,
+        graph_l_dists,
+        heap_bound_l,
+        heap_bound_extra_kl,
     };
     costs.validate()?;
     details.insert("graph".into(), graph_doc);

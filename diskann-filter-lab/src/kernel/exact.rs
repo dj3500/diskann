@@ -40,7 +40,7 @@ use super::{
     cost::ExactPlan,
     eval::{check, ClauseSearch, Eval, EvalCtx, RowScan, StaticBits},
     materialize::{merge_distinct, Materialized},
-    search::{Counters, EvalMode},
+    search::{tic, toc, Counters, EvalMode},
 };
 use crate::{graph::NodeVectors, vectors::Element};
 
@@ -379,23 +379,38 @@ fn planned<T: Element, P: Eval>(
     let checks = cx.q.n_clauses() > 1;
     match plan {
         ExactPlan::Scan | ExactPlan::DistanceFirst => {
+            let t = tic(ctr);
             let inplace = candidates(cx, n_data, mat);
             let cands: &[u32] = inplace.unwrap_or(&mat.cands);
+            toc(t, &mut ctr.t_cand_ns);
             ctr.n_exact_cand += cands.len() as u64;
             if plan == ExactPlan::DistanceFirst {
+                let t = tic(ctr);
                 distance_first::<T, P>(cx, cands, checks, vectors, query, answers, seeded, ctr);
+                toc(t, &mut ctr.t_dist_ns);
             } else if checks {
+                let t = tic(ctr);
                 filter::<P>(cx, cands, &mut mat.matches, ctr);
+                toc(t, &mut ctr.t_check_ns);
+                let t = tic(ctr);
                 distances(&mat.matches, vectors, query, answers, seeded, ctr);
+                toc(t, &mut ctr.t_dist_ns);
             } else {
+                let t = tic(ctr);
                 distances(cands, vectors, query, answers, seeded, ctr);
+                toc(t, &mut ctr.t_dist_ns);
             }
         }
         ExactPlan::Gallop => {
+            let t = tic(ctr);
             ctr.n_exact_cand += mat.build_sparse(cx.labels, cx.q, n_data);
+            toc(t, &mut ctr.t_check_ns);
+            let t = tic(ctr);
             distances(&mat.sparse, vectors, query, answers, seeded, ctr);
+            toc(t, &mut ctr.t_dist_ns);
         }
         ExactPlan::Bitmap => {
+            let t = tic(ctr);
             mat.ensure_dense(n_data);
             if cx.stat.n_points() == n_data {
                 mat.build_dense_static(cx.labels, cx.q, n_data, cx.stat);
@@ -413,7 +428,10 @@ fn planned<T: Element, P: Eval>(
                 }
             }
             ctr.n_exact_cand += out.len() as u64;
+            toc(t, &mut ctr.t_check_ns);
+            let t = tic(ctr);
             distances(&mat.matches, vectors, query, answers, seeded, ctr);
+            toc(t, &mut ctr.t_dist_ns);
         }
     }
 }

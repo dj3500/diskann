@@ -484,8 +484,12 @@ fn static_bits_do_not_change_answers_or_counters() {
             let pb = Plan::new(&k, &ix).unwrap();
             for q in 0..f.preds.len() {
                 for l in [10, 30] {
-                    let (oa, ca) = search(&f, &mut st, &pa, q, l, 10, None);
-                    let (ob, cb) = search(&f, &mut st, &pb, q, l, 10, None);
+                    let (oa, mut ca) = search(&f, &mut st, &pa, q, l, 10, None);
+                    let (ob, mut cb) = search(&f, &mut st, &pb, q, l, 10, None);
+                    // The residual shape counts labels by bitset, i.e. follows the split's θ.
+                    for c in [&mut ca, &mut cb] {
+                        [c.res_words, c.res_rows, c.c1_words, c.c1_rows] = [0; 4];
+                    }
                     assert_eq!((oa, ca), (ob, cb), "{e:?} static_bits({theta}) q={q} L={l}");
                     static_preds += cb.n_pred;
                 }

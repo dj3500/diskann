@@ -270,6 +270,30 @@ impl Compiled {
         !split || self.residual_rows
     }
 
+    /// Labels of the residual clauses (positions `1..`) checked by static-bitset word and in
+    /// the row, over all residual clauses and in clause 1: `[words, rows, words₁, rows₁]`
+    /// (without static bitsets, `split` false, every label is a row label).
+    pub fn residual_shape(&self, split: bool) -> [u64; 4] {
+        let mut s = [0u64; 4];
+        if self.empty {
+            return s;
+        }
+        for j in 1..self.n_clauses {
+            let (w, r) = if split {
+                (self.static_slots(j).len(), self.row_labels(j).len())
+            } else {
+                (0, self.clause(j).len())
+            };
+            s[0] += w as u64;
+            s[1] += r as u64;
+            if j == 1 {
+                s[2] = w as u64;
+                s[3] = r as u64;
+            }
+        }
+        s
+    }
+
     /// Bitset slots of the clause at position `j` (after [`Self::split_static`]).
     #[inline(always)]
     pub fn static_slots(&self, j: usize) -> &[u32] {

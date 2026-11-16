@@ -32,12 +32,14 @@
 //! (`gallop(p/s)`, cache misses in long lists). Calibrations without these curves (batch B6)
 //! use the miss-dominated `pred` curve and a constant `gallop`.
 //!
-//! Graph search at list size `L` computes `D = α·L + β` distances and evaluates `P`
-//! predicates: `P = D` when every distance pays one (eager), `P = min(D, K/r + extra(K))`
+//! Graph search at list size `L` computes `D(L)` distances (measured at list sizes from 10 to
+//! 2,560 and interpolated log-log; older calibrations: the line `α·L + β`) and evaluates `P`
+//! predicates: `P = D` when every distance pays one (eager), `P = min(D, K/r + extra(K, L))`
 //! under `heap_bound` laziness (the heap fills after about `K/r` evaluations at match rate
-//! `r`; afterwards only nodes inside the K-th distance are checked, a number that hardly
-//! grows with `L`), `P = φ·D` under `distance_first`; it costs `D·dist_g + P·pred_g`. The
-//! laziness terms are calibrated; without them `P = D` (batch B6).
+//! `r`; afterwards the nodes found inside the K-th distance are checked, a number that grows
+//! sublinearly with `L`: measured per list size, older calibrations one `extra(K)`),
+//! `P = φ·D` under `distance_first`; it costs `D·dist_g + P·pred_g`. The laziness terms are
+//! calibrated; without them `P = D` (batch B6).
 
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +100,20 @@ pub struct UnitCosts {
     /// not calibrated, then one per distance).
     #[serde(default)]
     pub distance_first_frac: f64,
+    /// Distance computations of graph searches measured at the list sizes `graph_l`
+    /// (increasing): `graph_l_dists`, interpolated log-log; empty in older calibrations (then
+    /// the line `graph_alpha · L + graph_beta`).
+    #[serde(default)]
+    pub graph_l: Vec<f64>,
+    #[serde(default)]
+    pub graph_l_dists: Vec<f64>,
+    /// `heap_bound` searches: `extra(K, L)` at the heap sizes `heap_bound_k` (rows) and the
+    /// list sizes `heap_bound_l` (columns, increasing); empty in older calibrations (then
+    /// `heap_bound_extra`, one value per heap size).
+    #[serde(default)]
+    pub heap_bound_l: Vec<f64>,
+    #[serde(default)]
+    pub heap_bound_extra_kl: Vec<Vec<f64>>,
 }
 
 impl Default for UnitCosts {
@@ -126,8 +142,26 @@ impl Default for UnitCosts {
             heap_bound_k: Vec::new(),
             heap_bound_extra: Vec::new(),
             distance_first_frac: 0.0,
+            graph_l: Vec::new(),
+            graph_l_dists: Vec::new(),
+            heap_bound_l: Vec::new(),
+            heap_bound_extra_kl: Vec::new(),
         }
     }
+}
+
+/// Log-log interpolation of the positive values `ys` over the increasing positive `xs` at `x`,
+/// extended beyond the ends with the end segments' slopes (a power law; one point: constant).
+fn loglog(xs: &[f64], ys: &[f64], x: f64) -> f64 {
+    let n = xs.len();
+    if n == 1 {
+        return ys[0];
+    }
+    let i = xs.partition_point(|&v| v <= x).clamp(1, n - 1);
+    let (x0, x1) = (xs[i - 1].ln(), xs[i].ln());
+    let (y0, y1) = (ys[i - 1].ln(), ys[i].ln());
+    let t = (x.max(1e-9).ln() - x0) / (x1 - x0);
+    (y0 + t * (y1 - y0)).exp()
 }
 
 impl UnitCosts {
@@ -174,6 +208,24 @@ impl UnitCosts {
             "heap_bound sizes must increase from at least 1, one value each"
         );
         anyhow::ensure!(
+            self.graph_l.len() == self.graph_l_dists.len()
+                && self.graph_l.windows(2).all(|w| w[0] < w[1])
+                && self.graph_l.iter().all(|&l| l >= 1.0)
+                && self.graph_l_dists.iter().all(|&d| d > 0.0),
+            "graph list sizes must increase from at least 1, one positive distance count each"
+        );
+        anyhow::ensure!(
+            self.heap_bound_l.windows(2).all(|w| w[0] < w[1])
+                && self.heap_bound_l.iter().all(|&l| l >= 1.0)
+                && (self.heap_bound_l.is_empty() && self.heap_bound_extra_kl.is_empty()
+                    || self.heap_bound_extra_kl.len() == self.heap_bound_k.len()
+                        && self
+                            .heap_bound_extra_kl
+                            .iter()
+                            .all(|r| r.len() == self.heap_bound_l.len())),
+            "extra(K, L) needs one row per heap size and one value per list size"
+        );
+        anyhow::ensure!(
             scalars
                 .iter()
                 .chain(&[self.distance_first_frac])
@@ -183,6 +235,7 @@ impl UnitCosts {
                 .chain(&self.pred_bits_ns)
                 .chain(&self.gallop_gap_ns)
                 .chain(&self.heap_bound_extra)
+                .chain(self.heap_bound_extra_kl.iter().flatten())
                 .all(|x| x.is_finite() && *x >= 0.0),
             "unit costs must be finite and non-negative"
         );
@@ -251,9 +304,18 @@ impl UnitCosts {
         v[i - 1] + t * (v[i] - v[i - 1])
     }
 
+    /// Model cost of a sketch probe that merges `merged` sketch entries and evaluates
+    /// `evaluated` sampled points.
+    pub fn probe(&self, merged: f64, evaluated: f64) -> f64 {
+        merged * self.sketch_ns + evaluated * self.probe_ns
+    }
+
     /// Distance computations of a graph search at list size `l`.
     pub fn graph_dists(&self, l: f64) -> f64 {
-        self.graph_alpha * l + self.graph_beta
+        if self.graph_l.is_empty() {
+            return self.graph_alpha * l + self.graph_beta;
+        }
+        loglog(&self.graph_l, &self.graph_l_dists, l)
     }
 
     /// Nominal cost of an eager graph search at list size `l` (every distance with a
@@ -262,19 +324,33 @@ impl UnitCosts {
         self.graph_dists(l) * (self.graph_dist_ns + self.graph_pred_ns)
     }
 
-    /// `extra(K)` of `heap_bound`: power-law interpolation between the calibrated heap
-    /// sizes, extended with the nearest segment's slope (a single size scales with `K`).
-    fn heap_bound_extra(&self, k: f64) -> f64 {
-        let (ks, xs) = (&self.heap_bound_k, &self.heap_bound_extra);
+    /// `extra(K, L)` of `heap_bound`: per calibrated heap size, log-log in the list size
+    /// (with `extra(K, L)` table) or the size's single value; then power-law interpolation
+    /// between the heap sizes, extended with the nearest segment's slope (a single size
+    /// scales with `K`).
+    fn heap_bound_extra(&self, k: f64, l: f64) -> f64 {
+        let ks = &self.heap_bound_k;
+        let at = |i: usize| -> f64 {
+            if self.heap_bound_l.is_empty() {
+                self.heap_bound_extra[i]
+            } else {
+                // A floor of one evaluation keeps the logarithms finite.
+                let row: Vec<f64> = self.heap_bound_extra_kl[i]
+                    .iter()
+                    .map(|&x| x.max(1.0))
+                    .collect();
+                loglog(&self.heap_bound_l, &row, l)
+            }
+        };
         if let Some(i) = ks.iter().position(|&x| x == k) {
-            return xs[i];
+            return at(i);
         }
         if ks.len() == 1 {
-            return xs[0] * k / ks[0];
+            return at(0) * k / ks[0];
         }
         let i = ks.partition_point(|&x| x <= k).clamp(1, ks.len() - 1);
         let (k0, k1) = (ks[i - 1], ks[i]);
-        let (x0, x1) = (xs[i - 1].max(1e-9), xs[i].max(1e-9));
+        let (x0, x1) = (at(i - 1).max(1e-9), at(i).max(1e-9));
         let slope = (x1.ln() - x0.ln()) / (k1.ln() - k0.ln());
         (x0.ln() + slope * (k.max(1.0).ln() - k0.ln())).exp()
     }
@@ -287,7 +363,7 @@ impl UnitCosts {
             Laziness::HeapBound if !self.heap_bound_k.is_empty() => {
                 if rate > 0.0 {
                     let k = k.max(1) as f64;
-                    d.min(k / rate.min(1.0) + self.heap_bound_extra(k))
+                    d.min(k / rate.min(1.0) + self.heap_bound_extra(k, l))
                 } else {
                     d
                 }
@@ -764,6 +840,48 @@ mod tests {
         assert!(c.validate().is_err());
         c.gallop_gap = vec![1.0, 100.0];
         c.heap_bound_extra.pop();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn measured_graph_curves_interpolate_log_log() {
+        let line = UnitCosts {
+            heap_bound_k: vec![10.0, 100.0],
+            heap_bound_extra: vec![100.0, 400.0],
+            ..UnitCosts::default()
+        };
+        let mut c = UnitCosts {
+            graph_l: vec![10.0, 100.0, 1000.0],
+            graph_l_dists: vec![100.0, 500.0, 2000.0],
+            heap_bound_l: vec![10.0, 100.0, 1000.0],
+            heap_bound_extra_kl: vec![vec![100.0, 200.0, 400.0], vec![300.0, 600.0, 1200.0]],
+            ..line.clone()
+        };
+        c.validate().unwrap();
+        // Without the curves: the line and one extra(K) per heap size.
+        assert_eq!(line.graph_dists(100.0), 10.0 * 100.0 + 200.0);
+        assert_eq!(
+            line.graph_preds(1000.0, 100, 1.0, Laziness::HeapBound),
+            100.0 + 400.0
+        );
+        // The measured points; a power law between them and beyond the ends.
+        assert!((c.graph_dists(100.0) - 500.0).abs() < 1e-9);
+        let mid = c.graph_dists(10f64.powf(1.5));
+        assert!((mid - 100.0 * 5f64.sqrt()).abs() < 1e-6, "{mid}");
+        assert!((c.graph_dists(10_000.0) - 8000.0).abs() < 1e-6);
+        // extra(K, L): the table, log-log in L, power law in K.
+        let p = |l: f64, k: usize| c.graph_preds(l, k, 1.0, Laziness::HeapBound) - k as f64;
+        assert!((p(100.0, 10) - 200.0).abs() < 1e-9);
+        assert!((p(1000.0, 100) - 1200.0).abs() < 1e-6);
+        assert!((p(10f64.powf(1.5), 10) - 100.0 * 2f64.sqrt()).abs() < 1e-6);
+        let k_mid = c.graph_preds(100.0, 30, 1.0, Laziness::HeapBound) - 30.0;
+        let want = 200.0 * 3f64.powf(3f64.ln() / 10f64.ln());
+        assert!((k_mid - want).abs() < 1e-6, "power law in K: {k_mid}");
+        // Shapes are checked.
+        c.heap_bound_extra_kl[1].pop();
+        assert!(c.validate().is_err());
+        c.heap_bound_extra_kl[1].push(1200.0);
+        c.graph_l_dists[0] = 0.0;
         assert!(c.validate().is_err());
     }
 

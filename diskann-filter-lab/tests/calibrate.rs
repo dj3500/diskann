@@ -135,6 +135,15 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
     assert!(curve("heap_bound_extra")
         .iter()
         .all(|x| x.is_finite() && *x >= 0.0));
+    // The measured distance counts per list size and extra(K, L) per list size.
+    let ls = curve("graph_l");
+    assert_eq!(ls.len(), 9, "{ls:?}");
+    assert!(curve("graph_l_dists").iter().all(|x| *x > 0.0));
+    let hl = curve("heap_bound_l");
+    assert!(hl.len() >= 2, "{hl:?}");
+    let rows = c["heap_bound_extra_kl"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.as_array().unwrap().len() == hl.len()));
     let frac = c["distance_first_frac"].as_f64().unwrap();
     assert!(frac > 0.0 && frac <= 1.0, "{frac}");
     // The report reads back as unit costs.
