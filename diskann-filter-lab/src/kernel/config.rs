@@ -69,6 +69,10 @@ pub enum Admission {
     /// Nodes satisfying the clauses whose labels all lie in the named categories (only these
     /// clauses are evaluated during the search).
     Projection(Vec<String>),
+    /// Nodes satisfying the query's clause with the smallest `U_c` (`projection(c*)`, the
+    /// binding clause, chosen per query from the posting sizes; only that clause is evaluated
+    /// during the search).
+    ProjectionSmallest,
     /// Nodes failing at most `τ` clauses (unit count).
     Cutoff(u32),
 }
@@ -596,6 +600,7 @@ impl Admission {
                 arity(&name, &args, 0)?;
                 Self::Strict
             }
+            "projection" if args.len() == 1 && args[0] == "c*" => Self::ProjectionSmallest,
             "projection" => {
                 ensure!(
                     !args.is_empty(),
@@ -618,6 +623,7 @@ impl fmt::Display for Admission {
             Self::All => write!(f, "all"),
             Self::Strict => write!(f, "strict"),
             Self::Projection(c) => write!(f, "projection({})", c.join(", ")),
+            Self::ProjectionSmallest => write!(f, "projection(c*)"),
             Self::Cutoff(t) => write!(f, "cutoff({t})"),
         }
     }
@@ -1123,7 +1129,10 @@ impl Kernel {
                 self.admission
             );
             ensure!(
-                !matches!(self.admission, Admission::Projection(_)),
+                !matches!(
+                    self.admission,
+                    Admission::Projection(_) | Admission::ProjectionSmallest
+                ),
                 "a clause projection cannot be evaluated on a materialized match set"
             );
         }
@@ -1381,7 +1390,13 @@ mod tests {
             StartSource::parse_list("sample(10)+global").unwrap(),
             [StartSource::Sample(10), StartSource::Global]
         );
-        for s in ["all", "strict", "projection(C3, C4)", "cutoff(1)"] {
+        for s in [
+            "all",
+            "strict",
+            "projection(C3, C4)",
+            "projection(c*)",
+            "cutoff(1)",
+        ] {
             assert_eq!(Admission::parse(s).unwrap().to_string(), s);
         }
         for s in [
