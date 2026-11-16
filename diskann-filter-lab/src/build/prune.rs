@@ -25,7 +25,10 @@ use std::{cmp::Ordering, fmt, str::FromStr};
 use anyhow::{bail, ensure, Context, Result};
 use bytemuck::{Pod, Zeroable};
 
-use super::{is_subset, signature, LabelInfo, Points};
+use super::{
+    candidates::{Penalty, PenaltyScratch, PruneKey},
+    is_subset, signature, LabelInfo, Points,
+};
 use crate::vectors::Element;
 
 /// A pool entry: a candidate node and its squared distance from the node being pruned.
@@ -66,9 +69,15 @@ pub enum PruneRule {
     /// C++ library (`Index::occlude_list`): a selected `r` may occlude a candidate `c` only if
     /// every label of `c` is a label of `r` (`F_c ⊆ F_r`), whatever the labels of `p`.
     LabelContainment { r: usize, alpha: f32 },
-    /// `source_containment(R, α)`: the FilteredVamana paper's rule (Algorithm 3): `r` may
-    /// occlude `c` only if `F_p ∩ F_c ⊆ F_r`.
-    SourceContainment { r: usize, alpha: f32 },
+    /// `source_containment(R, α[, θ])`: the FilteredVamana paper's rule (Algorithm 3): `r` may
+    /// occlude `c` only if `F_p ∩ F_c ⊆ F_r`. With `θ`, only labels with at most `θ` points
+    /// count (`F_p ∩ F_c ∩ Θ ⊆ F_r`, `Θ` = labels with at most `θ` points): the rule then
+    /// protects exactly the labels a capped filtered insertion builds structure for.
+    SourceContainment {
+        r: usize,
+        alpha: f32,
+        theta: Option<u32>,
+    },
     /// `coverage(R, α, B[, k])`: coverage-budgeted pruning. The first `R − B` neighbors of the
     /// label-blind RobustPrune are kept; then, for the labels of `p` from the rarest (fewest
     /// points) to the most frequent, while a label has fewer than `k` neighbors carrying it
@@ -126,7 +135,16 @@ impl PruneRule {
         match *self {
             Self::Alpha { r, alpha } => format!("alpha-R{r}-a{alpha}"),
             Self::LabelContainment { r, alpha } => format!("lc-R{r}-a{alpha}"),
-            Self::SourceContainment { r, alpha } => format!("sc-R{r}-a{alpha}"),
+            Self::SourceContainment {
+                r,
+                alpha,
+                theta: None,
+            } => format!("sc-R{r}-a{alpha}"),
+            Self::SourceContainment {
+                r,
+                alpha,
+                theta: Some(t),
+            } => format!("sc-R{r}-a{alpha}-t{t}"),
             Self::Coverage {
                 r,
                 alpha,
@@ -183,6 +201,7 @@ impl PruneRule {
             inter,
             inter_offsets,
             inter_sigs,
+            protected,
             n_dist,
             n_label_checks,
             ..
@@ -209,9 +228,19 @@ impl PruneRule {
                 };
                 robust_prune(pool, states, selected, r, alpha, permit, &mut dist);
             }
-            Self::SourceContainment { r, alpha } => {
+            Self::SourceContainment { r, alpha, theta } => {
                 let labels = labels.expect(NEEDS_LABELS);
-                let f_p = labels.row(source);
+                let mut f_p = labels.row(source);
+                if let Some(t) = theta {
+                    let store = labels.store();
+                    protected.clear();
+                    protected.extend(
+                        f_p.iter()
+                            .copied()
+                            .filter(|&l| store.posting_len(l) <= t as usize),
+                    );
+                    f_p = &protected[..];
+                }
                 inter.clear();
                 inter_offsets.clear();
                 inter_sigs.clear();
@@ -329,7 +358,16 @@ impl fmt::Display for PruneRule {
         match *self {
             Self::Alpha { r, alpha } => write!(f, "alpha({r}, {alpha})"),
             Self::LabelContainment { r, alpha } => write!(f, "label_containment({r}, {alpha})"),
-            Self::SourceContainment { r, alpha } => write!(f, "source_containment({r}, {alpha})"),
+            Self::SourceContainment {
+                r,
+                alpha,
+                theta: None,
+            } => write!(f, "source_containment({r}, {alpha})"),
+            Self::SourceContainment {
+                r,
+                alpha,
+                theta: Some(t),
+            } => write!(f, "source_containment({r}, {alpha}, {t})"),
             Self::Coverage {
                 r,
                 alpha,
@@ -348,7 +386,7 @@ impl fmt::Display for PruneRule {
 impl FromStr for PruneRule {
     type Err = anyhow::Error;
 
-    /// `alpha(R[, α])`, `label_containment(R[, α])`, `source_containment(R[, α])`,
+    /// `alpha(R[, α])`, `label_containment(R[, α])`, `source_containment(R[, α[, θ]])`,
     /// `coverage(R, α, B[, k])`, `split(R_geo, R_lab[, α])`; α defaults to 1.2, k to 1.
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
@@ -400,10 +438,17 @@ impl FromStr for PruneRule {
                 }
             }
             "source_containment" => {
-                arity(1, 2)?;
+                arity(1, 3)?;
                 Self::SourceContainment {
                     r: int(0)?,
                     alpha: real(1)?,
+                    theta: if args.len() > 2 {
+                        Some(u32::try_from(int(2)?).with_context(|| {
+                            format!("pruning rule {s:?}: θ does not fit in 32 bits")
+                        })?)
+                    } else {
+                        None
+                    },
                 }
             }
             "coverage" => {
@@ -444,10 +489,14 @@ pub struct PruneScratch {
     inter: Vec<u32>,
     inter_offsets: Vec<u32>,
     inter_sigs: Vec<u64>,
+    /// The labels of the pruned node that a capped containment rule protects.
+    protected: Vec<u32>,
     /// Candidate buffer of back-edge re-prunes.
     pool: Vec<Candidate>,
     /// Back-edge sources not yet in a row.
     pub(crate) fresh: Vec<u32>,
+    /// Label marks of penalized re-prunes.
+    pub(crate) penalty: PenaltyScratch,
     /// Distance computations between pool candidates (occlusion tests).
     pub n_dist: u64,
     /// Label occlusion-permission tests.
@@ -587,8 +636,9 @@ pub(crate) fn fresh_sources(row: &[u32], sources: impl Iterator<Item = u32>, out
 }
 
 /// Re-prunes node `t` over its current neighbors `row` and the new sources `fresh`
-/// (upstream's `add_edge_and_prune` when the row would overflow): distances from `t`, pool
-/// order, truncated to `maxc`; the result goes to `out`.
+/// (upstream's `add_edge_and_prune` when the row would overflow): distances from `t` (with a
+/// penalty whose prune key is [`PruneKey::Penalized`]: the penalized keys), pool order,
+/// truncated to `maxc`; the result goes to `out`.
 #[expect(
     clippy::too_many_arguments,
     reason = "internal helper shared by build and replay"
@@ -597,6 +647,7 @@ pub(crate) fn reprune<T: Element>(
     rule: &PruneRule,
     points: &Points<'_, T>,
     labels: Option<&LabelInfo<'_>>,
+    penalty: Option<&Penalty<'_>>,
     t: u32,
     row: &[u32],
     fresh: &[u32],
@@ -611,6 +662,11 @@ pub(crate) fn reprune<T: Element>(
         pool.push(Candidate::new(v, T::squared_l2(tv, points.get(v))));
     }
     scratch.n_dist_source += pool.len() as u64;
+    if let Some(pen) = penalty.filter(|p| p.key == PruneKey::Penalized) {
+        pen.begin(&mut scratch.penalty, t);
+        pen.penalize(&scratch.penalty, &mut pool);
+        pen.end(&mut scratch.penalty);
+    }
     normalize_pool(&mut pool, t, maxc);
     rule.prune(points, labels, t, &pool, scratch, out);
     scratch.pool = pool;
@@ -653,6 +709,7 @@ mod tests {
             "alpha(64, 1.2)",
             "label_containment(32, 1.3)",
             "source_containment(48, 1.2)",
+            "source_containment(48, 1.2, 10000)",
             "coverage(64, 1.2, 16, 2)",
             "split(32, 16, 1.2)",
         ] {
@@ -740,15 +797,46 @@ mod tests {
         assert_eq!(ids(&out), vec![1, 4]);
         // F_p ∩ F_c ⊆ F_r with F_p = {a}: every candidate's common part is ⊆ {a} or empty, so
         // the rule acts like the label-blind one here.
-        PruneRule::SourceContainment { r: 8, alpha: 1.2 }.prune(
-            &p,
-            Some(&info),
-            0,
-            &pool,
-            &mut s,
-            &mut out,
-        );
+        PruneRule::SourceContainment {
+            r: 8,
+            alpha: 1.2,
+            theta: None,
+        }
+        .prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
         assert_eq!(ids(&out), vec![1]);
+    }
+
+    #[test]
+    fn capped_source_containment_protects_only_rare_labels() {
+        // Source 0 {a, r} at 0; 1 {x} at 1; 2 {a} at 2 (occluded by 1 for a label-blind rule);
+        // 3 {a} far away (not in the pool) makes `a` the frequent label.
+        let m = line(&[0.0, 1.0, 2.0, 100.0]);
+        let p = Points::new(&m, &[]);
+        let store = labels(&[&["a", "r"], &["x"], &["a"], &["a"]]);
+        let info = LabelInfo::new(&store);
+        let pool = pool_of(&p, 0, &[1, 2]);
+        let mut s = PruneScratch::default();
+        let mut out = Vec::new();
+        let sc = |theta| PruneRule::SourceContainment {
+            r: 8,
+            alpha: 1.2,
+            theta,
+        };
+        // F_0 ∩ F_2 = {a} is not on 1: the paper's rule keeps 2.
+        sc(None).prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
+        assert_eq!(ids(&out), vec![1, 2]);
+        // With θ = 1 only labels with at most one point (r, x) are protected: 2 shares no
+        // protected label with 0, so 1 occludes it as in the label-blind rule.
+        sc(Some(1)).prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
+        assert_eq!(ids(&out), vec![1]);
+        assert_eq!(sc(Some(1)).to_string(), "source_containment(8, 1.2, 1)");
+        assert_eq!(
+            "source_containment(8, 1.2, 1)"
+                .parse::<PruneRule>()
+                .unwrap(),
+            sc(Some(1))
+        );
+        assert_eq!(sc(Some(7)).tag(), "sc-R8-a1.2-t7");
     }
 
     #[test]
@@ -812,7 +900,18 @@ mod tests {
         let mut s = PruneScratch::default();
         let mut out = Vec::new();
         let rule = PruneRule::Alpha { r: 8, alpha: 1.2 };
-        reprune(&rule, &p, None, 0, &[1, 2], &[3, 4], 750, &mut s, &mut out);
+        reprune(
+            &rule,
+            &p,
+            None,
+            None,
+            0,
+            &[1, 2],
+            &[3, 4],
+            750,
+            &mut s,
+            &mut out,
+        );
         assert_eq!(ids(&out), vec![1, 3]);
         assert_eq!(s.n_dist_source, 4);
     }

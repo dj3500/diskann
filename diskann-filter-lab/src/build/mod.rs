@@ -9,6 +9,8 @@
 //!   every point searches the graph as it was before the batch, so the result depends only
 //!   on the insertion order and the batch schedule, never on the thread count. It can record
 //!   every point's candidate pool ([`pools`]).
+//! - [`candidates`]: label-aware candidate generation for the insertions (label-filtered
+//!   searches per label, or a search penalized by the number of failed categories).
 //! - [`prune`]: pruning rules — label-blind α-RobustPrune, label-aware occlusion
 //!   (FilteredVamana's containment rule), coverage budgets and degree splits.
 //! - [`replay`]: *prune replay* — the adjacency rebuilt from recorded pools with another
@@ -19,6 +21,7 @@
 //! Auxiliary nodes carry no labels.
 
 pub mod builder;
+pub mod candidates;
 pub mod cli;
 pub mod pools;
 pub mod prune;
@@ -35,6 +38,7 @@ use crate::{
 };
 
 pub use builder::{build, BuildOutput, BuildParams, BuildStats, Order};
+pub use candidates::{Candidates, LabelSubset, Lambda, PruneKey};
 pub use pools::Pools;
 pub use prune::{Candidate, PruneRule};
 pub use replay::{replay, ReplayMode, ReplayOutput, ReplayParams};
