@@ -26,7 +26,8 @@ pub(crate) trait Ranking {
     #[inline(always)]
     fn prepare(&mut self, _v: u32) {}
 
-    /// The list key of node `v` at squared distance `d`.
+    /// The list key of node `v` at squared distance `d`; never below `d` (a node whose
+    /// distance alone cannot enter the full list is rejected without computing its key).
     #[inline(always)]
     fn key(&mut self, _v: u32, d: f32) -> f32 {
         d
@@ -145,6 +146,12 @@ impl Searcher {
             for i in 0..self.fresh.len() {
                 let v = self.fresh[i];
                 let d = T::squared_l2(query, points.get(v));
+                // keys are never below the distance: a node the full list rejects by its
+                // distance is rejected by its key, so its key is not computed
+                let len = self.beam.len();
+                if len == capacity && self.beam[len - 1].key < d {
+                    continue;
+                }
                 self.insert(capacity, v, ranking.key(v, d), d);
             }
         }

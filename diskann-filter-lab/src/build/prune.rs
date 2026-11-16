@@ -241,6 +241,13 @@ impl PruneRule {
                     );
                     f_p = &protected[..];
                 }
+                if f_p.is_empty() {
+                    // nothing to protect: every occlusion is permitted (label-blind RobustPrune)
+                    robust_prune(pool, states, selected, r, alpha, |_, _| true, &mut dist);
+                    *n_dist += nd;
+                    out.extend(selected.iter().map(|&p| pool[p as usize]));
+                    return;
+                }
                 inter.clear();
                 inter_offsets.clear();
                 inter_sigs.clear();

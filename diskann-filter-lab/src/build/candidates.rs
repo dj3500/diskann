@@ -486,23 +486,32 @@ impl<'a> Penalty<'a> {
         Self { store, weight, key }
     }
 
-    /// Marks the labels of `p` in `scratch` (and counts its categories).
+    /// Marks the labels of `p` in `scratch` and records its categories (with the ranges of
+    /// its row and the category's label ids).
     pub(crate) fn begin(&self, scratch: &mut PenaltyScratch, p: u32) {
         if scratch.marks.len() * 64 < self.store.n_labels() {
             scratch.marks = vec![0; self.store.n_labels().div_ceil(64)];
         }
         let row = self.row(p);
-        let mut cats = 0;
+        scratch.groups.clear();
         let mut last = u32::MAX;
-        for &l in row {
+        for (i, &l) in row.iter().enumerate() {
             scratch.marks[l as usize / 64] |= 1 << (l % 64);
             let c = self.store.category(l);
             if c != last {
-                cats += 1;
+                let ids = self.store.category_labels(c);
+                scratch.groups.push(Group {
+                    first: i as u32,
+                    end: i as u32 + 1,
+                    lo: ids.start,
+                    hi: ids.end,
+                });
                 last = c;
+            } else if let Some(g) = scratch.groups.last_mut() {
+                g.end = i as u32 + 1;
             }
         }
-        scratch.n_categories = cats;
+        scratch.n_categories = scratch.groups.len() as u32;
         scratch.source = p;
     }
 
@@ -523,27 +532,48 @@ impl<'a> Penalty<'a> {
     }
 
     /// The number of the marked point's categories in which `c` carries none of its labels.
+    /// Short rows are scanned against the marks; in long rows each category's segment is
+    /// found by binary search and searched for the point's labels (or scanned if it is short).
     #[inline]
     pub(crate) fn failed(&self, scratch: &PenaltyScratch, c: u32) -> u32 {
         let target = scratch.n_categories;
         if target == 0 {
             return 0;
         }
-        let mut sat = 0;
-        let mut last = u32::MAX;
-        for &l in self.row(c) {
-            if scratch.marks[l as usize / 64] >> (l % 64) & 1 == 1 {
-                let cat = self.store.category(l);
-                if cat != last {
-                    sat += 1;
-                    last = cat;
-                    if sat == target {
-                        break;
+        let row = self.row(c);
+        let marked = |l: u32| scratch.marks[l as usize / 64] >> (l % 64) & 1 == 1;
+        if row.len() <= LONG_ROW {
+            let mut sat = 0;
+            let mut last = u32::MAX;
+            for &l in row {
+                if marked(l) {
+                    let cat = self.store.category(l);
+                    if cat != last {
+                        sat += 1;
+                        last = cat;
+                        if sat == target {
+                            break;
+                        }
                     }
                 }
             }
+            return target - sat;
         }
-        target - sat
+        let own = self.row(scratch.source);
+        let mut failed = 0;
+        for g in &scratch.groups {
+            let a = row.partition_point(|&l| l < g.lo);
+            let b = a + row[a..].partition_point(|&l| l < g.hi);
+            let seg = &row[a..b];
+            let mine = &own[g.first as usize..g.end as usize];
+            let hit = if seg.len() <= 2 * mine.len() + LONG_ROW {
+                seg.iter().any(|&l| marked(l))
+            } else {
+                mine.iter().any(|l| seg.binary_search(l).is_ok())
+            };
+            failed += u32::from(!hit);
+        }
+        failed
     }
 
     /// The key `d + weight · f(p, c)` (with the marks of `p`).
@@ -567,18 +597,34 @@ impl<'a> Penalty<'a> {
         }
     }
 
+    /// Prefetches the row offsets of node `v` (its row is read when its key is computed).
+    #[inline]
     pub(crate) fn prefetch_row(&self, v: u32) {
-        if (v as usize) < self.store.n_points() {
-            let row = self.store.row(v);
-            super::prefetch(row.as_ptr().cast());
+        let (offsets, _) = self.store.forward();
+        if let Some(o) = offsets.get(v as usize) {
+            super::prefetch(std::ptr::from_ref(o).cast());
         }
     }
+}
+
+/// Rows longer than this are searched per category (binary search) by [`Penalty::failed`].
+const LONG_ROW: usize = 64;
+
+/// The labels of one category in the marked point's row: positions `first..end` of its row,
+/// label ids `lo..hi` of the category.
+#[derive(Debug, Default, Clone, Copy)]
+struct Group {
+    first: u32,
+    end: u32,
+    lo: u32,
+    hi: u32,
 }
 
 /// Per-thread label marks of the point whose penalties are computed.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PenaltyScratch {
     marks: Vec<u64>,
+    groups: Vec<Group>,
     n_categories: u32,
     source: u32,
 }
@@ -679,6 +725,40 @@ mod tests {
         assert_eq!(pen.key(&sc, 1, 3.0), 13.0);
         pen.end(&mut sc);
         assert!(sc.marks.iter().all(|&w| w == 0));
+        // Label-rich rows take the per-category path: same counts as a direct check.
+        let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+        for i in 0..6 {
+            let mut row: Vec<(String, String)> = (0..40 * (i % 3 + 1))
+                .map(|j| ("g".to_string(), format!("g{}", (j * 7 + i) % 300)))
+                .collect();
+            row.push(("m".into(), format!("m{}", i % 2)));
+            if i != 3 {
+                row.push(("d".into(), format!("d{}", i % 3)));
+            }
+            rows.push(row);
+        }
+        let mut b = LabelStoreBuilder::new();
+        for row in &rows {
+            b.push_point(row.iter().map(|(c, l)| (c.as_str(), l.as_str())))
+                .unwrap();
+        }
+        let s3 = b.finish().unwrap();
+        let pen3 = Penalty::new(&s3, 1.0, PruneKey::Raw);
+        for p in 0..6u32 {
+            pen3.begin(&mut sc, p);
+            for c in 0..6u32 {
+                let (fp, fc) = (s3.row(p), s3.row(c));
+                let cats: std::collections::BTreeSet<u32> =
+                    fp.iter().map(|&l| s3.category(l)).collect();
+                let direct = cats
+                    .iter()
+                    .filter(|&&k| !fp.iter().any(|&l| s3.category(l) == k && fc.contains(&l)))
+                    .count() as u32;
+                assert_eq!(pen3.failed(&sc, c), direct, "p {p} c {c}");
+            }
+            pen3.end(&mut sc);
+        }
+        assert!(s3.row(2).len() > LONG_ROW);
         // A point without labels has no categories to fail.
         let s2 = store(&[&[], &[("a", "x")]]);
         let pen2 = Penalty::new(&s2, 10.0, PruneKey::Raw);
