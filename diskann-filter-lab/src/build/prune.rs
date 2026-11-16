@@ -26,7 +26,7 @@ use anyhow::{bail, ensure, Context, Result};
 use bytemuck::{Pod, Zeroable};
 
 use super::{
-    candidates::{Penalty, PenaltyScratch, PruneKey},
+    candidates::{budget_order, BudgetOrder, Penalty, PenaltyScratch, PruneKey},
     is_subset, signature, LabelInfo, Points,
 };
 use crate::vectors::Element;
@@ -69,16 +69,19 @@ pub enum PruneRule {
     /// C++ library (`Index::occlude_list`): a selected `r` may occlude a candidate `c` only if
     /// every label of `c` is a label of `r` (`F_c ⊆ F_r`), whatever the labels of `p`.
     LabelContainment { r: usize, alpha: f32 },
-    /// `source_containment(R, α[, θ[, B]])`: the FilteredVamana paper's rule (Algorithm 3): `r`
-    /// may occlude `c` only if `F_p ∩ F_c ⊆ F_r`. With `θ`, only labels with at most `θ` points
-    /// count (`F_p ∩ F_c ∩ Θ ⊆ F_r`, `Θ` = labels with at most `θ` points); with `B`, only the
-    /// `B` rarest of them (fewest points, then smallest id). The rule then protects exactly the
-    /// labels a capped (and budgeted) filtered insertion builds structure for.
+    /// `source_containment(R, α[, θ[, B[, rarest|categories]]])`: the FilteredVamana paper's
+    /// rule (Algorithm 3): `r` may occlude `c` only if `F_p ∩ F_c ⊆ F_r`. With `θ`, only
+    /// labels with at most `θ` points count (`F_p ∩ F_c ∩ Θ ⊆ F_r`, `Θ` = labels with at most
+    /// `θ` points); with `B`, only the first `B` of them in budget order (the rarest, or per
+    /// category). The rule then protects exactly the labels a capped (and budgeted) filtered
+    /// insertion builds structure for.
     SourceContainment {
         r: usize,
         alpha: f32,
         theta: Option<u32>,
         budget: Option<u32>,
+        /// Which labels the budget keeps (as `filtered`'s budget).
+        order: BudgetOrder,
     },
     /// `coverage(R, α, B[, k])`: coverage-budgeted pruning. The first `R − B` neighbors of the
     /// label-blind RobustPrune are kept; then, for the labels of `p` from the rarest (fewest
@@ -142,6 +145,7 @@ impl PruneRule {
                 alpha,
                 theta,
                 budget,
+                order,
             } => {
                 let mut t = format!("sc-R{r}-a{alpha}");
                 if let Some(theta) = theta {
@@ -149,6 +153,9 @@ impl PruneRule {
                 }
                 if let Some(b) = budget {
                     t += &format!("-b{b}");
+                }
+                if order == BudgetOrder::PerCategory {
+                    t += "-cat";
                 }
                 t
             }
@@ -209,6 +216,7 @@ impl PruneRule {
             inter_offsets,
             inter_sigs,
             protected,
+            order_keys,
             n_dist,
             n_label_checks,
             ..
@@ -240,6 +248,7 @@ impl PruneRule {
                 alpha,
                 theta,
                 budget,
+                order,
             } => {
                 let labels = labels.expect(NEEDS_LABELS);
                 let mut f_p = labels.row(source);
@@ -249,7 +258,7 @@ impl PruneRule {
                     protected.clear();
                     protected.extend(f_p.iter().copied().filter(|&l| store.posting_len(l) <= t));
                     if let Some(b) = budget.filter(|&b| protected.len() > b as usize) {
-                        protected.sort_unstable_by_key(|&l| (store.posting_len(l), l));
+                        budget_order(store, protected, order, order_keys);
                         protected.truncate(b as usize);
                         protected.sort_unstable();
                     }
@@ -384,13 +393,17 @@ impl fmt::Display for PruneRule {
                 alpha,
                 theta,
                 budget,
+                order,
             } => {
                 write!(f, "source_containment({r}, {alpha}")?;
-                match (theta, budget) {
-                    (None, None) => {}
-                    (Some(t), None) => write!(f, ", {t}")?,
-                    (t, Some(b)) => {
-                        write!(f, ", {}, {b}", t.map_or("inf".into(), |t| t.to_string()))?;
+                let t = theta.map_or("inf".into(), |t| t.to_string());
+                match (theta, budget, order) {
+                    (None, None, BudgetOrder::Rarest) => {}
+                    (Some(_), None, BudgetOrder::Rarest) => write!(f, ", {t}")?,
+                    (_, Some(b), BudgetOrder::Rarest) => write!(f, ", {t}, {b}")?,
+                    (_, b, BudgetOrder::PerCategory) => {
+                        let b = b.map_or("R".into(), |b| b.to_string());
+                        write!(f, ", {t}, {b}, {order}")?;
                     }
                 }
                 write!(f, ")")
@@ -465,10 +478,10 @@ impl FromStr for PruneRule {
                 }
             }
             "source_containment" => {
-                arity(1, 4)?;
+                arity(1, 5)?;
                 let opt = |i: usize, what: &str| -> Result<Option<u32>> {
                     match args.get(i) {
-                        None | Some(&"inf") => Ok(None),
+                        None | Some(&"inf") | Some(&"R") => Ok(None),
                         Some(_) => Ok(Some(u32::try_from(int(i)?).with_context(|| {
                             format!("pruning rule {s:?}: {what} does not fit in 32 bits")
                         })?)),
@@ -479,6 +492,10 @@ impl FromStr for PruneRule {
                     alpha: real(1)?,
                     theta: opt(2, "θ")?,
                     budget: opt(3, "the budget")?,
+                    order: match args.get(4) {
+                        None => BudgetOrder::Rarest,
+                        Some(o) => o.parse()?,
+                    },
                 }
             }
             "coverage" => {
@@ -521,6 +538,7 @@ pub struct PruneScratch {
     inter_sigs: Vec<u64>,
     /// The labels of the pruned node that a capped containment rule protects.
     protected: Vec<u32>,
+    order_keys: Vec<(u32, u64, u32)>,
     /// Candidate buffer of back-edge re-prunes.
     pool: Vec<Candidate>,
     /// Back-edge sources not yet in a row.
@@ -833,6 +851,7 @@ mod tests {
             alpha: 1.2,
             theta: None,
             budget: None,
+            order: BudgetOrder::Rarest,
         }
         .prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
         assert_eq!(ids(&out), vec![1]);
@@ -854,6 +873,7 @@ mod tests {
             alpha: 1.2,
             theta,
             budget: None,
+            order: BudgetOrder::Rarest,
         };
         // F_0 ∩ F_2 = {a} is not on 1: the paper's rule keeps 2.
         sc(None).prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
@@ -890,6 +910,7 @@ mod tests {
             alpha: 1.2,
             theta: None,
             budget,
+            order: BudgetOrder::Rarest,
         };
         scb(Some(1)).prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
         assert_eq!(ids(&out), vec![1]);
