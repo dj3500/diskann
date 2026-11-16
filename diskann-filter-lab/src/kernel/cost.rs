@@ -26,11 +26,18 @@
 //!
 //! with `merge(c*) = P*·merge·log2 k` for a clause of `k ≥ 2` labels (a single posting list is
 //! read in place). The candidates checked by `scan` and `distance_first` are members of
-//! `union(c*)`: `pred` is the cost of checking a member (the residual clauses), calibrated on
-//! such members for queries whose residual clauses read rows and for bitset-only ones
-//! (`pred_row`, `pred_bits`); the cost of a galloping step depends on the gap `p/s`
-//! (`gallop(p/s)`, cache misses in long lists). Calibrations without these curves (batch B6)
-//! use the miss-dominated `pred` curve and a constant `gallop`.
+//! `union(c*)`: `pred` is the cost of checking a member (the residual clauses). Calibrations
+//! with the shape-resolved curves (batch A1b) price it from the query's residual clauses:
+//! `base(ρ) + words·word(ρ) + rows·row(ρ)`, with the bitset words probed and the row reads
+//! expected from the clauses' labels and the survival estimates ([`MemberWork`]), measured
+//! cold (a scan touches each candidate once). Batch A1 calibrations use one curve per class
+//! (residual clauses reading rows or bitset-only: `pred_row`, `pred_bits`, measured on
+//! re-sampled, hence warm, members), batch B6 the miss-dominated `pred` curve; the cost of a
+//! galloping step depends on the gap `p/s` (`gallop(p/s)`, cache misses in long lists), B6
+//! used a constant. The sketch probe costs `sketch·entries merged + points·pred` (every
+//! residual clause per sampled point); with the shape-resolved curves it enters the crossover
+//! (the exact path skips the probe when its upper cost is below the cheapest graph search plus
+//! the probe, which the graph route needs for its list size).
 //!
 //! Graph search at list size `L` computes `D(L)` distances (measured at list sizes from 10 to
 //! 2,560 and interpolated log-log; older calibrations: the line `α·L + β`) and evaluates `P`
@@ -114,6 +121,20 @@ pub struct UnitCosts {
     pub heap_bound_l: Vec<f64>,
     #[serde(default)]
     pub heap_bound_extra_kl: Vec<Vec<f64>>,
+    /// Checks of members of `union(c*)` by residual shape, measured cold (each candidate
+    /// touched once) at each density: per candidate (`check_base_ns`), per static-bitset
+    /// word probed (`check_word_ns`) and per row read (`check_row_ns`); empty in older
+    /// calibrations (then `pred_row_ns` / `pred_bits_ns`). With them the sketch probe costs
+    /// the same per sampled point (every residual clause evaluated) and enters the crossover.
+    #[serde(default)]
+    pub check_base_ns: Vec<f64>,
+    #[serde(default)]
+    pub check_word_ns: Vec<f64>,
+    #[serde(default)]
+    pub check_row_ns: Vec<f64>,
+    /// Per query: compiling the predicate and planning (0 if not calibrated).
+    #[serde(default)]
+    pub query_ns: f64,
 }
 
 impl Default for UnitCosts {
@@ -146,6 +167,10 @@ impl Default for UnitCosts {
             graph_l_dists: Vec::new(),
             heap_bound_l: Vec::new(),
             heap_bound_extra_kl: Vec::new(),
+            check_base_ns: Vec::new(),
+            check_word_ns: Vec::new(),
+            check_row_ns: Vec::new(),
+            query_ns: 0.0,
         }
     }
 }
@@ -196,6 +221,15 @@ impl UnitCosts {
             "the member check curves need one value per density"
         );
         anyhow::ensure!(
+            (self.check_base_ns.is_empty()
+                && self.check_word_ns.is_empty()
+                && self.check_row_ns.is_empty())
+                || (self.check_base_ns.len() == n
+                    && self.check_word_ns.len() == n
+                    && self.check_row_ns.len() == n),
+            "the shape-resolved check curves need one value per density"
+        );
+        anyhow::ensure!(
             self.gallop_gap.len() == self.gallop_gap_ns.len()
                 && self.gallop_gap.windows(2).all(|w| w[0] < w[1])
                 && self.gallop_gap.iter().all(|&g| g >= 1.0),
@@ -236,6 +270,10 @@ impl UnitCosts {
                 .chain(&self.gallop_gap_ns)
                 .chain(&self.heap_bound_extra)
                 .chain(self.heap_bound_extra_kl.iter().flatten())
+                .chain(&self.check_base_ns)
+                .chain(&self.check_word_ns)
+                .chain(&self.check_row_ns)
+                .chain(&[self.query_ns])
                 .all(|x| x.is_finite() && *x >= 0.0),
             "unit costs must be finite and non-negative"
         );
@@ -284,6 +322,32 @@ impl UnitCosts {
         )
     }
 
+    /// Whether the shape-resolved check curves are calibrated.
+    pub fn has_shape(&self) -> bool {
+        !self.check_base_ns.is_empty()
+    }
+
+    /// Cost of checking one member of `union(c*)` with the expected work `w` at density
+    /// `rho`: the shape-resolved curves, else `pred_member` of `w`'s class.
+    pub fn member(&self, w: &MemberWork, rho: f64) -> f64 {
+        if !self.has_shape() {
+            return self.pred_member(w.class_rows, rho);
+        }
+        self.curve(&self.check_base_ns, rho)
+            + w.words * self.curve(&self.check_word_ns, rho)
+            + w.rows * self.curve(&self.check_row_ns, rho)
+    }
+
+    /// Cost of one sampled point of a sketch probe (every residual clause evaluated, work
+    /// `w`) at density `rho`: the shape-resolved curves, else `probe_ns`.
+    pub fn probe_point(&self, w: &MemberWork, rho: f64) -> f64 {
+        if self.has_shape() {
+            self.member(w, rho)
+        } else {
+            self.probe_ns
+        }
+    }
+
     /// Cost of one modelled galloping step at gap `gap` (posting entries per galloped
     /// candidate): log-linear in the gap, clamped at the calibrated ends.
     pub fn gallop(&self, gap: f64) -> f64 {
@@ -305,9 +369,9 @@ impl UnitCosts {
     }
 
     /// Model cost of a sketch probe that merges `merged` sketch entries and evaluates
-    /// `evaluated` sampled points.
-    pub fn probe(&self, merged: f64, evaluated: f64) -> f64 {
-        merged * self.sketch_ns + evaluated * self.probe_ns
+    /// `evaluated` sampled points (every residual clause: work `w` each) at density `rho`.
+    pub fn probe(&self, merged: f64, evaluated: f64, w: &MemberWork, rho: f64) -> f64 {
+        merged * self.sketch_ns + evaluated * self.probe_point(w, rho)
     }
 
     /// Distance computations of a graph search at list size `l`.
@@ -615,6 +679,74 @@ impl Estimates {
     }
 }
 
+/// Expected work of checking one member of `union(c*)` on the residual clauses (positions
+/// `1..` of the Boolean order, as [`super::eval`]'s static evaluator does): static-bitset
+/// words probed and row reads. `class_rows`: some residual clause reads rows (the class of the
+/// older per-class curves).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MemberWork {
+    pub words: f64,
+    pub rows: f64,
+    pub class_rows: bool,
+}
+
+impl MemberWork {
+    /// From the clause shapes (`split`: the query was split against the static bitsets;
+    /// otherwise every label is checked in the row) and the survival estimates
+    /// (`survival[j − 1]`: the fraction of `union(c*)` satisfying clauses `1..=j`). A clause
+    /// probes its bitset words in decreasing label frequency until one is set: a member that
+    /// fails it probes every word, one that passes about one; a failed clause without row
+    /// labels ends the check; the row is read once if some clause has row labels. `full`: no
+    /// early end (the probe evaluates every clause); `upper`: the worst case (every word
+    /// probed, the row read).
+    pub fn of(q: &Compiled, split: bool, survival: &[f64], full: bool, upper: bool) -> Self {
+        let c = q.n_clauses();
+        let class_rows = q.residual_reads_rows(split);
+        if c <= 1 || q.is_empty() {
+            return Self {
+                class_rows,
+                ..Self::default()
+            };
+        }
+        if !split {
+            return Self {
+                words: 0.0,
+                rows: 1.0,
+                class_rows,
+            };
+        }
+        let (mut words, mut reach, mut prev, mut row) = (0.0, 1.0, 1.0, false);
+        for j in 1..c {
+            let s = q.static_slots(j).len() as f64;
+            let cur = survival.get(j - 1).copied().unwrap_or(prev).clamp(0.0, 1.0);
+            let p = if upper {
+                1.0
+            } else if prev > 0.0 {
+                (cur / prev).min(1.0)
+            } else {
+                0.0
+            };
+            prev = cur;
+            words += reach
+                * if upper {
+                    s
+                } else {
+                    s * (1.0 - p) + s.min(1.0) * p
+                };
+            if !q.row_labels(j).is_empty() {
+                row = true;
+            } else if !full && !upper {
+                reach *= p;
+            }
+        }
+        Self {
+            words,
+            rows: if row { reach } else { 0.0 },
+            class_rows,
+        }
+    }
+}
+
 /// Inputs of the exact plan costs of one query.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanInputs<'a> {
@@ -658,11 +790,11 @@ impl PlanInputs<'_> {
         let checks = self.q.n_clauses() > 1;
         let k = self.k as f64;
         let dist_m = m * c.dist(m / n);
-        let rows = self.q.residual_reads_rows(self.bitsets.is_some());
+        let work = MemberWork::of(self.q, self.bitsets.is_some(), &e.survival, false, upper);
         match plan {
             ExactPlan::Scan => {
                 let pred = if checks {
-                    a * c.pred_member(rows, a / n)
+                    a * c.member(&work, a / n)
                 } else {
                     0.0
                 };
@@ -678,7 +810,7 @@ impl PlanInputs<'_> {
                 } else {
                     (k * a / m * (1.0 + (m / k).ln())).min(a)
                 };
-                self.merge(c) + a * c.dist(a / n) + evals * c.pred_member(rows, evals / n)
+                self.merge(c) + a * c.dist(a / n) + evals * c.member(&work, evals / n)
             }
             ExactPlan::Gallop => {
                 let mut cost = self.merge(c) + a * c.word_ns;
@@ -919,6 +1051,73 @@ mod tests {
         assert!((l_multiplier(0.01, 16.0) - 4.0).abs() < 1e-9);
         assert_eq!(l_multiplier(0.0, 16.0), 16.0);
         assert_eq!(l_multiplier(1e-9, 8.0), 8.0);
+    }
+
+    #[test]
+    fn member_work_follows_the_residual_shape() {
+        let mut b = LabelStoreBuilder::new();
+        for i in 0..1000u32 {
+            let (a, bb, c, r) = (
+                format!("a={}", i % 10),
+                format!("b={}", i % 4),
+                format!("c={}", i % 2),
+                format!("r={}", i % 100),
+            );
+            b.push_point([
+                ("a", a.as_str()),
+                ("b", bb.as_str()),
+                ("c", c.as_str()),
+                ("r", r.as_str()),
+            ])
+            .unwrap();
+        }
+        let s = b.finish().unwrap();
+        let mut pb = PredicateSetBuilder::new(&s);
+        pb.push(&[vec!["a=1"], vec!["b=0", "b=1", "b=2"], vec!["r=1", "c=0"]]);
+        let preds = pb.finish();
+        let mut bits = vec![0u64; s.n_labels()];
+        let mut q = Compiled::new();
+        q.compile(&s, preds.get(0), Weights::Unit, None, &mut bits);
+        // Bitsets for the labels with at least 200 points (b, c), rows for r.
+        let bs = LabelBitsets::build(&s, 200);
+        q.split_static(&s, &bs, bs.theta(), false);
+        // Boolean order by posting sums: [a=1] (100), [r=1, c=0] (510), [b=0..2] (750).
+        assert_eq!(
+            (1..3)
+                .map(|j| (q.static_slots(j).len(), q.row_labels(j).len()))
+                .collect::<Vec<_>>(),
+            [(1, 1), (3, 0)]
+        );
+        // Clause 1 (one word, a row label: no early end) passes half, clause 2 half of them.
+        let surv = [0.5, 0.25];
+        let w = MemberWork::of(&q, true, &surv, false, false);
+        assert_eq!((w.words, w.rows, w.class_rows), (1.0 + 2.0, 0.5, true));
+        let full = MemberWork::of(&q, true, &surv, true, false);
+        assert_eq!((full.words, full.rows), (3.0, 1.0));
+        let up = MemberWork::of(&q, true, &surv, false, true);
+        assert_eq!((up.words, up.rows), (4.0, 1.0));
+        let rows = MemberWork::of(&q, false, &surv, false, false);
+        assert_eq!((rows.words, rows.rows), (0.0, 1.0));
+        // The shape-resolved curves; older calibrations use the class curve.
+        let mut c = UnitCosts {
+            pred_row_ns: vec![100.0; 6],
+            pred_bits_ns: vec![10.0; 6],
+            ..UnitCosts::default()
+        };
+        assert_eq!(c.member(&w, 1e-3), 100.0);
+        assert_eq!(c.probe_point(&full, 1e-3), c.probe_ns);
+        c.check_base_ns = vec![4.0; 6];
+        c.check_word_ns = vec![10.0; 6];
+        c.check_row_ns = vec![60.0; 6];
+        c.validate().unwrap();
+        assert_eq!(c.member(&w, 1e-3), 4.0 + 3.0 * 10.0 + 0.5 * 60.0);
+        assert_eq!(c.probe_point(&full, 1e-3), 4.0 + 3.0 * 10.0 + 60.0);
+        assert_eq!(
+            c.probe(100.0, 32.0, &full, 1e-3),
+            100.0 * c.sketch_ns + 32.0 * 94.0
+        );
+        c.check_row_ns.pop();
+        assert!(c.validate().is_err());
     }
 
     #[test]

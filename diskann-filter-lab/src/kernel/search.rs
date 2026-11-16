@@ -16,7 +16,7 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{Crossover, EstimateSource, ExactChecks, StartAdmission, StartSource, Terminator},
-    cost::{l_multiplier, Estimates, ExactPlan, PlanInputs, UnitCosts},
+    cost::{l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts},
     entry::{self, SampleIndex, StartPredicate},
     eval::{
         ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
@@ -24,7 +24,7 @@ use super::{
     },
     exact::{self, ExactEval},
     materialize::{Materialized, Materializer},
-    planner::{Decision, Fallback, Guard, Probe},
+    planner::{Decision, Fallback, Guard, Probe, PROBE_STAGE},
     score::{
         self, AdditiveScore, BonusScore, DistanceScore, LexicographicScore, MultiplicativeScore,
         Score,
@@ -874,28 +874,30 @@ impl Searcher {
         let probed = ctr.n_probe;
         let est = match (plan.kernel.estimates, ix.sketches) {
             (EstimateSource::Sketch, Some(sk)) if self.compiled.n_clauses() > 0 => {
-                if let Some(c) = plan.costs.as_ref() {
-                    let b = sk.b();
-                    let merged: usize = self
-                        .compiled
-                        .clause(0)
-                        .iter()
-                        .map(|&l| ix.labels.posting_len(l).min(b))
-                        .sum();
-                    // The evaluated points are known after the probe (below).
-                    ctr.est_probe_ns = c.probe(merged as f64, 0.0) as u64;
-                }
                 let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
                 if plan.kernel.exact_checks == ExactChecks::Residual {
                     cx = cx.cstar_members();
                 }
-                match exact_stat {
+                let est = match exact_stat {
                     Some(b) => {
                         cx = cx.with_static(b);
                         self.probe.run::<StaticBits>(sk, &cx, n, ctr)
                     }
                     None => self.probe.run::<RowScan>(sk, &cx, n, ctr),
+                };
+                if let Some(c) = plan.costs.as_ref() {
+                    let evaluated = (ctr.n_probe - probed) as f64;
+                    ctr.est_probe_ns = probe_cost(
+                        c,
+                        &self.compiled,
+                        ix.labels,
+                        sk.b(),
+                        n,
+                        exact_stat.is_some(),
+                        Some(evaluated),
+                    ) as u64;
                 }
+                est
             }
             _ => {
                 self.probe.witnesses.clear();
@@ -903,9 +905,6 @@ impl Searcher {
             }
         };
         toc(t, &mut ctr.t_probe_ns);
-        if let Some(c) = plan.costs.as_ref() {
-            ctr.est_probe_ns += c.probe(0.0, (ctr.n_probe - probed) as f64) as u64;
-        }
         self.last_estimates = est.clone();
         est
     }
@@ -937,7 +936,8 @@ impl Searcher {
             k,
         };
         // Obviously cheap exact queries: the exact path's upper cost is below the cheapest
-        // graph search; no probe.
+        // graph search, which needs the probe first (its list size and estimates come from
+        // it): no probe. The probe's cost enters with the shape-resolved check curves.
         let (_, e_up) = pi.best(
             costs,
             kernel.exact_plans,
@@ -945,7 +945,19 @@ impl Searcher {
             false,
             true,
         );
-        if e_up <= g0 {
+        let probe = match (kernel.estimates, ix.sketches) {
+            (EstimateSource::Sketch, Some(sk)) if costs.has_shape() => probe_cost(
+                costs,
+                &self.compiled,
+                ix.labels,
+                sk.b(),
+                n,
+                exact_stat.is_some(),
+                None,
+            ),
+            _ => 0.0,
+        };
+        if e_up <= g0 + probe {
             let est = bounds;
             let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
             record(ctr, p, e.min(e_up), g0, &est);
@@ -1154,6 +1166,43 @@ fn record(ctr: &mut Counters, p: ExactPlan, e: f64, g: f64, est: &Estimates) {
     ctr.est_graph_ns = g.round() as u64;
     ctr.a_hat = est.a.round() as u64;
     ctr.m_hat = est.m.round() as u64;
+}
+
+/// Model cost of the sketch probe of `q` ([`UnitCosts::probe`]) over sketches of size `b`:
+/// `evaluated` sampled points, or before the probe the expected number (the sample of
+/// `union(c*)`, at most `b` points, or the first stage when the posting bounds put half of
+/// the points among the matches), each evaluated on every residual clause with the posting
+/// bounds' survival (`split`: the query was split against the static bitsets).
+fn probe_cost(
+    c: &UnitCosts,
+    q: &Compiled,
+    labels: &LabelStore,
+    b: usize,
+    n: usize,
+    split: bool,
+    evaluated: Option<f64>,
+) -> f64 {
+    if q.n_clauses() == 0 || q.is_empty() {
+        return 0.0;
+    }
+    let merged: usize = q
+        .clause(0)
+        .iter()
+        .map(|&l| labels.posting_len(l).min(b))
+        .sum();
+    let bounds = Estimates::from_bounds(q, n);
+    let points = evaluated.unwrap_or_else(|| {
+        let u = q.upper_bound(0) as f64;
+        if q.n_clauses() <= 1 {
+            0.0
+        } else if u > b as f64 && bounds.m >= 0.5 * n as f64 {
+            PROBE_STAGE as f64
+        } else {
+            u.min(b as f64)
+        }
+    });
+    let w = MemberWork::of(q, split, &bounds.survival, true, false);
+    c.probe(merged as f64, points, &w, points.max(1.0) / n.max(1) as f64)
 }
 
 #[expect(clippy::too_many_arguments, reason = "forwards the per-query inputs")]

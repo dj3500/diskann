@@ -144,6 +144,18 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
     let rows = c["heap_bound_extra_kl"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.as_array().unwrap().len() == hl.len()));
+    // Cold member checks by residual shape and the per-query cost.
+    for key in ["check_base_ns", "check_word_ns", "check_row_ns"] {
+        let v = curve(key);
+        assert_eq!(v.len(), densities, "{key}");
+        assert!(v.iter().all(|x| x.is_finite() && *x >= 0.0), "{key}: {v:?}");
+    }
+    assert!(
+        curve("check_word_ns").iter().any(|x| *x > 0.0)
+            || curve("check_row_ns").iter().any(|x| *x > 0.0),
+        "no word or row cost measured"
+    );
+    assert!(c["query_ns"].as_f64().unwrap() > 0.0);
     let frac = c["distance_first_frac"].as_f64().unwrap();
     assert!(frac > 0.0 && frac <= 1.0, "{frac}");
     // The report reads back as unit costs.
