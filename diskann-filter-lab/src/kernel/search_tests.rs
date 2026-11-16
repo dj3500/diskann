@@ -1456,6 +1456,85 @@ fn the_cost_rule_prefers_postfilters_for_frequent_matches() {
 }
 
 #[test]
+fn hopeless_graph_searches_take_the_exact_path() {
+    use super::cost::UnitCosts;
+    // A free graph search evaluating L nodes (D(L) = L) and a prohibitive exact path: the cost
+    // crossover always prefers the graph, except where the gate finds the planned search
+    // hopeless, i.e. at the upper bound of the match count (exact here: complete sketches) it
+    // meets fewer than one match, L·M/n < 1.
+    let f = fixture(300, 47, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        graph_alpha: 1.0,
+        graph_beta: 0.0,
+        graph_dist_ns: 1.0,
+        graph_pred_ns: 1.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let s2 = [
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+    ];
+    let mut off = s2.to_vec();
+    off.push(("hopeless_gate", "off"));
+    let (gated, ungated) = (khpad(&s2), khpad(&off));
+    assert_eq!(gated.to_json().get("hopeless_gate"), None);
+    assert_eq!(ungated.to_json()["hopeless_gate"], "off");
+    let (pg, pu) = (
+        Plan::new(&gated, &ix).unwrap(),
+        Plan::new(&ungated, &ix).unwrap(),
+    );
+    let mut st = Searcher::for_index(&ix, &[&pg, &pu]);
+    let (mut exact, mut graph) = (0, 0);
+    for q in 0..f.preds.len() {
+        let m = (0..300u32)
+            .filter(|&p| f.preds.get(q).matches(f.labels.row(p)))
+            .count() as f64;
+        for l0 in [5, 20] {
+            let l = (l0 as f64 * super::cost::l_multiplier(m / 300.0, 4.0)).round();
+            let (out, ctr) = search_ix(&f, &ix, &mut st, &pg, q, l0, 3);
+            check_properties(&f, q, &out, "gated");
+            let (_, cu) = search_ix(&f, &ix, &mut st, &pu, q, l0, 3);
+            if q == 7 {
+                continue;
+            }
+            assert_eq!(
+                cu.route,
+                Route::Graph,
+                "q={q} L0={l0}: the ungated crossover"
+            );
+            assert_eq!(
+                ctr.m_hi as f64, m,
+                "q={q}: complete sketches give exact counts"
+            );
+            if l * m / 300.0 < 1.0 {
+                exact += 1;
+                assert_eq!(ctr.route, Route::Exact, "q={q} L0={l0}: m={m}, L={l}");
+                assert_eq!(out, f.truth(q, 3), "q={q} L0={l0}");
+                assert!(
+                    ctr.est_graph_ns < ctr.est_exact_ns,
+                    "q={q}: the graph was cheaper"
+                );
+            } else {
+                graph += 1;
+                assert_eq!(ctr.route, Route::Graph, "q={q} L0={l0}: m={m}, L={l}");
+            }
+        }
+    }
+    assert!(exact > 0 && graph > 0, "both outcomes: {exact} / {graph}");
+}
+
+#[test]
 fn the_effort_curve_plans_the_list_size_from_the_match_rate() {
     use super::cost::UnitCosts;
     // A curve over K' = 10 / 100 neighbours and recalls 0.5 / 0.9; an expensive exact path.

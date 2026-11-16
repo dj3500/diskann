@@ -16,8 +16,8 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{
-        Crossover, EstimateSource, ExactChecks, PostfilterRoute, PostfilterStarts, StartAdmission,
-        StartSource, Terminator,
+        Crossover, EstimateSource, ExactChecks, PostfilterRoute, PostfilterStarts, RowReads,
+        StartAdmission, StartSource, Terminator,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -165,6 +165,8 @@ pub struct Counters {
     /// Estimates of `|union(c*)|` and of the match count (0 if not computed).
     pub a_hat: u64,
     pub m_hat: u64,
+    /// Upper confidence bound of the match count (0 if not computed).
+    pub m_hi: u64,
     /// Model cost of the graph work of a guarded trial (ns).
     pub graph_ns: u64,
     /// Model cost of the sketch probe (ns; 0 without a probe).
@@ -188,6 +190,8 @@ pub struct Counters {
     pub t_check_ns: u64,
     pub t_dist_ns: u64,
     pub t_graph_ns: u64,
+    /// Wall-clock time of the cost crossover's decision, the probe included (phase timers).
+    pub t_decide_ns: u64,
     /// The phase timers are on (set per query; not a counter).
     pub timing: bool,
 }
@@ -225,7 +229,7 @@ impl Counters {
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 35] = [
+    pub const NAMES: [&'static str; 37] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -261,10 +265,12 @@ impl Counters {
         "t_dist_ns",
         "t_graph_ns",
         "timing",
+        "m_hi",
+        "t_decide_ns",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 35] {
+    pub fn values(&self) -> [u64; 37] {
         [
             self.n_dist,
             self.n_pred,
@@ -301,6 +307,8 @@ impl Counters {
             self.t_dist_ns,
             self.t_graph_ns,
             u64::from(self.timing),
+            self.m_hi,
+            self.t_decide_ns,
         ]
     }
 }
@@ -444,7 +452,9 @@ impl Plan {
                 )
             })?;
             c.validate()?;
-            Some(c.clone())
+            let mut c = c.clone();
+            c.reads_at_reach = kernel.row_reads == RowReads::Reach;
+            Some(c)
         } else {
             None
         };
@@ -813,7 +823,9 @@ impl Searcher {
                 n
             }
         } else {
+            let t = tic(&ctr);
             let d = self.decide(plan, ix, l, k, exact_stat, &mut ctr);
+            toc(t, &mut ctr.t_decide_ns);
             if d.exact {
                 ctr.route = Route::Exact;
                 self.exact_v2(plan, ix, q, k, d.plan, exact_stat, false, &mut ctr);
@@ -1024,6 +1036,9 @@ impl Searcher {
             _ => planned_l(l, &est, scale),
         };
         let mut g = costs.graph_cost(l_plan as f64, k, rate, kernel.laziness) + starts;
+        // A search that, at the upper confidence bound of the match count, meets less than one
+        // match is no alternative to the exact path, however cheap.
+        let hopeless = kernel.hopeless_gate && costs.graph_hopeless(l_plan as f64, &est);
         let mut l_run = if matches!(
             kernel.terminator,
             Terminator::PostingL { .. } | Terminator::EffortCurve
@@ -1036,13 +1051,15 @@ impl Searcher {
         let mut postfilter = false;
         if kernel.postfilter != PostfilterRoute::Off {
             let (l_pf, g_pf) = postfilter_option(costs, l_run, k, rate, n, pf_starts);
-            if g_pf.is_finite() && (kernel.postfilter == PostfilterRoute::Always || g_pf <= g) {
+            if g_pf.is_finite()
+                && (kernel.postfilter == PostfilterRoute::Always || hopeless || g_pf <= g)
+            {
                 (postfilter, l_run, g) = (true, l_pf, g_pf);
             }
         }
         record(ctr, p, e, g, &est);
         Decision {
-            exact: e <= g,
+            exact: e <= g || (hopeless && !postfilter),
             plan: p,
             est_exact: e,
             est_graph: g,
@@ -1311,6 +1328,7 @@ fn record(ctr: &mut Counters, p: ExactPlan, e: f64, g: f64, est: &Estimates) {
     ctr.est_graph_ns = g.round() as u64;
     ctr.a_hat = est.a.round() as u64;
     ctr.m_hat = est.m.round() as u64;
+    ctr.m_hi = est.m_hi.round() as u64;
 }
 
 /// Model cost of the sketch probe of `q` ([`UnitCosts::probe`]) over sketches of size `b`:
@@ -1346,7 +1364,7 @@ fn probe_cost(
             u.min(b as f64)
         }
     });
-    let w = MemberWork::of(q, split, &bounds.survival, true, false);
+    let w = MemberWork::of(q, split, &bounds.survival, true, false, c.reads_at_reach);
     c.probe(merged as f64, points, &w, points.max(1.0) / n.max(1) as f64)
 }
 

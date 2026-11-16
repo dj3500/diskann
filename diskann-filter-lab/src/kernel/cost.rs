@@ -144,6 +144,10 @@ pub struct UnitCosts {
     /// Per query: compiling the predicate and planning (0 if not calibrated).
     #[serde(default)]
     pub query_ns: f64,
+    /// Not calibrated: the kernel's `row_reads = reach` (ablation of A1c's correction): a
+    /// member check reads its row whenever it reaches a clause with labels without a bitset.
+    #[serde(skip)]
+    pub reads_at_reach: bool,
     /// Graph search: list sizes (increasing) and ns per distance computation of a
     /// predicate-free search at each; empty in older calibrations (then `graph_dist_ns` at
     /// every size).
@@ -197,6 +201,7 @@ impl Default for UnitCosts {
             check_prefetch_ns: Vec::new(),
             check_row_ns: Vec::new(),
             query_ns: 0.0,
+            reads_at_reach: false,
             graph_dist_ns_l: Vec::new(),
             graph_dist_ns_curve: Vec::new(),
             effort_r: Vec::new(),
@@ -442,6 +447,14 @@ impl UnitCosts {
             return self.graph_alpha * l + self.graph_beta;
         }
         loglog(&self.graph_l, &self.graph_l_dists, l)
+    }
+
+    /// A graph search with list size `l` that cannot be expected to find a match: even at the
+    /// upper confidence bound of the match count, the nodes it evaluates (`D(l)`, at least
+    /// `l`) meet fewer than one match when the matches are spread independently of the
+    /// distance to the query. Needs the probe's estimates (posting bounds: never).
+    pub fn graph_hopeless(&self, l: f64, est: &Estimates) -> bool {
+        est.sampled > 0 && est.n > 0.0 && self.graph_dists(l).max(l) * est.m_hi / est.n < 1.0
     }
 
     /// Cost of one distance computation of a graph search at list size `l`: `graph_dist_ns`,
@@ -852,10 +865,20 @@ impl MemberWork {
     /// (`survival[j − 1]`: the fraction of `union(c*)` satisfying clauses `1..=j`). A clause
     /// probes its bitset words in decreasing label frequency until one is set: a member that
     /// fails it probes every word, one that passes about one; a failed clause without row
-    /// labels ends the check; the row is read once if some clause has row labels and the check
-    /// gets there. `full`: no early end (the probe evaluates every clause); `upper`: the worst
-    /// case (every word probed, the row read).
-    pub fn of(q: &Compiled, split: bool, survival: &[f64], full: bool, upper: bool) -> Self {
+    /// labels ends the check; the row is read once if the check gets past those and some
+    /// clause with row labels is left unsatisfied by its bitset labels (a member passing a
+    /// clause that has some mostly passes by one of them). `full`: no early end (the probe
+    /// evaluates every clause); `upper`: the worst case (every word probed, the row read).
+    /// `at_reach`: the row is read whenever the check reaches a clause with row labels (the
+    /// A1b model, an ablation).
+    pub fn of(
+        q: &Compiled,
+        split: bool,
+        survival: &[f64],
+        full: bool,
+        upper: bool,
+        at_reach: bool,
+    ) -> Self {
         let c = q.n_clauses();
         let class_rows = q.residual_reads_rows(split);
         if c <= 1 || q.is_empty() {
@@ -872,7 +895,9 @@ impl MemberWork {
                 class_rows,
             };
         }
-        let (mut words, mut reach, mut prev, mut row) = (0.0, 1.0, 1.0, false);
+        let (mut words, mut reach, mut prev) = (0.0, 1.0, 1.0);
+        // Row-label clauses seen, and the chance that their bitset labels satisfy them all.
+        let (mut row, mut all_static) = (false, 1.0);
         for j in 1..c {
             let s = q.static_slots(j).len() as f64;
             let cur = survival.get(j - 1).copied().unwrap_or(prev).clamp(0.0, 1.0);
@@ -892,6 +917,13 @@ impl MemberWork {
                 };
             if !q.row_labels(j).is_empty() {
                 row = true;
+                // A member passing a clause with bitset labels mostly passes by one of them (the
+                // frequent labels); a clause of row labels only always needs the row.
+                if !upper && !at_reach && s > 0.0 {
+                    all_static *= p;
+                } else {
+                    all_static = 0.0;
+                }
             } else if !full && !upper {
                 reach *= p;
             }
@@ -899,7 +931,7 @@ impl MemberWork {
         Self {
             words,
             prefetch: if row { 1.0 } else { 0.0 },
-            rows: if row { reach } else { 0.0 },
+            rows: if row { reach * (1.0 - all_static) } else { 0.0 },
             class_rows,
         }
     }
@@ -948,7 +980,14 @@ impl PlanInputs<'_> {
         let checks = self.q.n_clauses() > 1;
         let k = self.k as f64;
         let dist_m = m * c.dist(m / n);
-        let work = MemberWork::of(self.q, self.bitsets.is_some(), &e.survival, false, upper);
+        let work = MemberWork::of(
+            self.q,
+            self.bitsets.is_some(),
+            &e.survival,
+            false,
+            upper,
+            c.reads_at_reach,
+        );
         match plan {
             ExactPlan::Scan => {
                 let pred = if checks {
@@ -1289,17 +1328,24 @@ mod tests {
         );
         // Clause 1 (one word, a row label: no early end) passes half, clause 2 half of them.
         let surv = [0.5, 0.25];
-        let w = MemberWork::of(&q, true, &surv, false, false);
+        let w = MemberWork::of(&q, true, &surv, false, false, false);
+        // Clause 1 leaves the row unread when its bitset label passes (half the members), and
+        // clause 2 (bitset-only) ends half of the checks first: 0.5 · 0.5 reads.
         assert_eq!(
             (w.words, w.prefetch, w.rows, w.class_rows),
-            (1.0 + 2.0, 1.0, 0.5, true)
+            (1.0 + 2.0, 1.0, 0.25, true)
         );
-        let full = MemberWork::of(&q, true, &surv, true, false);
-        assert_eq!((full.words, full.prefetch, full.rows), (3.0, 1.0, 1.0));
-        let up = MemberWork::of(&q, true, &surv, false, true);
+        let full = MemberWork::of(&q, true, &surv, true, false, false);
+        assert_eq!((full.words, full.prefetch, full.rows), (3.0, 1.0, 0.5));
+        let up = MemberWork::of(&q, true, &surv, false, true, false);
         assert_eq!((up.words, up.rows), (4.0, 1.0));
-        let rows = MemberWork::of(&q, false, &surv, false, false);
+        let rows = MemberWork::of(&q, false, &surv, false, false, false);
         assert_eq!((rows.words, rows.prefetch, rows.rows), (0.0, 1.0, 1.0));
+        // The A1b model (`row_reads = reach`): a read for every check reaching clause 1.
+        let reach = MemberWork::of(&q, true, &surv, false, false, true);
+        assert_eq!((reach.words, reach.rows), (3.0, 0.5));
+        let reach_full = MemberWork::of(&q, true, &surv, true, false, true);
+        assert_eq!(reach_full.rows, 1.0);
         // The shape-resolved curves; older calibrations use the class curve.
         let mut c = UnitCosts {
             pred_row_ns: vec![100.0; 6],
@@ -1312,16 +1358,16 @@ mod tests {
         c.check_word_ns = vec![10.0; 6];
         c.check_row_ns = vec![60.0; 6];
         c.validate().unwrap();
-        assert_eq!(c.member(&w, 1e-3), 4.0 + 3.0 * 10.0 + 0.5 * 60.0);
-        assert_eq!(c.probe_point(&full, 1e-3), 4.0 + 3.0 * 10.0 + 60.0);
+        assert_eq!(c.member(&w, 1e-3), 4.0 + 3.0 * 10.0 + 0.25 * 60.0);
+        assert_eq!(c.probe_point(&full, 1e-3), 4.0 + 3.0 * 10.0 + 0.5 * 60.0);
         assert_eq!(
             c.probe(100.0, 32.0, &full, 1e-3),
-            100.0 * c.sketch_ns + 32.0 * 94.0
+            100.0 * c.sketch_ns + 32.0 * 64.0
         );
         // Every member's row is prefetched; the reads follow the survival.
         c.check_prefetch_ns = vec![20.0; 6];
         c.validate().unwrap();
-        assert_eq!(c.member(&w, 1e-3), 4.0 + 3.0 * 10.0 + 20.0 + 0.5 * 60.0);
+        assert_eq!(c.member(&w, 1e-3), 4.0 + 3.0 * 10.0 + 20.0 + 0.25 * 60.0);
         let bits_only = MemberWork {
             prefetch: 0.0,
             rows: 0.0,

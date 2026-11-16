@@ -380,6 +380,42 @@ pub struct Kernel {
     pub phase_times: bool,
     pub postfilter: PostfilterRoute,
     pub postfilter_starts: PostfilterStarts,
+    /// The cost crossovers route to the exact path when the planned graph search is hopeless
+    /// (fewer than one match met at the upper confidence bound of the match count; A1c);
+    /// `off` for the ablation.
+    pub hopeless_gate: bool,
+    /// How the cost model counts the row reads of member checks.
+    pub row_reads: RowReads,
+}
+
+/// How the cost model counts a member check's row reads (the static evaluator reads a
+/// member's row only when a clause with labels without a bitset is not already satisfied by
+/// its bitset labels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RowReads {
+    /// As the evaluator: when such a clause's bitset labels miss.
+    Clause,
+    /// Whenever the check reaches such a clause (the A1b model; an ablation).
+    Reach,
+}
+
+impl RowReads {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "clause" => Self::Clause,
+            "reach" => Self::Reach,
+            v => bail!("unknown row_reads {v:?} (clause, reach)"),
+        })
+    }
+}
+
+impl fmt::Display for RowReads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Clause => "clause",
+            Self::Reach => "reach",
+        })
+    }
 }
 
 impl Default for Kernel {
@@ -411,6 +447,8 @@ impl Default for Kernel {
             phase_times: false,
             postfilter: PostfilterRoute::Off,
             postfilter_starts: PostfilterStarts::Global,
+            hopeless_gate: true,
+            row_reads: RowReads::Clause,
         }
     }
 }
@@ -891,6 +929,14 @@ impl Kernel {
             }
             "postfilter" => self.postfilter = PostfilterRoute::parse(value)?,
             "postfilter_starts" => self.postfilter_starts = PostfilterStarts::parse(value)?,
+            "hopeless_gate" => {
+                self.hopeless_gate = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown hopeless_gate {v:?} (on, off)"),
+                }
+            }
+            "row_reads" => self.row_reads = RowReads::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1069,6 +1115,12 @@ impl Kernel {
         }
         if self.postfilter_starts != PostfilterStarts::Global {
             j["postfilter_starts"] = json!(self.postfilter_starts.to_string());
+        }
+        if !self.hopeless_gate {
+            j["hopeless_gate"] = json!("off");
+        }
+        if self.row_reads != RowReads::Clause {
+            j["row_reads"] = json!(self.row_reads.to_string());
         }
         j
     }
