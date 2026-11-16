@@ -11,6 +11,7 @@
 //!   every point's candidate pool ([`pools`]).
 //! - [`candidates`]: label-aware candidate generation for the insertions (label-filtered
 //!   searches per label, or a search penalized by the number of failed categories).
+//! - [`stitch`]: per-label Vamana graphs of small labels merged into a label-blind graph.
 //! - [`prune`]: pruning rules — label-blind α-RobustPrune, label-aware occlusion
 //!   (FilteredVamana's containment rule), coverage budgets and degree splits.
 //! - [`replay`]: *prune replay* — the adjacency rebuilt from recorded pools with another
@@ -26,6 +27,7 @@ pub mod cli;
 pub mod pools;
 pub mod prune;
 pub mod replay;
+pub mod stitch;
 
 mod adjacency;
 mod search;
