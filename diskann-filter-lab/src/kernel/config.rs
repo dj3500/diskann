@@ -192,6 +192,34 @@ pub enum PostfilterRoute {
     Always,
 }
 
+/// Start nodes of the post-filter route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PostfilterStarts {
+    /// The graph's global starts.
+    Global,
+    /// The configured `starts` of the kernel (e.g. per-label starts of `c*`).
+    Configured,
+}
+
+impl PostfilterStarts {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "global" => Self::Global,
+            "configured" => Self::Configured,
+            _ => bail!("unknown postfilter_starts {s:?} (global, configured)"),
+        })
+    }
+}
+
+impl fmt::Display for PostfilterStarts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Global => "global",
+            Self::Configured => "configured",
+        })
+    }
+}
+
 impl PostfilterRoute {
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s.trim() {
@@ -351,6 +379,7 @@ pub struct Kernel {
     /// its counters: a diagnostic, off by default (a few clock reads per query).
     pub phase_times: bool,
     pub postfilter: PostfilterRoute,
+    pub postfilter_starts: PostfilterStarts,
 }
 
 impl Default for Kernel {
@@ -381,6 +410,7 @@ impl Default for Kernel {
             exact_checks: ExactChecks::Residual,
             phase_times: false,
             postfilter: PostfilterRoute::Off,
+            postfilter_starts: PostfilterStarts::Global,
         }
     }
 }
@@ -860,6 +890,7 @@ impl Kernel {
                 }
             }
             "postfilter" => self.postfilter = PostfilterRoute::parse(value)?,
+            "postfilter_starts" => self.postfilter_starts = PostfilterStarts::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1035,6 +1066,9 @@ impl Kernel {
         // Only when set, so that the JSON (and hashes) of other configurations do not change.
         if self.postfilter != PostfilterRoute::Off {
             j["postfilter"] = json!(self.postfilter.to_string());
+        }
+        if self.postfilter_starts != PostfilterStarts::Global {
+            j["postfilter_starts"] = json!(self.postfilter_starts.to_string());
         }
         j
     }

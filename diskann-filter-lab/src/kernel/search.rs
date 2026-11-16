@@ -16,8 +16,8 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{
-        Crossover, EstimateSource, ExactChecks, PostfilterRoute, StartAdmission, StartSource,
-        Terminator,
+        Crossover, EstimateSource, ExactChecks, PostfilterRoute, PostfilterStarts, StartAdmission,
+        StartSource, Terminator,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -820,7 +820,7 @@ impl Searcher {
                 self.answers.finish(ids, dists)
             } else if d.postfilter {
                 let t = tic(&ctr);
-                let n = self.postfilter(ix, q, d.l, exact_stat, &mut ctr, ids, dists);
+                let n = self.postfilter(plan, ix, q, d.l, exact_stat, &mut ctr, ids, dists);
                 toc(t, &mut ctr.t_graph_ns);
                 n
             } else {
@@ -956,8 +956,12 @@ impl Searcher {
             _ => l,
         };
         let mut g0 = costs.graph_cost(l0 as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
+        let pf_starts = match kernel.postfilter_starts {
+            PostfilterStarts::Global => ix.global.len(),
+            PostfilterStarts::Configured => start_count(kernel, ix, &self.compiled),
+        };
         if kernel.postfilter != PostfilterRoute::Off {
-            g0 = g0.min(postfilter_option(costs, ix, l0, k, bounds.m / bounds.n, n).1);
+            g0 = g0.min(postfilter_option(costs, l0, k, bounds.m / bounds.n, n, pf_starts).1);
         }
         let pi = PlanInputs {
             q: &self.compiled,
@@ -1031,7 +1035,7 @@ impl Searcher {
         // The post-filter alternative at a list size that holds the K nearest matches.
         let mut postfilter = false;
         if kernel.postfilter != PostfilterRoute::Off {
-            let (l_pf, g_pf) = postfilter_option(costs, ix, l_run, k, rate, n);
+            let (l_pf, g_pf) = postfilter_option(costs, l_run, k, rate, n, pf_starts);
             if g_pf.is_finite() && (kernel.postfilter == PostfilterRoute::Always || g_pf <= g) {
                 (postfilter, l_run, g) = (true, l_pf, g_pf);
             }
@@ -1057,6 +1061,7 @@ impl Searcher {
     )]
     fn postfilter<T: Element>(
         &mut self,
+        plan: &Plan,
         ix: &Index<'_, T>,
         q: &Query<'_, T>,
         l: usize,
@@ -1067,10 +1072,17 @@ impl Searcher {
     ) -> usize {
         ctr.route = Route::Postfilter;
         self.visited.clear();
-        self.starts.clear();
-        for &v in ix.global {
-            if !self.visited.test_and_set(v) {
-                self.starts.push(v);
+        match plan.kernel.postfilter_starts {
+            PostfilterStarts::Global => {
+                self.starts.clear();
+                for &v in ix.global {
+                    if !self.visited.test_and_set(v) {
+                        self.starts.push(v);
+                    }
+                }
+            }
+            PostfilterStarts::Configured => {
+                self.select_starts(plan, ix, q, ctr);
             }
         }
         ctr.n_start = self.starts.len() as u64;
@@ -1143,9 +1155,51 @@ impl Searcher {
         dists: &mut [f32],
         guard: Option<&mut Guard>,
     ) -> Option<usize> {
-        let kernel = &plan.kernel;
         ctr.route = Route::Graph;
         self.visited.clear();
+        self.select_starts(plan, ix, q, ctr);
+        ctr.n_start = self.starts.len() as u64;
+        match plan.fast {
+            FastPath::Postfilter if reference.is_none() && self.trace.is_none() => {
+                Some(self.fast_postfilter(ix, q, l, ctr, ids, dists))
+            }
+            FastPath::Inline if reference.is_none() && self.trace.is_none() => {
+                Some(self.fast_inline(ix, q, l, ctr, ids, dists))
+            }
+            _ => {
+                let witnesses = std::mem::take(&mut self.probe.witnesses);
+                let out = dispatch(
+                    plan.eval,
+                    plan.family,
+                    self,
+                    plan,
+                    ix,
+                    q,
+                    l,
+                    reference,
+                    ctr,
+                    ids,
+                    dists,
+                    guard,
+                    &witnesses,
+                );
+                self.probe.witnesses = witnesses;
+                out
+            }
+        }
+    }
+}
+
+impl Searcher {
+    /// Selects the kernel's starts of the query (marking them visited).
+    fn select_starts<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        ctr: &mut Counters,
+    ) {
+        let kernel = &plan.kernel;
         let predicate = if ix.label_view {
             let cnf = q
                 .view
@@ -1177,35 +1231,6 @@ impl Searcher {
             &mut self.pos,
             ctr,
         );
-        ctr.n_start = self.starts.len() as u64;
-        match plan.fast {
-            FastPath::Postfilter if reference.is_none() && self.trace.is_none() => {
-                Some(self.fast_postfilter(ix, q, l, ctr, ids, dists))
-            }
-            FastPath::Inline if reference.is_none() && self.trace.is_none() => {
-                Some(self.fast_inline(ix, q, l, ctr, ids, dists))
-            }
-            _ => {
-                let witnesses = std::mem::take(&mut self.probe.witnesses);
-                let out = dispatch(
-                    plan.eval,
-                    plan.family,
-                    self,
-                    plan,
-                    ix,
-                    q,
-                    l,
-                    reference,
-                    ctr,
-                    ids,
-                    dists,
-                    guard,
-                    &witnesses,
-                );
-                self.probe.witnesses = witnesses;
-                out
-            }
-        }
     }
 }
 
@@ -1260,14 +1285,14 @@ fn effort_l(costs: &UnitCosts, effort: usize, k: usize, rate: f64, n: usize) -> 
 /// `l`, and large enough for the search to evaluate as many nodes as the rank of the `K`-th
 /// match at the match rate with `Z` standard deviations, so that the `K` nearest matches are
 /// evaluated with high probability without label starts; at most `n`) and its nominal cost
-/// (infinite without matches).
-fn postfilter_option<T: Element>(
+/// with `starts` start nodes (infinite without matches).
+fn postfilter_option(
     costs: &UnitCosts,
-    ix: &Index<'_, T>,
     l: usize,
     k: usize,
     rate: f64,
     n: usize,
+    starts: usize,
 ) -> (usize, f64) {
     let rank = kth_match_rank(k, rate, Z);
     if !rank.is_finite() {
@@ -1275,7 +1300,7 @@ fn postfilter_option<T: Element>(
     }
     let l_need = costs.graph_l_for(rank).ceil().min(n as f64) as usize;
     let l_pf = l_need.max(l).min(n.max(1));
-    let starts = ix.global.len() as f64 * costs.graph_dist_ns;
+    let starts = starts as f64 * costs.graph_dist_ns;
     (l_pf, costs.postfilter_cost(l_pf as f64, k, rate) + starts)
 }
 

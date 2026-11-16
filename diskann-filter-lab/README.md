@@ -153,6 +153,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
 | `postfilter` | `off`, `cost` (a graph-routed query of the cost crossover takes the post-filter route when its nominal cost is at most the configured graph search's), `always` (every graph-routed query; a control): see below |
+| `postfilter_starts` | starts of the post-filter route: `global` (the graph's global starts), `configured` (the `starts` role, e.g. per-label starts) |
 | `exact_checks` | what the planned exact path and the probe check on their points, all members of `union(c*)`: `residual` (default: the clauses after `c*`, with prefetches for them) or `full` (every clause with the graph search's prefetch policy, as in batch B6) |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
@@ -248,7 +249,8 @@ seeded with the graph's answers (route `fallback`). Costs are model costs of the
 so trials are deterministic.
 
 **Post-filter route** (`postfilter = "cost"`, route `postfilter`): an unfiltered search from
-the graph's global starts with no predicate checks during the traversal; at the end the
+the graph's global starts (or the configured starts, `postfilter_starts = "configured"`) with
+no predicate checks during the traversal; at the end the
 evaluated nodes are checked in distance order until `K` matches are found. Its answers are
 those of a `heap(K)` collector over the same traversal (the `K` nearest evaluated matches by
 (distance, id)): the final beam holds the nearest evaluated nodes, so it is checked first and

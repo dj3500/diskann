@@ -1515,3 +1515,71 @@ fn the_effort_curve_plans_the_list_size_from_the_match_rate() {
     };
     assert!(Plan::new(&k, &ix0).is_err());
 }
+
+#[test]
+fn the_postfilter_route_with_the_configured_starts_keeps_the_heap_answers() {
+    // `postfilter_starts = configured`: the same traversal as the configured graph search
+    // (label starts, heap(K), heap-bound checks), so the same answers, with fewer checks.
+    let f = fixture(300, 47, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let base = [
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+    ];
+    let inline = khpad(&base);
+    let mut edits = base.to_vec();
+    edits.extend([
+        ("postfilter", "always"),
+        ("postfilter_starts", "configured"),
+    ]);
+    let route = khpad(&edits);
+    let (ip, rp) = (
+        Plan::new(&inline, &ix).unwrap(),
+        Plan::new(&route, &ix).unwrap(),
+    );
+    let mut st = Searcher::for_index(&ix, &[&ip, &rp]);
+    let (mut routed, mut fewer) = (0, 0);
+    for q in 0..f.preds.len() {
+        for kk in [1, 5, 10] {
+            let (out, ctr) = search_ix(&f, &ix, &mut st, &rp, q, 40, kk);
+            if ctr.route != Route::Postfilter {
+                continue;
+            }
+            routed += 1;
+            // The inline search at the route's list size: identical answers and traversal.
+            let l = (ctr.final_l - ctr.n_start) as usize;
+            let k2 = khpad(&[("laziness", "heap_bound"), ("terminator", "exhaust")]);
+            let p2 = Plan::new(&k2, &ix).unwrap();
+            let (want, wctr) = search_ix(&f, &ix, &mut st, &p2, q, l, kk);
+            assert_eq!(out, want, "q={q} K={kk}");
+            assert_eq!(
+                (ctr.n_dist, ctr.n_start),
+                (wctr.n_dist, wctr.n_start),
+                "q={q} K={kk}"
+            );
+            if ctr.n_pred - ctr.n_probe < wctr.n_pred {
+                fewer += 1;
+            }
+        }
+    }
+    let _ = ip;
+    assert!(
+        routed > 0 && fewer > 0,
+        "routed {routed}, fewer checks {fewer}"
+    );
+}
