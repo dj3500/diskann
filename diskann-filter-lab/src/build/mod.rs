@@ -38,7 +38,7 @@ use crate::{
 };
 
 pub use builder::{build, BuildOutput, BuildParams, BuildStats, Order};
-pub use candidates::{Candidates, LabelSubset, Lambda, PruneKey};
+pub use candidates::{BudgetOrder, Candidates, LabelSubset, Lambda, PruneKey};
 pub use pools::Pools;
 pub use prune::{Candidate, PruneRule};
 pub use replay::{replay, ReplayMode, ReplayOutput, ReplayParams};
