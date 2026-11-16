@@ -458,7 +458,7 @@ impl Plan {
         } else {
             None
         };
-        if kernel.terminator == Terminator::EffortCurve {
+        if matches!(kernel.terminator, Terminator::EffortCurve { .. }) {
             ensure!(
                 costs.as_ref().is_some_and(|c| !c.effort_r.is_empty()),
                 "effort_curve needs unit costs with an effort curve (effort_r, effort_k, effort_l)"
@@ -964,7 +964,7 @@ impl Searcher {
         let bounds = Estimates::from_bounds(&self.compiled, n);
         // The cheapest graph search: the list size of an unselective query.
         let l0 = match kernel.terminator {
-            Terminator::EffortCurve => effort_l(costs, l, k, 1.0, n),
+            Terminator::EffortCurve { .. } => effort_l(costs, l, k, 1.0, n, f64::INFINITY),
             _ => l,
         };
         let mut g0 = costs.graph_cost(l0 as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
@@ -1003,7 +1003,9 @@ impl Searcher {
             ),
             _ => 0.0,
         };
-        if e_up <= g0 + probe {
+        // Graph only: the estimates set the list size and the route, never the exact path.
+        let graph_only = kernel.crossover == Crossover::Graph;
+        if !graph_only && e_up <= g0 + probe {
             let est = bounds;
             let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
             record(ctr, p, e.min(e_up), g0, &est);
@@ -1032,7 +1034,7 @@ impl Searcher {
         };
         let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
         let l_plan = match kernel.terminator {
-            Terminator::EffortCurve => effort_l(costs, l, k, rate, n),
+            Terminator::EffortCurve { cap } => effort_l(costs, l, k, rate, n, cap),
             _ => planned_l(l, &est, scale),
         };
         let mut g = costs.graph_cost(l_plan as f64, k, rate, kernel.laziness) + starts;
@@ -1041,7 +1043,7 @@ impl Searcher {
         let hopeless = kernel.hopeless_gate && costs.graph_hopeless(l_plan as f64, &est);
         let mut l_run = if matches!(
             kernel.terminator,
-            Terminator::PostingL { .. } | Terminator::EffortCurve
+            Terminator::PostingL { .. } | Terminator::EffortCurve { .. }
         ) {
             l_plan
         } else {
@@ -1059,7 +1061,7 @@ impl Searcher {
         }
         record(ctr, p, e, g, &est);
         Decision {
-            exact: e <= g || (hopeless && !postfilter),
+            exact: !graph_only && (e <= g || (hopeless && !postfilter)),
             plan: p,
             est_exact: e,
             est_graph: g,
@@ -1283,18 +1285,26 @@ fn planned_l(l0: usize, est: &Estimates, scale: f64) -> usize {
     ((l0 as f64) * l_multiplier(rate, scale)).round().max(1.0) as usize
 }
 
-/// `effort_curve`: the calibrated unfiltered list size for the target recall `effort / 1000`
-/// at `K / rate` neighbours (at most `n`; `n` without matches).
-fn effort_l(costs: &UnitCosts, effort: usize, k: usize, rate: f64, n: usize) -> usize {
+/// `effort_curve(cap)`: the calibrated unfiltered list size for the target recall `effort / 1000`
+/// at `K / rate` neighbours (at most `n`; `n` without matches), at most `cap` times the list
+/// size at `K` neighbours.
+fn effort_l(costs: &UnitCosts, effort: usize, k: usize, rate: f64, n: usize, cap: f64) -> usize {
     let n = n.max(1) as f64;
-    let l = if rate > 0.0 {
-        let kprime = k.max(1) as f64 / rate.min(1.0);
+    let r = effort as f64 / 1000.0;
+    let curve = |kprime: f64| {
         costs
-            .effort_list(effort as f64 / 1000.0, kprime)
+            .effort_list(r, kprime)
             .expect("validated: effort_curve has a curve")
+    };
+    let mut l = if rate > 0.0 {
+        curve(k.max(1) as f64 / rate.min(1.0))
     } else {
         n
     };
+    if cap.is_finite() {
+        // At most `cap` times the list size of an unselective query (r̂ = 1).
+        l = l.min(cap * curve(k.max(1) as f64));
+    }
     l.ceil().clamp(1.0, n) as usize
 }
 
@@ -2016,7 +2026,7 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                 Terminator::Exhaust
                 | Terminator::AdaptiveL { .. }
                 | Terminator::PostingL { .. }
-                | Terminator::EffortCurve => {}
+                | Terminator::EffortCurve { .. } => {}
             }
             frontier.clear();
             while frontier.len() < beam_width {

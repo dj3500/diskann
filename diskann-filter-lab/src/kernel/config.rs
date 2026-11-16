@@ -143,8 +143,9 @@ pub enum Terminator {
     /// the graph's calibrated unfiltered effort for recall `R` at `K / r̂` neighbours (`r̂ =
     /// |M̂| / n`: a filtered search at match rate `r` as an unfiltered search for `K / r`
     /// neighbours), fixed before navigation; then `exhaust`. Needs the effort curve of the
-    /// unit costs and a cost crossover.
-    EffortCurve,
+    /// unit costs and a cost crossover. `effort_curve(cap)`: at most `cap` × the curve's list
+    /// size for an unselective query (`r̂ = 1`); `effort_curve`: no cap.
+    EffortCurve { cap: f64 },
 }
 
 /// How a query chooses between the graph search and the exact path.
@@ -157,6 +158,9 @@ pub enum Crossover {
     /// `cost`, then a bounded graph trial with online fallback to the exact path (needs the
     /// `heap` collector).
     Guarded,
+    /// Graph only (track G): the cost model's estimates set the list size (`posting_l`,
+    /// `effort_curve`) and choose the post-filter route, but the exact path is never taken.
+    Graph,
 }
 
 /// Source of the per-query estimates of the cost model and of `posting_l`.
@@ -750,9 +754,12 @@ impl Terminator {
             ("posting_l", [m]) => Self::PostingL {
                 scale: num(m, "posting-L scale")?,
             },
-            ("effort_curve", []) => Self::EffortCurve,
+            ("effort_curve", []) => Self::EffortCurve { cap: f64::INFINITY },
+            ("effort_curve", [c]) => Self::EffortCurve {
+                cap: num(c, "effort-curve cap")?,
+            },
             _ => bail!(
-                "unknown terminator {s:?} (exhaust, adaptive_l(sample, scale), budget(W), match_aware, posting_l(scale), effort_curve)"
+                "unknown terminator {s:?} (exhaust, adaptive_l(sample, scale), budget(W), match_aware, posting_l(scale), effort_curve(cap))"
             ),
         })
     }
@@ -766,7 +773,8 @@ impl fmt::Display for Terminator {
             Self::Budget(w) => write!(f, "budget({w})"),
             Self::MatchAware => write!(f, "match_aware"),
             Self::PostingL { scale } => write!(f, "posting_l({scale})"),
-            Self::EffortCurve => write!(f, "effort_curve"),
+            Self::EffortCurve { cap } if cap.is_infinite() => write!(f, "effort_curve"),
+            Self::EffortCurve { cap } => write!(f, "effort_curve({cap})"),
         }
     }
 }
@@ -851,7 +859,8 @@ impl Crossover {
             "threshold" => Self::Threshold,
             "cost" => Self::Cost,
             "guarded" => Self::Guarded,
-            _ => bail!("unknown crossover {s:?} (threshold, cost, guarded)"),
+            "graph" => Self::Graph,
+            _ => bail!("unknown crossover {s:?} (threshold, cost, guarded, graph)"),
         })
     }
 }
@@ -862,6 +871,7 @@ impl fmt::Display for Crossover {
             Self::Threshold => "threshold",
             Self::Cost => "cost",
             Self::Guarded => "guarded",
+            Self::Graph => "graph",
         })
     }
 }
@@ -990,10 +1000,13 @@ impl Kernel {
             Terminator::PostingL { scale } => {
                 ensure!(scale >= 1.0, "posting_l needs a scale of at least 1");
             }
-            Terminator::EffortCurve => ensure!(
-                self.crossover != Crossover::Threshold,
-                "effort_curve needs a cost crossover (the estimates and the calibrated curve)"
-            ),
+            Terminator::EffortCurve { cap } => {
+                ensure!(
+                    self.crossover != Crossover::Threshold,
+                    "effort_curve needs a cost crossover (the estimates and the calibrated curve)"
+                );
+                ensure!(cap >= 1.0, "effort_curve(cap) needs cap >= 1");
+            }
             Terminator::Exhaust => {}
         }
         if let Expander::TwoHop(Some(c)) = self.expander {
@@ -1046,8 +1059,11 @@ impl Kernel {
         }
         if self.postfilter != PostfilterRoute::Off {
             ensure!(
-                self.crossover == Crossover::Cost,
-                "the post-filter route needs the cost crossover (its estimates and costs)"
+                matches!(
+                    self.crossover,
+                    Crossover::Cost | Crossover::Guarded | Crossover::Graph
+                ),
+                "the post-filter route needs a cost crossover (its estimates and costs)"
             );
         }
         if let PredicateMode::StaticBits(t) = self.predicate {
@@ -1339,6 +1355,8 @@ mod tests {
             "budget(500)",
             "match_aware",
             "posting_l(16)",
+            "effort_curve",
+            "effort_curve(16)",
         ] {
             assert_eq!(Terminator::parse(s).unwrap().to_string(), s);
         }
@@ -1346,7 +1364,7 @@ mod tests {
             Terminator::parse("posting_l").unwrap(),
             Terminator::PostingL { scale: 16.0 }
         );
-        for s in ["threshold", "cost", "guarded"] {
+        for s in ["threshold", "cost", "guarded", "graph"] {
             assert_eq!(Crossover::parse(s).unwrap().to_string(), s);
         }
         for s in ["bounds", "sketch"] {

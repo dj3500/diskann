@@ -1407,52 +1407,58 @@ fn the_cost_rule_prefers_postfilters_for_frequent_matches() {
         sketches: Some(&sketches),
         ..f.index()
     };
-    let k = khpad(&[
-        ("exact", "planned"),
-        ("crossover", "cost"),
-        ("estimates", "sketch"),
-        ("terminator", "posting_l(4)"),
-        ("laziness", "heap_bound"),
-        ("postfilter", "cost"),
-    ]);
-    let plan = Plan::new(&k, &ix).unwrap();
-    let mut st = Searcher::for_index(&ix, &[&plan]);
-    let (mut pf, mut inline) = (0, 0);
-    for q in 0..f.preds.len() {
-        let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 10, 3);
-        check_properties(&f, q, &out, "cost rule");
-        let m = ctr.m_hat as f64;
-        if m == 0.0 {
-            continue;
-        }
-        // The post-filter alternative: a list size that evaluates the K-th match, about K / r
-        // checks, the global starts. The recorded graph estimate is the cheaper search.
-        let rate = m / 300.0;
-        let l_plan = (10.0 * super::cost::l_multiplier(rate, 4.0)).round();
-        let rank = super::cost::kth_match_rank(3, rate, super::cost::Z);
-        let l_pf = costs.graph_l_for(rank).ceil().max(l_plan).min(300.0);
-        let g_pf = costs.postfilter_cost(l_pf, 3, rate) + ix.global.len() as f64 * 10.0;
-        match ctr.route {
-            Route::Postfilter => {
-                pf += 1;
-                assert_eq!(ctr.est_graph_ns, g_pf.round() as u64, "q={q}");
-                assert_eq!(ctr.final_l, l_pf as u64 + ctr.n_start, "q={q}");
+    // The guarded crossover routes the same way (its trial guards only inline graph searches).
+    for crossover in ["cost", "guarded"] {
+        let k = khpad(&[
+            ("exact", "planned"),
+            ("crossover", crossover),
+            ("estimates", "sketch"),
+            ("terminator", "posting_l(4)"),
+            ("laziness", "heap_bound"),
+            ("postfilter", "cost"),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut st = Searcher::for_index(&ix, &[&plan]);
+        let (mut pf, mut inline) = (0, 0);
+        for q in 0..f.preds.len() {
+            let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 10, 3);
+            check_properties(&f, q, &out, "cost rule");
+            let m = ctr.m_hat as f64;
+            if m == 0.0 {
+                continue;
             }
-            Route::Graph => {
-                inline += 1;
-                assert!(
-                    (ctr.est_graph_ns as f64) < g_pf,
-                    "q={q}: {} >= {g_pf}",
-                    ctr.est_graph_ns
-                );
+            // The post-filter alternative: a list size that evaluates the K-th match, about K / r
+            // checks, the global starts. The recorded graph estimate is the cheaper search.
+            let rate = m / 300.0;
+            let l_plan = (10.0 * super::cost::l_multiplier(rate, 4.0)).round();
+            let rank = super::cost::kth_match_rank(3, rate, super::cost::Z);
+            let l_pf = costs.graph_l_for(rank).ceil().max(l_plan).min(300.0);
+            let g_pf = costs.postfilter_cost(l_pf, 3, rate) + ix.global.len() as f64 * 10.0;
+            match ctr.route {
+                Route::Postfilter => {
+                    pf += 1;
+                    assert_eq!(ctr.est_graph_ns, g_pf.round() as u64, "q={q}");
+                    assert_eq!(ctr.final_l, l_pf as u64 + ctr.n_start, "q={q}");
+                }
+                // A guarded inline trial may fall back to the exact path.
+                Route::Graph | Route::Fallback
+                    if ctr.route == Route::Graph || crossover == "guarded" =>
+                {
+                    inline += 1;
+                    assert!(
+                        (ctr.est_graph_ns as f64) < g_pf,
+                        "q={q}: {} >= {g_pf}",
+                        ctr.est_graph_ns
+                    );
+                }
+                r => panic!("q={q}: unexpected route {r:?}"),
             }
-            r => panic!("q={q}: unexpected route {r:?}"),
         }
+        assert!(
+            pf > 0 && inline > 0,
+            "{crossover}: both routes are used: {pf} / {inline}"
+        );
     }
-    assert!(
-        pf > 0 && inline > 0,
-        "both routes are used: {pf} / {inline}"
-    );
 }
 
 #[test]
@@ -1487,14 +1493,18 @@ fn hopeless_graph_searches_take_the_exact_path() {
     ];
     let mut off = s2.to_vec();
     off.push(("hopeless_gate", "off"));
+    // The graph-only crossover keeps hopeless searches on the graph.
+    let mut graph_only = s2.to_vec();
+    graph_only[1] = ("crossover", "graph");
     let (gated, ungated) = (khpad(&s2), khpad(&off));
     assert_eq!(gated.to_json().get("hopeless_gate"), None);
     assert_eq!(ungated.to_json()["hopeless_gate"], "off");
-    let (pg, pu) = (
+    let (pg, pu, po) = (
         Plan::new(&gated, &ix).unwrap(),
         Plan::new(&ungated, &ix).unwrap(),
+        Plan::new(&khpad(&graph_only), &ix).unwrap(),
     );
-    let mut st = Searcher::for_index(&ix, &[&pg, &pu]);
+    let mut st = Searcher::for_index(&ix, &[&pg, &pu, &po]);
     let (mut exact, mut graph) = (0, 0);
     for q in 0..f.preds.len() {
         let m = (0..300u32)
@@ -1505,9 +1515,12 @@ fn hopeless_graph_searches_take_the_exact_path() {
             let (out, ctr) = search_ix(&f, &ix, &mut st, &pg, q, l0, 3);
             check_properties(&f, q, &out, "gated");
             let (_, cu) = search_ix(&f, &ix, &mut st, &pu, q, l0, 3);
+            let (oo, co) = search_ix(&f, &ix, &mut st, &po, q, l0, 3);
+            check_properties(&f, q, &oo, "graph only");
             if q == 7 {
                 continue;
             }
+            assert_eq!(co.route, Route::Graph, "q={q} L0={l0}: graph only");
             assert_eq!(
                 cu.route,
                 Route::Graph,
@@ -1661,4 +1674,57 @@ fn the_postfilter_route_with_the_configured_starts_keeps_the_heap_answers() {
         routed > 0 && fewer > 0,
         "routed {routed}, fewer checks {fewer}"
     );
+}
+
+#[test]
+fn the_graph_crossover_never_takes_the_exact_path() {
+    use super::cost::UnitCosts;
+    // Expensive graph distances: the cost crossover sends many queries to the exact path; the
+    // graph crossover keeps every query on the graph (inline or post-filter), with valid answers.
+    let f = fixture(300, 47, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        graph_dist_ns: 1e6,
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    for (crossover, terminator) in [("cost", "effort_curve"), ("graph", "effort_curve(2)")] {
+        let k = khpad(&[
+            ("exact", "planned"),
+            ("crossover", crossover),
+            ("estimates", "sketch"),
+            ("terminator", terminator),
+            ("laziness", "heap_bound"),
+            ("postfilter", "cost"),
+            ("postfilter_starts", "configured"),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut st = Searcher::for_index(&ix, &[&plan]);
+        let mut exact = 0;
+        for q in 0..f.preds.len() {
+            let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 700, 10);
+            check_properties(&f, q, &out, crossover);
+            match ctr.route {
+                Route::Exact => exact += 1,
+                Route::Graph if crossover == "graph" => {
+                    // effort_curve(2): at most twice the list size of an unselective query.
+                    let cap = (2.0 * costs.effort_list(0.7, 10.0).unwrap()).ceil() as u64;
+                    assert!(ctr.final_l <= cap + ctr.n_start, "q={q}: {}", ctr.final_l);
+                }
+                _ => {}
+            }
+        }
+        if crossover == "graph" {
+            assert_eq!(exact, 0, "the graph crossover took the exact path");
+        } else {
+            assert!(exact > 0, "the cost crossover never took the exact path");
+        }
+    }
 }

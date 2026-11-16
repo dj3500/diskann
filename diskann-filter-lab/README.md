@@ -144,15 +144,15 @@ are navigated, never evaluated against the predicate and never returned.
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
-| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve) |
+| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve; `effort_curve(cap)`: at most `cap` × the list size of an unselective query) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
 | `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap` (default) or any subset |
-| `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector) |
+| `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector), `graph` (graph only, track G: the estimates set the list size and the post-filter route, the exact path is never taken) |
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
-| `postfilter` | `off`, `cost` (a graph-routed query of the cost crossover takes the post-filter route when its nominal cost is at most the configured graph search's), `always` (every graph-routed query; a control): see below |
+| `postfilter` | `off`, `cost` (a graph-routed query of the cost or guarded crossover takes the post-filter route when its nominal cost is at most the configured graph search's; under `guarded` the route itself is not guarded), `always` (every graph-routed query; a control): see below |
 | `postfilter_starts` | starts of the post-filter route: `global` (the graph's global starts), `configured` (the `starts` role, e.g. per-label starts) |
 | `exact_checks` | what the planned exact path and the probe check on their points, all members of `union(c*)`: `residual` (default: the clauses after `c*`, with prefetches for them) or `full` (every clause with the graph search's prefetch policy, as in batch B6) |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
@@ -220,8 +220,14 @@ read rows and bitset-only ones (`pred_row_ns`, `pred_bits_ns`; used for `scan` a
 merge and bitmap costs; galloping steps by gap, measured with the gallop plan on label pairs
 whose posting lengths have that ratio (`gallop_gap_ns`: cache misses grow with the gap); graph-search costs per distance and per predicate (and per distance by list size up to
 L = 40,960: long beams cost more per distance), and the predicate evaluations of `heap_bound`
-and `distance_first` searches (below). It takes a few
-seconds (1M points) to two minutes (40M) per dataset; the costs are loaded with the experiment
+and `distance_first` searches (below). With a graph it also measures the effort curve of
+`effort_curve` (`--effort-queries`, default 200; 0 skips it): midpoints of seeded random base
+pairs, their exact unfiltered ground truth (`K' ≤ 3,000`) from one scan of the base, one
+unfiltered search per query and list size `10·2^i ≤ --effort-lmax` (default 40,960) from the
+global start (the `K'` nearest evaluated nodes answer every `K'` at once), and per target recall
+the smallest list size reaching it (log-linear between sizes; above the largest, the power law
+of the miss rate through the last two sizes, at most 8× it). It takes a few
+seconds (1M points) to a few minutes (40M) per dataset; the costs are loaded with the experiment
 or configuration key `calibration`. Calibrations without the newer terms reproduce the batch-B6
 cost model.
 
@@ -263,7 +269,8 @@ nominal cost is the distances of that search plus about `K/r` checks. The cost c
 it when that is at most the configured graph search's cost (label starts, inline checks), and
 the exact path when that is cheaper still. `UnitCosts::effort_l` holds the optional effort
 curve of `effort_curve` (list sizes by target recall `effort_r` and neighbours `effort_k`,
-from unfiltered searches of base-derived queries; it is not measured by `flab calibrate`).
+from unfiltered searches of base-derived queries; measured by `flab calibrate` with a graph, see
+below).
 
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
