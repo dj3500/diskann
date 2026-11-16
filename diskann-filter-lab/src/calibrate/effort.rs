@@ -13,7 +13,8 @@
 //! - **Searches**: one plain unfiltered search per query and list size, from the global start,
 //!   collecting the `kmax` nearest evaluated nodes. The traversal does not depend on the
 //!   collector, so the `K'` nearest of them are the answers of a heap(K') search at the same list
-//!   size, for every `K' ≤ kmax`. List sizes 10·2^i up to `l_max`.
+//!   size, for every `K' ≤ kmax`. List sizes 10·2^i up to `l_max`, stopping after the first size at
+//!   which every K' has a mean recall of at least 0.995 (above the largest target recall, 0.99).
 //! - **Table**: mean tie-aware recall@K' per list size (made non-decreasing in L); per target
 //!   recall R and K', the smallest list size reaching R, log-linear in L between measured sizes.
 //!   Above the largest size the last two sizes give a power law, 1 − recall ∝ L^b, at most 8×
@@ -41,6 +42,8 @@ pub const R_GRID: [f64; 11] = [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.93, 0.95, 0.97, 
 pub const K_GRID: [usize; 6] = [10, 30, 100, 300, 1000, 3000];
 /// Extrapolation above the largest measured list size stops at this multiple of it.
 const EXTRAPOLATION_CAP: f64 = 8.0;
+/// The list sizes stop growing once every K' reaches this mean recall.
+const STOP_RECALL: f64 = 0.995;
 
 /// Options of the effort calibration.
 #[derive(Debug, Clone)]
@@ -98,7 +101,7 @@ fn midpoint<T: Element>(a: &[T], b: &[T]) -> Vec<T> {
             let m: Vec<u8> = a
                 .iter()
                 .zip(b)
-                .map(|(&x, &y)| ((x as u16 + y as u16 + 1) / 2) as u8)
+                .map(|(&x, &y)| (x as u16 + y as u16).div_ceil(2) as u8)
                 .collect();
             bytemuck::cast_slice(&m).to_vec()
         }
@@ -248,6 +251,8 @@ pub fn effort_curve<T: Element>(
     let (mut ids, mut ds) = (vec![0u32; kmax], vec![0f32; kmax]);
     let mut recall = vec![vec![0f64; ls.len()]; ks.len()];
     let mut n_dist = vec![0f64; ls.len()];
+    let m = queries.len() as f64;
+    let mut measured = ls.len();
     for (li, &l) in ls.iter().enumerate() {
         for (q, d_gt) in queries.iter().zip(&gt) {
             let query = Query {
@@ -264,10 +269,22 @@ pub fn effort_curve<T: Element>(
                 row[li] += hits as f64 / kp as f64;
             }
         }
+        for x in recall
+            .iter_mut()
+            .map(|row| &mut row[li])
+            .chain([&mut n_dist[li]])
+        {
+            *x /= m;
+        }
+        if recall.iter().all(|row| row[li] >= STOP_RECALL) {
+            measured = li + 1;
+            break;
+        }
     }
-    let m = queries.len() as f64;
-    for x in recall.iter_mut().flatten().chain(&mut n_dist) {
-        *x /= m;
+    ls.truncate(measured);
+    n_dist.truncate(measured);
+    for row in &mut recall {
+        row.truncate(measured);
     }
     let lsf: Vec<f64> = ls.iter().map(|&l| l as f64).collect();
     let top = lsf[lsf.len() - 1];

@@ -223,8 +223,9 @@ L = 40,960: long beams cost more per distance), and the predicate evaluations of
 and `distance_first` searches (below). With a graph it also measures the effort curve of
 `effort_curve` (`--effort-queries`, default 200; 0 skips it): midpoints of seeded random base
 pairs, their exact unfiltered ground truth (`K' ≤ 3,000`) from one scan of the base, one
-unfiltered search per query and list size `10·2^i ≤ --effort-lmax` (default 40,960) from the
-global start (the `K'` nearest evaluated nodes answer every `K'` at once), and per target recall
+unfiltered search per query and list size `10·2^i ≤ --effort-lmax` (default 40,960; it stops at
+the first size where every `K'` reaches a mean recall of 0.995) from the global start (the `K'`
+nearest evaluated nodes answer every `K'` at once), and per target recall
 the smallest list size reaching it (log-linear between sizes; above the largest, the power law
 of the miss rate through the last two sizes, at most 8× it). It takes a few
 seconds (1M points) to a few minutes (40M) per dataset; the costs are loaded with the experiment
