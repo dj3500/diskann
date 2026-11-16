@@ -180,7 +180,8 @@ pub struct BuildStats {
     pub n_filtered_searches: u64,
     pub n_dist_filtered: u64,
     pub n_member_tests: u64,
-    /// Label-penalty evaluations (`f(p, c)`) of penalized insertion searches.
+    /// Label-penalty evaluations (`f(p, c)`) of penalized insertion searches (nodes rejected by
+    /// their distance alone are not evaluated).
     pub n_penalty_evals: u64,
     /// Entries of the pools handed to the insertion prunes (after merging and repeats).
     pub n_pool_entries: u64,
@@ -211,6 +212,7 @@ struct Inserted {
     n_member_tests: u64,
     n_pool: u64,
     n_merged: u64,
+    n_penalty: u64,
 }
 
 /// Admits the members of one label (a bitset over the nodes).
@@ -229,6 +231,7 @@ impl Ranking for Members<'_> {
 struct Penalized<'b> {
     penalty: &'b Penalty<'b>,
     scratch: &'b PenaltyScratch,
+    evals: u64,
 }
 
 impl Ranking for Penalized<'_> {
@@ -239,6 +242,7 @@ impl Ranking for Penalized<'_> {
 
     #[inline(always)]
     fn key(&mut self, v: u32, d: f32) -> f32 {
+        self.evals += 1;
         self.penalty.key(self.scratch, v, d)
     }
 }
@@ -373,19 +377,27 @@ pub fn build<T: BuildElement>(
                         pen.begin(&mut prune_scratch.penalty, p);
                         pen.key == PruneKey::Penalized
                     });
-                    let n_dist = match &penalty {
-                        None => searcher.search(graph, &points, query, start, params.l_build),
-                        Some(pen) => searcher.search_ranked(
-                            graph,
-                            &points,
-                            query,
-                            start,
-                            params.l_build,
-                            &mut Penalized {
+                    let (n_dist, n_penalty) = match &penalty {
+                        None => (
+                            searcher.search(graph, &points, query, start, params.l_build),
+                            0,
+                        ),
+                        Some(pen) => {
+                            let mut ranking = Penalized {
                                 penalty: pen,
                                 scratch: &prune_scratch.penalty,
-                            },
-                        ),
+                                evals: 0,
+                            };
+                            let n = searcher.search_ranked(
+                                graph,
+                                &points,
+                                query,
+                                start,
+                                params.l_build,
+                                &mut ranking,
+                            );
+                            (n, ranking.evals)
+                        }
                     };
                     let n_expanded = searcher.expanded.len() as u64;
                     let mut candidates = std::mem::take(&mut searcher.expanded);
@@ -466,6 +478,7 @@ pub fn build<T: BuildElement>(
                         n_member_tests,
                         n_pool,
                         n_merged,
+                        n_penalty,
                     }
                 })
             })
@@ -487,6 +500,7 @@ pub fn build<T: BuildElement>(
             stats.n_pool_entries += ins.n_pool;
             stats.n_row_merges += u64::from(ins.n_merged > 0);
             stats.n_row_merge_entries += ins.n_merged;
+            stats.n_penalty_evals += ins.n_penalty;
         }
         if params.capture {
             for (k, ins) in inserted.into_iter().enumerate() {
@@ -576,10 +590,6 @@ pub fn build<T: BuildElement>(
         stats.n_label_checks += s.prune.n_label_checks;
     }
     stats.n_dist_reprune -= stats.n_dist_prune;
-    if penalty.is_some() {
-        // every distance of a penalized search evaluated the penalty once
-        stats.n_penalty_evals = stats.n_dist_search - stats.n_row_merge_entries;
-    }
     let dim = base.ncols();
     let aux = AuxNodes::new(
         vec![AuxKind::Frozen],
