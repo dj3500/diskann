@@ -42,6 +42,9 @@ pub enum Fallback {
     Incomplete = 3,
     /// A sampled match closer than the K-th answer at nominal termination.
     Witness = 4,
+    /// Post-filter route: the final beam held fewer than K matches, so every evaluated node
+    /// was checked in distance order (no second search).
+    Log = 5,
 }
 
 /// Points of the first probe stage: the probe stops there when the estimated match rate is at
@@ -275,6 +278,8 @@ pub struct Decision {
     pub est_graph: f64,
     /// List size of the graph search.
     pub l: usize,
+    /// The graph search is a post-filter search (list size `l`).
+    pub postfilter: bool,
 }
 
 #[cfg(test)]

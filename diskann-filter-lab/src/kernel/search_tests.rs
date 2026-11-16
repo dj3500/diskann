@@ -1306,3 +1306,212 @@ fn posting_l_fixes_the_list_size_before_navigation() {
         assert_eq!(ctr.final_l, want + ctr.n_start, "q={q}: m={m}");
     }
 }
+
+#[test]
+fn the_postfilter_route_returns_the_heap_answers_of_a_global_search() {
+    use super::cost::kth_match_rank;
+    // Every graph-routed query takes the post-filter route (`always`); exact routes only when
+    // the exact path is cheaper than the starts. Its answers are those of a heap collector
+    // over the same (unfiltered) traversal from the global start, with fewer checks.
+    let f = fixture(300, 37, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    // An expensive exact path: every query is graph-routed.
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let mut logged = 0;
+    for with_bits in [false, true] {
+        let ix = Index {
+            bitsets: with_bits.then_some(&f.bitsets),
+            costs: Some(&costs),
+            sketches: Some(&sketches),
+            ..f.index()
+        };
+        let route = khpad(&[
+            ("exact", "planned"),
+            ("crossover", "cost"),
+            ("estimates", "sketch"),
+            ("terminator", "posting_l(4)"),
+            ("laziness", "heap_bound"),
+            ("postfilter", "always"),
+        ]);
+        let heap = kernel(&[
+            ("collector", "heap"),
+            ("laziness", "heap_bound"),
+            ("starts", "global"),
+        ]);
+        let (rp, hp) = (
+            Plan::new(&route, &ix).unwrap(),
+            Plan::new(&heap, &ix).unwrap(),
+        );
+        let mut st = Searcher::for_index(&ix, &[&rp, &hp]);
+        let mut routed = 0;
+        for q in 0..f.preds.len() {
+            for kk in [1, 5, 10, 40] {
+                let (out, ctr) = search_ix(&f, &ix, &mut st, &rp, q, 8, kk);
+                let what = format!("bits={with_bits} q={q} K={kk}");
+                check_properties(&f, q, &out, &what);
+                if ctr.route != Route::Postfilter {
+                    continue;
+                }
+                routed += 1;
+                // The list size evaluates the K-th match's rank at the estimated rate, and is at
+                // least the planned list size of the graph search.
+                let rate = ctr.m_hat as f64 / 300.0;
+                let l_plan = (8.0 * super::cost::l_multiplier(rate, 4.0)).round() as u64;
+                let rank = kth_match_rank(kk, rate, super::cost::Z);
+                let need = costs.graph_l_for(rank).ceil() as u64;
+                let want = need.max(l_plan).min(300);
+                assert_eq!(ctr.final_l, want + ctr.n_start, "{what}");
+                let (base, bctr) = search_ix(&f, &ix, &mut st, &hp, q, want as usize, kk);
+                assert_eq!(out, base, "{what}");
+                assert_eq!(
+                    (ctr.n_dist, ctr.n_expand),
+                    (bctr.n_dist, bctr.n_expand),
+                    "{what}"
+                );
+                if ctr.fallback == super::planner::Fallback::Log as u64 {
+                    logged += 1;
+                } else {
+                    assert_eq!(ctr.fallback, 0, "{what}");
+                }
+            }
+        }
+        assert!(routed > 0, "no query took the post-filter route");
+    }
+    assert!(logged > 0, "the log of evaluated nodes was never needed");
+}
+
+#[test]
+fn the_cost_rule_prefers_postfilters_for_frequent_matches() {
+    use super::cost::UnitCosts;
+    // Expensive checks: a post-filter search wins when the K-th match is near (frequent
+    // matches) and loses when its list size would have to grow a lot.
+    let f = fixture(300, 41, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        graph_alpha: 1.0,
+        graph_beta: 10.0,
+        graph_dist_ns: 10.0,
+        graph_pred_ns: 1000.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let k = khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", "cost"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut st = Searcher::for_index(&ix, &[&plan]);
+    let (mut pf, mut inline) = (0, 0);
+    for q in 0..f.preds.len() {
+        let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 10, 3);
+        check_properties(&f, q, &out, "cost rule");
+        let m = ctr.m_hat as f64;
+        if m == 0.0 {
+            continue;
+        }
+        // The post-filter alternative: a list size that evaluates the K-th match, about K / r
+        // checks, the global starts. The recorded graph estimate is the cheaper search.
+        let rate = m / 300.0;
+        let l_plan = (10.0 * super::cost::l_multiplier(rate, 4.0)).round();
+        let rank = super::cost::kth_match_rank(3, rate, super::cost::Z);
+        let l_pf = costs.graph_l_for(rank).ceil().max(l_plan).min(300.0);
+        let g_pf = costs.postfilter_cost(l_pf, 3, rate) + ix.global.len() as f64 * 10.0;
+        match ctr.route {
+            Route::Postfilter => {
+                pf += 1;
+                assert_eq!(ctr.est_graph_ns, g_pf.round() as u64, "q={q}");
+                assert_eq!(ctr.final_l, l_pf as u64 + ctr.n_start, "q={q}");
+            }
+            Route::Graph => {
+                inline += 1;
+                assert!(
+                    (ctr.est_graph_ns as f64) < g_pf,
+                    "q={q}: {} >= {g_pf}",
+                    ctr.est_graph_ns
+                );
+            }
+            r => panic!("q={q}: unexpected route {r:?}"),
+        }
+    }
+    assert!(
+        pf > 0 && inline > 0,
+        "both routes are used: {pf} / {inline}"
+    );
+}
+
+#[test]
+fn the_effort_curve_plans_the_list_size_from_the_match_rate() {
+    use super::cost::UnitCosts;
+    // A curve over K' = 10 / 100 neighbours and recalls 0.5 / 0.9; an expensive exact path.
+    let f = fixture(300, 43, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..UnitCosts::default()
+    };
+    // Interpolation: log-linear in R, log-log in K'; clamped in R, proportional beyond K'.
+    let near = |r: f64, kp: f64, want: f64| {
+        let got = costs.effort_list(r, kp).unwrap();
+        assert!(
+            (got - want).abs() < 1e-6 * want,
+            "R={r} K'={kp}: {got} vs {want}"
+        );
+    };
+    near(0.5, 10.0, 10.0);
+    near(0.7, 10.0, 20.0);
+    near(0.9, 31.622_776_601_683_79, 80.0);
+    near(0.99, 400.0, 640.0);
+    near(0.3, 5.0, 10.0);
+    assert_eq!(UnitCosts::default().effort_list(0.9, 10.0), None);
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let k = khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "effort_curve"),
+        ("laziness", "heap_bound"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut st = Searcher::for_index(&ix, &[&plan]);
+    for q in 0..f.preds.len() {
+        let (out, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 700, 10);
+        check_properties(&f, q, &out, "effort_curve");
+        if ctr.m_hat == 0 {
+            continue;
+        }
+        assert_eq!(ctr.route, Route::Graph, "q={q}");
+        let kprime = 10.0 * 300.0 / ctr.m_hat as f64;
+        let want = costs.effort_list(0.7, kprime).unwrap().ceil().min(300.0) as u64;
+        assert_eq!(ctr.final_l, want + ctr.n_start, "q={q}");
+    }
+    // Without a curve, the plan is rejected.
+    let ix0 = Index {
+        costs: Some(&free_graph_costs()),
+        ..ix
+    };
+    assert!(Plan::new(&k, &ix0).is_err());
+}

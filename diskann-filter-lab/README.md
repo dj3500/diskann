@@ -144,7 +144,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
-| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16) |
+| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
@@ -152,6 +152,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector) |
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
+| `postfilter` | `off`, `cost` (a graph-routed query of the cost crossover takes the post-filter route when its nominal cost is at most the configured graph search's), `always` (every graph-routed query; a control): see below |
 | `exact_checks` | what the planned exact path and the probe check on their points, all members of `union(c*)`: `residual` (default: the clauses after `c*`, with prefetches for them) or `full` (every clause with the graph search's prefetch policy, as in batch B6) |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
@@ -244,6 +245,22 @@ exact cost (`forecast`), or when the graph's model cost reaches the estimated ex
 sampled match is closer than the K-th answer (`witness`). The fallback exhausts the exact path
 seeded with the graph's answers (route `fallback`). Costs are model costs of the counters,
 so trials are deterministic.
+
+**Post-filter route** (`postfilter = "cost"`, route `postfilter`): an unfiltered search from
+the graph's global starts with no predicate checks during the traversal; at the end the
+evaluated nodes are checked in distance order until `K` matches are found. Its answers are
+those of a `heap(K)` collector over the same traversal (the `K` nearest evaluated matches by
+(distance, id)): the final beam holds the nearest evaluated nodes, so it is checked first and
+the checks stop after the `K`-th match (and its distance ties); only when the whole beam
+holds fewer than `K` matches are the other evaluated nodes checked, from a log of every
+evaluated node (counter `fallback = 5`). The route's list size is the planned list size, raised
+until the search evaluates as many nodes as the rank of the `K`-th match at the estimated
+match rate `r` (negative binomial mean `K/r` plus `z = 2.576` standard deviations), and its
+nominal cost is the distances of that search plus about `K/r` checks. The cost crossover takes
+it when that is at most the configured graph search's cost (label starts, inline checks), and
+the exact path when that is cheaper still. `UnitCosts::effort_l` holds the optional effort
+curve of `effort_curve` (list sizes by target recall `effort_r` and neighbours `effort_k`,
+from unfiltered searches of base-derived queries; it is not measured by `flab calibrate`).
 
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,

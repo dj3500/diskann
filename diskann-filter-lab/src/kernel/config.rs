@@ -139,6 +139,12 @@ pub enum Terminator {
     /// estimated match rate (`|M̂| / n` from the `estimates` role), clamped to `scale`, fixed
     /// before navigation; then `exhaust`.
     PostingL { scale: f64 },
+    /// Calibrated effort: the effort is a target recall `R` in per mille, and the list size is
+    /// the graph's calibrated unfiltered effort for recall `R` at `K / r̂` neighbours (`r̂ =
+    /// |M̂| / n`: a filtered search at match rate `r` as an unfiltered search for `K / r`
+    /// neighbours), fixed before navigation; then `exhaust`. Needs the effort curve of the
+    /// unit costs and a cost crossover.
+    EffortCurve,
 }
 
 /// How a query chooses between the graph search and the exact path.
@@ -170,6 +176,41 @@ pub enum ExactChecks {
     Residual,
     /// Every clause, with the graph search's prefetch policy (batch B6).
     Full,
+}
+
+/// Whether graph-routed queries of the cost crossover may take a post-filter search instead
+/// of the configured graph search: the graph's global starts, no predicate checks during the
+/// traversal, and the final beam checked in distance order until `K` matches are found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PostfilterRoute {
+    /// Never.
+    Off,
+    /// When its nominal cost is at most that of the configured graph search, at a list size
+    /// that holds the `K` nearest matches with high probability at the estimated match rate.
+    Cost,
+    /// Always (a control).
+    Always,
+}
+
+impl PostfilterRoute {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "off" => Self::Off,
+            "cost" => Self::Cost,
+            "always" => Self::Always,
+            _ => bail!("unknown postfilter route {s:?} (off, cost, always)"),
+        })
+    }
+}
+
+impl fmt::Display for PostfilterRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Cost => "cost",
+            Self::Always => "always",
+        })
+    }
 }
 
 impl ExactChecks {
@@ -309,6 +350,7 @@ pub struct Kernel {
     /// Per-phase wall-clock timers of a query (probe, exact path phases, graph search) into
     /// its counters: a diagnostic, off by default (a few clock reads per query).
     pub phase_times: bool,
+    pub postfilter: PostfilterRoute,
 }
 
 impl Default for Kernel {
@@ -338,6 +380,7 @@ impl Default for Kernel {
             fallback: Fallbacks::ALL,
             exact_checks: ExactChecks::Residual,
             phase_times: false,
+            postfilter: PostfilterRoute::Off,
         }
     }
 }
@@ -639,8 +682,9 @@ impl Terminator {
             ("posting_l", [m]) => Self::PostingL {
                 scale: num(m, "posting-L scale")?,
             },
+            ("effort_curve", []) => Self::EffortCurve,
             _ => bail!(
-                "unknown terminator {s:?} (exhaust, adaptive_l(sample, scale), budget(W), match_aware, posting_l(scale))"
+                "unknown terminator {s:?} (exhaust, adaptive_l(sample, scale), budget(W), match_aware, posting_l(scale), effort_curve)"
             ),
         })
     }
@@ -654,6 +698,7 @@ impl fmt::Display for Terminator {
             Self::Budget(w) => write!(f, "budget({w})"),
             Self::MatchAware => write!(f, "match_aware"),
             Self::PostingL { scale } => write!(f, "posting_l({scale})"),
+            Self::EffortCurve => write!(f, "effort_curve"),
         }
     }
 }
@@ -814,6 +859,7 @@ impl Kernel {
                     v => bail!("unknown phase_times {v:?} (on, off)"),
                 }
             }
+            "postfilter" => self.postfilter = PostfilterRoute::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -867,6 +913,10 @@ impl Kernel {
             Terminator::PostingL { scale } => {
                 ensure!(scale >= 1.0, "posting_l needs a scale of at least 1");
             }
+            Terminator::EffortCurve => ensure!(
+                self.crossover != Crossover::Threshold,
+                "effort_curve needs a cost crossover (the estimates and the calibrated curve)"
+            ),
             Terminator::Exhaust => {}
         }
         if let Expander::TwoHop(Some(c)) = self.expander {
@@ -915,6 +965,12 @@ impl Kernel {
             ensure!(
                 self.collector == Collector::Heap,
                 "the guarded crossover needs the heap collector (its answers seed the fallback)"
+            );
+        }
+        if self.postfilter != PostfilterRoute::Off {
+            ensure!(
+                self.crossover == Crossover::Cost,
+                "the post-filter route needs the cost crossover (its estimates and costs)"
             );
         }
         if let PredicateMode::StaticBits(t) = self.predicate {
@@ -975,6 +1031,10 @@ impl Kernel {
         // Only when on: the hashes of configurations without timers do not change.
         if self.phase_times {
             j["phase_times"] = json!("on");
+        }
+        // Only when set, so that the JSON (and hashes) of other configurations do not change.
+        if self.postfilter != PostfilterRoute::Off {
+            j["postfilter"] = json!(self.postfilter.to_string());
         }
         j
     }

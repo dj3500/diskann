@@ -142,6 +142,15 @@ pub struct UnitCosts {
     /// Per query: compiling the predicate and planning (0 if not calibrated).
     #[serde(default)]
     pub query_ns: f64,
+    /// Unfiltered effort curve of the graph (base-derived queries): `effort_l[i][j]` is the
+    /// list size at which the mean unfiltered recall at `effort_k[j]` neighbours reaches
+    /// `effort_r[i]` (both increasing); empty when not calibrated.
+    #[serde(default)]
+    pub effort_r: Vec<f64>,
+    #[serde(default)]
+    pub effort_k: Vec<f64>,
+    #[serde(default)]
+    pub effort_l: Vec<Vec<f64>>,
 }
 
 impl Default for UnitCosts {
@@ -179,6 +188,9 @@ impl Default for UnitCosts {
             check_prefetch_ns: Vec::new(),
             check_row_ns: Vec::new(),
             query_ns: 0.0,
+            effort_r: Vec::new(),
+            effort_k: Vec::new(),
+            effort_l: Vec::new(),
         }
     }
 }
@@ -271,6 +283,15 @@ impl UnitCosts {
                             .iter()
                             .all(|r| r.len() == self.heap_bound_l.len())),
             "extra(K, L) needs one row per heap size and one value per list size"
+        );
+        anyhow::ensure!(
+            self.effort_l.len() == self.effort_r.len()
+                && self.effort_l.iter().all(|row| row.len() == self.effort_k.len())
+                && self.effort_r.windows(2).all(|w| w[0] < w[1])
+                && self.effort_k.windows(2).all(|w| w[0] < w[1])
+                && self.effort_k.iter().all(|&k| k >= 1.0)
+                && self.effort_l.iter().flatten().all(|&l| l.is_finite() && l >= 1.0),
+            "the effort curve needs increasing recalls and neighbour counts and one list size (>= 1) each"
         );
         anyhow::ensure!(
             scalars
@@ -471,6 +492,78 @@ impl UnitCosts {
     pub fn charged(&self, n_dist: u64, n_pred: u64) -> f64 {
         n_dist as f64 * self.graph_dist_ns + n_pred as f64 * self.graph_pred_ns
     }
+
+    /// Nominal cost of a post-filter search at list size `l` (heap size `k`, match rate
+    /// `rate`): the distances of an unfiltered search, and the checks of the evaluated nodes
+    /// in distance order until `k` matches are found (about `k / rate`, at most all of them).
+    pub fn postfilter_cost(&self, l: f64, k: usize, rate: f64) -> f64 {
+        let d = self.graph_dists(l);
+        let checks = if rate > 0.0 {
+            d.min(k.max(1) as f64 / rate.min(1.0))
+        } else {
+            d
+        };
+        d * self.graph_dist_ns + checks * self.graph_pred_ns
+    }
+
+    /// The calibrated unfiltered list size for mean recall `r` at `kprime` neighbours:
+    /// log-linear interpolation in the recall and log-log in the neighbours, clamped to the
+    /// calibrated recalls; beyond the largest calibrated neighbour count it grows in proportion
+    /// to it. `None` without a curve.
+    pub fn effort_list(&self, r: f64, kprime: f64) -> Option<f64> {
+        let (rs, ks) = (&self.effort_r, &self.effort_k);
+        if rs.is_empty() || ks.is_empty() {
+            return None;
+        }
+        // Bracket and weight of `x` in the increasing grid `g` (clamped).
+        let at = |g: &[f64], x: f64| -> (usize, usize, f64) {
+            if x <= g[0] {
+                return (0, 0, 0.0);
+            }
+            let last = g.len() - 1;
+            if x >= g[last] {
+                return (last, last, 0.0);
+            }
+            let i = g.partition_point(|&v| v <= x);
+            (i - 1, i, (x - g[i - 1]) / (g[i] - g[i - 1]))
+        };
+        let kp = kprime.max(1.0);
+        let lk: Vec<f64> = ks.iter().map(|k| k.ln()).collect();
+        let (j0, j1, u) = at(&lk, kp.ln());
+        let (i0, i1, t) = at(rs, r);
+        let row = |i: usize| {
+            let row = &self.effort_l[i];
+            (1.0 - u) * row[j0].ln() + u * row[j1].ln()
+        };
+        let l = ((1.0 - t) * row(i0) + t * row(i1)).exp();
+        let top = ks[ks.len() - 1];
+        Some(if kp > top { l * kp / top } else { l })
+    }
+
+    /// The smallest list size whose graph search computes `nodes` distances (the inverse of
+    /// [`Self::graph_dists`]; 0 when the calibration has no growth with `L`).
+    pub fn graph_l_for(&self, nodes: f64) -> f64 {
+        let ds = &self.graph_l_dists;
+        if ds.len() > 1 && ds.windows(2).all(|w| w[0] < w[1]) {
+            // The measured curve is piecewise linear in log-log: its inverse swaps the axes.
+            return loglog(ds, &self.graph_l, nodes.max(1.0));
+        }
+        if self.graph_alpha <= 0.0 {
+            return 0.0;
+        }
+        ((nodes - self.graph_beta) / self.graph_alpha).max(0.0)
+    }
+}
+
+/// Rank of the `k`-th match among points in distance order when each point matches
+/// independently with probability `rate`: the negative binomial mean `k / rate` plus `z`
+/// standard deviations (`√(k (1 − rate)) / rate`); infinite at rate 0.
+pub fn kth_match_rank(k: usize, rate: f64, z: f64) -> f64 {
+    if rate.is_nan() || rate <= 0.0 {
+        return f64::INFINITY;
+    }
+    let (k, r) = (k.max(1) as f64, rate.min(1.0));
+    k / r + z * (k * (1.0 - r)).sqrt() / r
 }
 
 /// An exact plan (see the module documentation).
@@ -1039,6 +1132,21 @@ mod tests {
         c.heap_bound_extra_kl[1].push(1200.0);
         c.graph_l_dists[0] = 0.0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn graph_l_for_inverts_the_distance_count() {
+        let line = UnitCosts::default();
+        assert!((line.graph_l_for(line.graph_dists(300.0)) - 300.0).abs() < 1e-9);
+        let c = UnitCosts {
+            graph_l: vec![10.0, 100.0, 1000.0],
+            graph_l_dists: vec![100.0, 500.0, 2000.0],
+            ..UnitCosts::default()
+        };
+        for l in [5.0, 10.0, 31.6, 100.0, 640.0, 5000.0] {
+            let back = c.graph_l_for(c.graph_dists(l));
+            assert!((back - l).abs() < 1e-6 * l, "{l} -> {back}");
+        }
     }
 
     #[test]

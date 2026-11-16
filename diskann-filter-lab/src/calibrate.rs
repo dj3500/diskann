@@ -652,6 +652,8 @@ pub fn calibrate<T: Element>(
         check_prefetch_ns,
         check_row_ns,
         query_ns,
+        // The effort curve is calibrated separately (base-derived queries).
+        ..UnitCosts::default()
     };
     costs.validate()?;
     details.insert("graph".into(), graph_doc);

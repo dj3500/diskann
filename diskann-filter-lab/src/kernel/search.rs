@@ -15,8 +15,13 @@ use super::{
     config::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
-    config::{Crossover, EstimateSource, ExactChecks, StartAdmission, StartSource, Terminator},
-    cost::{l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts},
+    config::{
+        Crossover, EstimateSource, ExactChecks, PostfilterRoute, StartAdmission, StartSource,
+        Terminator,
+    },
+    cost::{
+        kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
+    },
     entry::{self, SampleIndex, StartPredicate},
     eval::{
         ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
@@ -100,6 +105,8 @@ pub enum Route {
     Empty,
     /// A guarded graph trial, then the exact path.
     Fallback,
+    /// A post-filter search (global starts, no checks during the traversal).
+    Postfilter,
 }
 
 impl Route {
@@ -109,6 +116,7 @@ impl Route {
             Self::Exact => "exact",
             Self::Empty => "empty",
             Self::Fallback => "fallback",
+            Self::Postfilter => "postfilter",
         }
     }
 }
@@ -440,6 +448,12 @@ impl Plan {
         } else {
             None
         };
+        if kernel.terminator == Terminator::EffortCurve {
+            ensure!(
+                costs.as_ref().is_some_and(|c| !c.effort_r.is_empty()),
+                "effort_curve needs unit costs with an effort curve (effort_r, effort_k, effort_l)"
+            );
+        }
         if kernel.estimates == EstimateSource::Sketch {
             let sk = ix.sketches.ok_or_else(|| {
                 anyhow::anyhow!("the sketch estimates need bottom-b sketches of the labels")
@@ -630,6 +644,8 @@ pub struct Searcher {
     pos: Vec<usize>,
     probe: Probe,
     last_estimates: Estimates,
+    /// Every node a post-filter route evaluated, as packed (distance, id).
+    log: Vec<u64>,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
 }
@@ -663,6 +679,7 @@ impl Searcher {
             pos: Vec::new(),
             probe: Probe::new(),
             last_estimates: Estimates::default(),
+            log: Vec::new(),
             trace: None,
         }
     }
@@ -801,6 +818,11 @@ impl Searcher {
                 ctr.route = Route::Exact;
                 self.exact_v2(plan, ix, q, k, d.plan, exact_stat, false, &mut ctr);
                 self.answers.finish(ids, dists)
+            } else if d.postfilter {
+                let t = tic(&ctr);
+                let n = self.postfilter(ix, q, d.l, exact_stat, &mut ctr, ids, dists);
+                toc(t, &mut ctr.t_graph_ns);
+                n
             } else {
                 let costs = plan.costs.as_ref().expect("validated");
                 let mut guard = (kernel.crossover == Crossover::Guarded && reference.is_none())
@@ -928,7 +950,15 @@ impl Searcher {
         let starts = start_count(kernel, ix, &self.compiled) as f64
             * (costs.graph_dist_ns + costs.graph_pred_ns);
         let bounds = Estimates::from_bounds(&self.compiled, n);
-        let g0 = costs.graph_cost(l as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
+        // The cheapest graph search: the list size of an unselective query.
+        let l0 = match kernel.terminator {
+            Terminator::EffortCurve => effort_l(costs, l, k, 1.0, n),
+            _ => l,
+        };
+        let mut g0 = costs.graph_cost(l0 as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
+        if kernel.postfilter != PostfilterRoute::Off {
+            g0 = g0.min(postfilter_option(costs, ix, l0, k, bounds.m / bounds.n, n).1);
+        }
         let pi = PlanInputs {
             q: &self.compiled,
             labels: ix.labels,
@@ -969,6 +999,7 @@ impl Searcher {
                 est_exact: e.min(e_up),
                 est_graph: g0,
                 l,
+                postfilter: false,
             };
         }
         let est = self.estimates(plan, ix, exact_stat, ctr);
@@ -983,20 +1014,71 @@ impl Searcher {
             Terminator::PostingL { scale } | Terminator::AdaptiveL { scale, .. } => scale,
             _ => 1.0,
         };
-        let l_plan = planned_l(l, &est, scale);
         let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
-        let g = costs.graph_cost(l_plan as f64, k, rate, kernel.laziness) + starts;
+        let l_plan = match kernel.terminator {
+            Terminator::EffortCurve => effort_l(costs, l, k, rate, n),
+            _ => planned_l(l, &est, scale),
+        };
+        let mut g = costs.graph_cost(l_plan as f64, k, rate, kernel.laziness) + starts;
+        let mut l_run = if matches!(
+            kernel.terminator,
+            Terminator::PostingL { .. } | Terminator::EffortCurve
+        ) {
+            l_plan
+        } else {
+            l
+        };
+        // The post-filter alternative at a list size that holds the K nearest matches.
+        let mut postfilter = false;
+        if kernel.postfilter != PostfilterRoute::Off {
+            let (l_pf, g_pf) = postfilter_option(costs, ix, l_run, k, rate, n);
+            if g_pf.is_finite() && (kernel.postfilter == PostfilterRoute::Always || g_pf <= g) {
+                (postfilter, l_run, g) = (true, l_pf, g_pf);
+            }
+        }
         record(ctr, p, e, g, &est);
         Decision {
             exact: e <= g,
             plan: p,
             est_exact: e,
             est_graph: g,
-            l: if matches!(kernel.terminator, Terminator::PostingL { .. }) {
-                l_plan
-            } else {
-                l
-            },
+            l: l_run,
+            postfilter,
+        }
+    }
+
+    /// The post-filter route: an unfiltered search with list size `l` from the graph's global
+    /// starts; the answers of a `heap(K)` collector over the evaluated nodes, found by
+    /// checking them in distance order until `K` matches (with the static bitsets when the
+    /// index has them).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    fn postfilter<T: Element>(
+        &mut self,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        exact_stat: Option<&LabelBitsets>,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
+        ctr.route = Route::Postfilter;
+        self.visited.clear();
+        self.starts.clear();
+        for &v in ix.global {
+            if !self.visited.test_and_set(v) {
+                self.starts.push(v);
+            }
+        }
+        ctr.n_start = self.starts.len() as u64;
+        match exact_stat {
+            Some(b) => {
+                self.postfilter_loop::<T, StaticBits>(ix, q, l, Some(b), true, ctr, ids, dists)
+            }
+            None => self.postfilter_loop::<T, RowScan>(ix, q, l, None, true, ctr, ids, dists),
         }
     }
 
@@ -1157,6 +1239,44 @@ fn start_count<T: Element>(kernel: &Kernel, ix: &Index<'_, T>, q: &Compiled) -> 
 fn planned_l(l0: usize, est: &Estimates, scale: f64) -> usize {
     let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
     ((l0 as f64) * l_multiplier(rate, scale)).round().max(1.0) as usize
+}
+
+/// `effort_curve`: the calibrated unfiltered list size for the target recall `effort / 1000`
+/// at `K / rate` neighbours (at most `n`; `n` without matches).
+fn effort_l(costs: &UnitCosts, effort: usize, k: usize, rate: f64, n: usize) -> usize {
+    let n = n.max(1) as f64;
+    let l = if rate > 0.0 {
+        let kprime = k.max(1) as f64 / rate.min(1.0);
+        costs
+            .effort_list(effort as f64 / 1000.0, kprime)
+            .expect("validated: effort_curve has a curve")
+    } else {
+        n
+    };
+    l.ceil().clamp(1.0, n) as usize
+}
+
+/// The post-filter alternative of a graph search with list size `l`: its list size (at least
+/// `l`, and large enough for the search to evaluate as many nodes as the rank of the `K`-th
+/// match at the match rate with `Z` standard deviations, so that the `K` nearest matches are
+/// evaluated with high probability without label starts; at most `n`) and its nominal cost
+/// (infinite without matches).
+fn postfilter_option<T: Element>(
+    costs: &UnitCosts,
+    ix: &Index<'_, T>,
+    l: usize,
+    k: usize,
+    rate: f64,
+    n: usize,
+) -> (usize, f64) {
+    let rank = kth_match_rank(k, rate, Z);
+    if !rank.is_finite() {
+        return (l, f64::INFINITY);
+    }
+    let l_need = costs.graph_l_for(rank).ceil().min(n as f64) as usize;
+    let l_pf = l_need.max(l).min(n.max(1));
+    let starts = ix.global.len() as f64 * costs.graph_dist_ns;
+    (l_pf, costs.postfilter_cost(l_pf as f64, k, rate) + starts)
 }
 
 /// Records the crossover's estimates in the counters.
@@ -1852,7 +1972,8 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                 }
                 Terminator::Exhaust
                 | Terminator::AdaptiveL { .. }
-                | Terminator::PostingL { .. } => {}
+                | Terminator::PostingL { .. }
+                | Terminator::EffortCurve => {}
             }
             frontier.clear();
             while frontier.len() < beam_width {

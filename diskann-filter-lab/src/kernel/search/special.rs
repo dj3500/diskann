@@ -10,12 +10,14 @@
 //! configurable loop costs a few percent more than these loops (`examples/kernel_overhead.rs`).
 
 use super::{Counters, Index, Query, Searcher, LOOKAHEAD};
+use crate::kernel::planner::Fallback;
 use crate::{
+    bitsets::LabelBitsets,
     kernel::{
         beam::{Inserted, State},
         collect::Collector,
         eval::{Eval, EvalCtx, RowScan},
-        fkey,
+        fkey, pack, unpack,
     },
     vectors::Element,
 };
@@ -50,7 +52,37 @@ impl Searcher {
         ids: &mut [u32],
         dists: &mut [f32],
     ) -> usize {
+        self.postfilter_loop::<T, RowScan>(ix, q, l, None, false, ctr, ids, dists)
+    }
+
+    /// Unfiltered search with list size `l` from the selected starts, then collection with the
+    /// evaluator `P` (static bitsets `bits` if given):
+    /// - `deferred = false` (the `postfilter` preset): every one of the first `l` data
+    ///   entries of the final beam is checked, and the matches are the answers;
+    /// - `deferred = true`: the answers of a `heap(K)` collector over every evaluated node
+    ///   (the `K` nearest matches by (distance, id)), found by checking the final beam in
+    ///   distance order until `K` matches and the entries at the `K`-th match's distance are
+    ///   checked; nodes outside the final beam are farther than all of its entries, so they
+    ///   are checked (in (distance, id) order, from a log of every evaluated node) only when
+    ///   the whole beam was checked.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    pub(super) fn postfilter_loop<T: Element, P: Eval>(
+        &mut self,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        bits: Option<&LabelBitsets>,
+        deferred: bool,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
         let k = ids.len();
+        let log = &mut self.log;
+        log.clear();
         let n_data = ix.graph.n_data() as u32;
         let (graph, vectors, qv) = (ix.graph, ix.vectors, q.vector);
         let beam = &mut self.beam32;
@@ -61,6 +93,9 @@ impl Searcher {
             let d = T::squared_l2(qv, vectors.get(s));
             c.n_dist += 1;
             let state = if s < n_data {
+                if deferred {
+                    log.push(pack(d, s));
+                }
                 State::Unknown
             } else {
                 c.n_aux_dist += 1;
@@ -98,6 +133,9 @@ impl Searcher {
                 let v = nbrs[i];
                 let d = T::squared_l2(qv, vectors.get(v));
                 let state = if v < n_data {
+                    if deferred {
+                        log.push(pack(d, v));
+                    }
                     State::Unknown
                 } else {
                     c.n_aux_dist += 1;
@@ -112,21 +150,48 @@ impl Searcher {
             }
         }
         c.n_hops = c.n_expand;
-        let cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+        let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+        if let Some(b) = bits {
+            cx = cx.with_static(b);
+        }
         self.answers.reset(Collector::FinalBeam, k, l);
-        let mut taken = 0;
+        let limit = if deferred { usize::MAX } else { l };
+        let (mut taken, mut found, mut bound) = (0, 0, f32::INFINITY);
+        let mut stopped = false;
         for i in 0..beam.len() {
             let e = beam.entry(i);
             if e.state == State::Aux {
                 continue;
             }
-            if taken == l {
+            if taken == limit || e.d > bound {
+                stopped = true;
                 break;
             }
             taken += 1;
             c.n_pred += 1;
-            if RowScan::full(&cx, e.id) {
+            if P::full(&cx, e.id) {
                 self.answers.offer(e.d, e.id);
+                found += 1;
+                if deferred && found == k {
+                    bound = e.d;
+                }
+            }
+        }
+        if deferred && !stopped && k > 0 {
+            // The whole beam was checked: the K nearest matches of every evaluated node, in
+            // (distance, id) order.
+            ctr.fallback = Fallback::Log as u64;
+            self.answers.reset(Collector::Heap, k, l);
+            log.sort_unstable();
+            for &p in log.iter() {
+                let (d, id) = unpack(p);
+                if self.answers.is_full() && d > self.answers.worst() {
+                    break;
+                }
+                c.n_pred += 1;
+                if P::full(&cx, id) {
+                    self.answers.offer(d, id);
+                }
             }
         }
         ctr.add(&c);
