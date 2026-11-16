@@ -69,14 +69,16 @@ pub enum PruneRule {
     /// C++ library (`Index::occlude_list`): a selected `r` may occlude a candidate `c` only if
     /// every label of `c` is a label of `r` (`F_c ⊆ F_r`), whatever the labels of `p`.
     LabelContainment { r: usize, alpha: f32 },
-    /// `source_containment(R, α[, θ])`: the FilteredVamana paper's rule (Algorithm 3): `r` may
-    /// occlude `c` only if `F_p ∩ F_c ⊆ F_r`. With `θ`, only labels with at most `θ` points
-    /// count (`F_p ∩ F_c ∩ Θ ⊆ F_r`, `Θ` = labels with at most `θ` points): the rule then
-    /// protects exactly the labels a capped filtered insertion builds structure for.
+    /// `source_containment(R, α[, θ[, B]])`: the FilteredVamana paper's rule (Algorithm 3): `r`
+    /// may occlude `c` only if `F_p ∩ F_c ⊆ F_r`. With `θ`, only labels with at most `θ` points
+    /// count (`F_p ∩ F_c ∩ Θ ⊆ F_r`, `Θ` = labels with at most `θ` points); with `B`, only the
+    /// `B` rarest of them (fewest points, then smallest id). The rule then protects exactly the
+    /// labels a capped (and budgeted) filtered insertion builds structure for.
     SourceContainment {
         r: usize,
         alpha: f32,
         theta: Option<u32>,
+        budget: Option<u32>,
     },
     /// `coverage(R, α, B[, k])`: coverage-budgeted pruning. The first `R − B` neighbors of the
     /// label-blind RobustPrune are kept; then, for the labels of `p` from the rarest (fewest
@@ -138,13 +140,18 @@ impl PruneRule {
             Self::SourceContainment {
                 r,
                 alpha,
-                theta: None,
-            } => format!("sc-R{r}-a{alpha}"),
-            Self::SourceContainment {
-                r,
-                alpha,
-                theta: Some(t),
-            } => format!("sc-R{r}-a{alpha}-t{t}"),
+                theta,
+                budget,
+            } => {
+                let mut t = format!("sc-R{r}-a{alpha}");
+                if let Some(theta) = theta {
+                    t += &format!("-t{theta}");
+                }
+                if let Some(b) = budget {
+                    t += &format!("-b{b}");
+                }
+                t
+            }
             Self::Coverage {
                 r,
                 alpha,
@@ -228,17 +235,24 @@ impl PruneRule {
                 };
                 robust_prune(pool, states, selected, r, alpha, permit, &mut dist);
             }
-            Self::SourceContainment { r, alpha, theta } => {
+            Self::SourceContainment {
+                r,
+                alpha,
+                theta,
+                budget,
+            } => {
                 let labels = labels.expect(NEEDS_LABELS);
                 let mut f_p = labels.row(source);
-                if let Some(t) = theta {
+                if theta.is_some() || budget.is_some() {
                     let store = labels.store();
+                    let t = theta.map_or(usize::MAX, |t| t as usize);
                     protected.clear();
-                    protected.extend(
-                        f_p.iter()
-                            .copied()
-                            .filter(|&l| store.posting_len(l) <= t as usize),
-                    );
+                    protected.extend(f_p.iter().copied().filter(|&l| store.posting_len(l) <= t));
+                    if let Some(b) = budget.filter(|&b| protected.len() > b as usize) {
+                        protected.sort_unstable_by_key(|&l| (store.posting_len(l), l));
+                        protected.truncate(b as usize);
+                        protected.sort_unstable();
+                    }
                     f_p = &protected[..];
                 }
                 if f_p.is_empty() {
@@ -368,13 +382,19 @@ impl fmt::Display for PruneRule {
             Self::SourceContainment {
                 r,
                 alpha,
-                theta: None,
-            } => write!(f, "source_containment({r}, {alpha})"),
-            Self::SourceContainment {
-                r,
-                alpha,
-                theta: Some(t),
-            } => write!(f, "source_containment({r}, {alpha}, {t})"),
+                theta,
+                budget,
+            } => {
+                write!(f, "source_containment({r}, {alpha}")?;
+                match (theta, budget) {
+                    (None, None) => {}
+                    (Some(t), None) => write!(f, ", {t}")?,
+                    (t, Some(b)) => {
+                        write!(f, ", {}, {b}", t.map_or("inf".into(), |t| t.to_string()))?;
+                    }
+                }
+                write!(f, ")")
+            }
             Self::Coverage {
                 r,
                 alpha,
@@ -393,7 +413,7 @@ impl fmt::Display for PruneRule {
 impl FromStr for PruneRule {
     type Err = anyhow::Error;
 
-    /// `alpha(R[, α])`, `label_containment(R[, α])`, `source_containment(R[, α[, θ]])`,
+    /// `alpha(R[, α])`, `label_containment(R[, α])`, `source_containment(R[, α[, θ|inf[, B]]])`,
     /// `coverage(R, α, B[, k])`, `split(R_geo, R_lab[, α])`; α defaults to 1.2, k to 1.
     fn from_str(s: &str) -> Result<Self> {
         let s = s.trim();
@@ -445,17 +465,20 @@ impl FromStr for PruneRule {
                 }
             }
             "source_containment" => {
-                arity(1, 3)?;
+                arity(1, 4)?;
+                let opt = |i: usize, what: &str| -> Result<Option<u32>> {
+                    match args.get(i) {
+                        None | Some(&"inf") => Ok(None),
+                        Some(_) => Ok(Some(u32::try_from(int(i)?).with_context(|| {
+                            format!("pruning rule {s:?}: {what} does not fit in 32 bits")
+                        })?)),
+                    }
+                };
                 Self::SourceContainment {
                     r: int(0)?,
                     alpha: real(1)?,
-                    theta: if args.len() > 2 {
-                        Some(u32::try_from(int(2)?).with_context(|| {
-                            format!("pruning rule {s:?}: θ does not fit in 32 bits")
-                        })?)
-                    } else {
-                        None
-                    },
+                    theta: opt(2, "θ")?,
+                    budget: opt(3, "the budget")?,
                 }
             }
             "coverage" => {
@@ -717,6 +740,7 @@ mod tests {
             "label_containment(32, 1.3)",
             "source_containment(48, 1.2)",
             "source_containment(48, 1.2, 10000)",
+            "source_containment(48, 1.2, 10000, 2)",
             "coverage(64, 1.2, 16, 2)",
             "split(32, 16, 1.2)",
         ] {
@@ -808,6 +832,7 @@ mod tests {
             r: 8,
             alpha: 1.2,
             theta: None,
+            budget: None,
         }
         .prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
         assert_eq!(ids(&out), vec![1]);
@@ -828,6 +853,7 @@ mod tests {
             r: 8,
             alpha: 1.2,
             theta,
+            budget: None,
         };
         // F_0 ∩ F_2 = {a} is not on 1: the paper's rule keeps 2.
         sc(None).prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
@@ -844,6 +870,42 @@ mod tests {
             sc(Some(1))
         );
         assert_eq!(sc(Some(7)).tag(), "sc-R8-a1.2-t7");
+        // A budget protects only the rarest labels: source 0 {a, r, s}, r on 1 point, s on 3,
+        // a on 4; candidate 2 {a, s}. With B = 1 only r is protected and 1 {x} occludes 2;
+        // with B = 2, s is protected too and 2 stays.
+        let m = line(&[0.0, 1.0, 2.0, 100.0, 101.0, 102.0]);
+        let p = Points::new(&m, &[]);
+        let store = labels(&[
+            &["a", "r", "s"],
+            &["x"],
+            &["a", "s"],
+            &["a"],
+            &["a"],
+            &["s"],
+        ]);
+        let info = LabelInfo::new(&store);
+        let pool = pool_of(&p, 0, &[1, 2]);
+        let scb = |budget| PruneRule::SourceContainment {
+            r: 8,
+            alpha: 1.2,
+            theta: None,
+            budget,
+        };
+        scb(Some(1)).prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
+        assert_eq!(ids(&out), vec![1]);
+        scb(Some(2)).prune(&p, Some(&info), 0, &pool, &mut s, &mut out);
+        assert_eq!(ids(&out), vec![1, 2]);
+        assert_eq!(
+            scb(Some(2)).to_string(),
+            "source_containment(8, 1.2, inf, 2)"
+        );
+        assert_eq!(
+            "source_containment(8, 1.2, inf, 2)"
+                .parse::<PruneRule>()
+                .unwrap(),
+            scb(Some(2))
+        );
+        assert_eq!(scb(Some(2)).tag(), "sc-R8-a1.2-b2");
     }
 
     #[test]

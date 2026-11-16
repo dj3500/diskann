@@ -892,6 +892,7 @@ mod tests {
             r,
             alpha: 1.2,
             theta: Some(100),
+            budget: None,
         };
         let one = build(&base, Some(&store), &labeled_params(1, gen, sc)).unwrap();
         let three = build(&base, Some(&store), &labeled_params(3, gen, sc)).unwrap();
