@@ -21,13 +21,15 @@
 //!   probe), bitmap word operations, scatters and enumeration.
 //! - **Probe**: ns per sampled point of a sketch probe (every clause evaluated on random points,
 //!   prefetched like the probe).
-//! - **Member checks by residual shape** (`check_base_ns`, `check_word_ns`, `check_row_ns`):
-//!   at each density, cold checks (caches evicted before each timed pass, fresh random
-//!   candidates: a scan touches each candidate once) of `[ℓ₀] ∧ C` with `ℓ₀` the rarest label
-//!   (the skipped `c*`) and `C` 1, 4 or 16 random labels with a bitset, or two without one;
-//!   least squares of ns per candidate on the bitset words probed gives the per-candidate and
-//!   per-word costs, the row workload the per-row cost. The model multiplies them by the
-//!   words and rows a query's residual clauses need (their labels and the probe's survival
+//! - **Member checks by residual shape** (`check_base_ns`, `check_word_ns`,
+//!   `check_prefetch_ns`, `check_row_ns`): at each density, checks of fresh random candidates
+//!   (a scan touches each candidate once) for `[ℓ₀] ∧ …` with `ℓ₀` the rarest label (the
+//!   skipped `c*`) and residual clauses of 1, 4 or 16 random labels with a bitset, of two
+//!   labels without one (every row read), or of one label without a bitset followed by a rare
+//!   bitset label (every row prefetched, few read); least squares of ns per candidate on the
+//!   bitset words probed gives the per-candidate and per-word costs, the two row workloads
+//!   the per-prefetch and per-read costs. The model multiplies them by the words, prefetches
+//!   and reads a query's residual clauses need (their labels and the probe's survival
 //!   estimates); the sketch probe pays the same per sampled point.
 //! - **Per query** (`query_ns`): compiling a calibration predicate, its static split and
 //!   posting bounds.
@@ -410,7 +412,7 @@ pub fn calibrate<T: Element>(
     details.insert("gallop_by_gap".into(), gallop_doc);
     // Cold member checks by residual shape and the per-query compile cost, on a third stream.
     let mut rng3 = Rng(opts.seed ^ 0x5eed_a1b0);
-    let (check_base_ns, check_word_ns, check_row_ns, shape_doc) =
+    let (check_base_ns, check_word_ns, check_prefetch_ns, check_row_ns, shape_doc) =
         shape_curves(labels, bitsets.as_ref(), n, opts, &mut rng3);
     details.insert("check_shape".into(), shape_doc);
     let query_ns = query_cost(labels, bitsets.as_ref(), &preds);
@@ -647,6 +649,7 @@ pub fn calibrate<T: Element>(
         heap_bound_extra_kl,
         check_base_ns,
         check_word_ns,
+        check_prefetch_ns,
         check_row_ns,
         query_ns,
     };
@@ -693,65 +696,111 @@ const SHAPE_POINTS: usize = 20_000;
 const SHAPE_MAX_PASSES: usize = 48;
 /// Candidates per pass at most (a window of the id space keeps the density).
 const SHAPE_MAX_CANDS: usize = 100_000;
-/// Bytes read between timed passes to evict the caches (several times a CCX's L3).
-const FLUSH_BYTES: usize = 64 << 20;
 
-/// Evicts the caches by reading a buffer much larger than the last-level cache.
-fn flush_caches(buf: &[u64]) {
-    std::hint::black_box(buf.iter().fold(0u64, |a, &x| a ^ x));
+/// The workloads of [`shape_curves`]: the residual clauses after `[ℓ₀]`.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// One clause of `k` labels with a bitset.
+    Bits(usize),
+    /// One clause of two labels without a bitset (every member's row read).
+    Rows,
+    /// A clause of one label without a bitset, then a rarely matching bitset label (every
+    /// member's row prefetched, few read).
+    Prefetch,
 }
 
-/// Cold checks of members of `union(c*)` by residual shape, at each density of
-/// [`DENSITIES`]: `(base, word, row, report)`, ns per candidate, per static-bitset word
-/// probed and per row read. Each pass compiles `[ℓ₀] ∧ C` with `ℓ₀` the rarest label (so
-/// `c* = [ℓ₀]`, skipped as for members) and `C` either `k ∈ {1, 4, 16}` random labels with a
-/// bitset or two random labels without one (rows only), checks fresh random candidates of the
-/// density (a window of the id space for dense ones) after evicting the caches (a candidate
-/// is touched once per query), and counts the words probed and rows read (untimed). Least
-/// squares of ns per candidate on the words probed (bitset workloads) gives `base` and `word`;
-/// `row` is the rest of the row workload's cost. Without bitsets every check reads the row
-/// (`word` = 0).
+/// The bitset words probed and the rows read checking `v` on the residual clauses of `q`, as
+/// the static evaluator does (an unsatisfied clause without row labels ends the check; the
+/// row is read once if a clause with row labels is left unsatisfied by its bitsets).
+fn check_work(q: &Compiled, b: &LabelBitsets, v: u32) -> (usize, usize) {
+    let (w, bit) = ((v >> 6) as usize, v & 63);
+    let (mut words, mut row) = (0, false);
+    for j in 1..q.n_clauses() {
+        let mut hit = false;
+        for &s in q.static_slots(j) {
+            words += 1;
+            if (b.word(s, w) >> bit) & 1 != 0 {
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            if q.row_labels(j).is_empty() {
+                return (words, 0);
+            }
+            row = true;
+        }
+    }
+    (words, usize::from(row))
+}
+
+/// Checks of members of `union(c*)` by residual shape, at each density of [`DENSITIES`]:
+/// `(base, word, prefetch, row, report)`, ns per candidate, per static-bitset word probed, per
+/// row prefetched and per row read and checked. Each pass compiles `[ℓ₀] ∧ …` with `ℓ₀` the
+/// rarest label (so `c* = [ℓ₀]`, skipped as for members) and the residual clauses of a
+/// [`Shape`] (random labels), checks fresh random candidates of the density (a window of the
+/// id space for dense ones: a scan touches each candidate once; no cache flush, as the other
+/// curves: the steady state of a stream of queries) and counts the words probed and rows read
+/// (untimed). Least squares of ns per candidate on the words probed (bitset workloads) gives
+/// `base` and `word`; the rows workload (`base + prefetch + row`) and the prefetch workload
+/// (`base + words·word + prefetch + reads·row`) give `prefetch` and `row`. Without bitsets
+/// every check reads the row (`word` = `prefetch` = 0).
 fn shape_curves(
     labels: &LabelStore,
     bitsets: Option<&LabelBitsets>,
     n: usize,
     opts: &Options,
     rng: &mut Rng,
-) -> (Vec<f64>, Vec<f64>, Vec<f64>, Value) {
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Value) {
     let nd = DENSITIES.len();
     let nl = labels.n_labels() as u32;
+    let zeros = || vec![0.0; nd];
     let Some(rare) = (0..nl)
         .filter(|&l| labels.posting_len(l) > 0)
         .min_by_key(|&l| (labels.posting_len(l), l))
     else {
-        return (vec![0.0; nd], vec![0.0; nd], vec![0.0; nd], Value::Null);
+        return (zeros(), zeros(), zeros(), zeros(), Value::Null);
     };
     let floor = labels.posting_len(rare);
     let (with_bits, without): (Vec<u32>, Vec<u32>) = (0..nl)
         .filter(|&l| l != rare && labels.posting_len(l) > floor)
         .partition(|&l| bitsets.is_some_and(|b| b.slot(l).is_some()));
-    let flush = vec![1u64; FLUSH_BYTES / 8];
+    // The rarest quarter of the bitset labels: members seldom match them.
+    let mut sparse_bits = with_bits.clone();
+    sparse_bits.sort_by_key(|&l| (labels.posting_len(l), l));
+    sparse_bits.truncate(with_bits.len().div_ceil(4));
     let mut compiled = Compiled::new();
     let mut bits = vec![0u64; labels.n_labels()];
     let mut out = Vec::new();
     let mut ctr = Counters::default();
-    let (mut base, mut word, mut row) = (vec![0.0; nd], vec![0.0; nd], vec![0.0; nd]);
+    let (mut base, mut word, mut prefetch, mut row) = (zeros(), zeros(), zeros(), zeros());
     let mut doc = Vec::new();
+    let pick = |pool: &[u32], rng: &mut Rng| pool[rng.below(pool.len())];
     for (di, &rho) in DENSITIES.iter().enumerate() {
         let m = ((rho * n as f64) as usize)
             .clamp(64, SHAPE_MAX_CANDS)
             .min(n);
         let window = ((m as f64 / rho).ceil() as usize).clamp(m, n);
-        // (ns per candidate, words probed, rows read) per pass, bitset and row workloads.
-        let (mut wpts, mut rpts) = (Vec::new(), Vec::new());
-        let workloads: Vec<(usize, bool)> = if bitsets.is_some() && !with_bits.is_empty() {
-            vec![(1, true), (4, true), (16, true), (2, false)]
+        // (ns per candidate, words probed, rows read) per pass of each workload.
+        let (mut wpts, mut rpts, mut ppts) = (Vec::new(), Vec::new(), Vec::new());
+        let workloads: Vec<Shape> = if bitsets.is_some() && !with_bits.is_empty() {
+            vec![
+                Shape::Bits(1),
+                Shape::Bits(4),
+                Shape::Bits(16),
+                Shape::Rows,
+                Shape::Prefetch,
+            ]
         } else {
-            vec![(2, false)]
+            vec![Shape::Rows]
         };
-        for &(k, bitset) in &workloads {
-            let pool = if bitset { &with_bits } else { &without };
-            if pool.is_empty() {
+        for &shape in &workloads {
+            let feasible = match shape {
+                Shape::Bits(_) => !with_bits.is_empty(),
+                Shape::Rows => !without.is_empty(),
+                Shape::Prefetch => !without.is_empty() && !sparse_bits.is_empty(),
+            };
+            if !feasible {
                 continue;
             }
             let passes = opts
@@ -759,17 +808,28 @@ fn shape_curves(
                 .max(SHAPE_POINTS.div_ceil(m))
                 .min(SHAPE_MAX_PASSES);
             for _ in 0..passes {
-                let mut clause: Vec<u32> = (0..k).map(|_| pool[rng.below(pool.len())]).collect();
-                clause.sort_unstable();
-                clause.dedup();
+                let name = |l: u32| labels.label_name(l).to_owned();
+                let mut clauses = vec![vec![name(rare)]];
+                match shape {
+                    Shape::Bits(k) => {
+                        let mut c: Vec<u32> = (0..k).map(|_| pick(&with_bits, rng)).collect();
+                        c.sort_unstable();
+                        c.dedup();
+                        clauses.push(c.into_iter().map(name).collect());
+                    }
+                    Shape::Rows => {
+                        let mut c = vec![pick(&without, rng), pick(&without, rng)];
+                        c.sort_unstable();
+                        c.dedup();
+                        clauses.push(c.into_iter().map(name).collect());
+                    }
+                    Shape::Prefetch => {
+                        clauses.push(vec![name(pick(&without, rng))]);
+                        clauses.push(vec![name(pick(&sparse_bits, rng))]);
+                    }
+                }
                 let mut pb = PredicateSetBuilder::new(labels);
-                pb.push(&[
-                    vec![labels.label_name(rare).to_owned()],
-                    clause
-                        .iter()
-                        .map(|&l| labels.label_name(l).to_owned())
-                        .collect(),
-                ]);
+                pb.push(&clauses);
                 let preds = pb.finish();
                 compiled.compile(labels, preds.get(0), Weights::Unit, None, &mut bits);
                 if compiled.is_empty() || compiled.n_clauses() < 2 {
@@ -784,30 +844,19 @@ fn shape_curves(
                     (0..m).map(|_| (start + rng.below(window)) as u32).collect();
                 cands.sort_unstable();
                 cands.dedup();
-                // The work of each check, as the static evaluator does it (untimed).
                 let (mut w, mut r) = (0usize, 0usize);
                 for &v in &cands {
-                    let mut hit = false;
-                    if let Some(b) = bitsets {
-                        for &s in compiled.static_slots(1) {
-                            w += 1;
-                            if (b.word(s, (v >> 6) as usize) >> (v & 63)) & 1 != 0 {
-                                hit = true;
-                                break;
-                            }
-                        }
-                        if !hit && !compiled.row_labels(1).is_empty() {
-                            r += 1;
-                        }
-                    } else {
-                        r += 1;
-                    }
+                    let (dw, dr) = match bitsets {
+                        Some(b) => check_work(&compiled, b, v),
+                        None => (0, 1),
+                    };
+                    w += dw;
+                    r += dr;
                 }
                 let mut cx = EvalCtx::new(labels, &compiled, &bits, &[], &[]).cstar_members();
                 if let Some(b) = bitsets {
                     cx = cx.with_static(b);
                 }
-                flush_caches(&flush);
                 let t = Instant::now();
                 match bitsets {
                     Some(_) => exact::filter::<StaticBits>(&cx, &cands, &mut out, &mut ctr),
@@ -817,10 +866,10 @@ fn shape_curves(
                 std::hint::black_box(&out);
                 let c = cands.len().max(1) as f64;
                 let pt = (ns / c, w as f64 / c, r as f64 / c);
-                if bitset {
-                    wpts.push(pt);
-                } else {
-                    rpts.push(pt);
+                match shape {
+                    Shape::Bits(_) => wpts.push(pt),
+                    Shape::Rows => rpts.push(pt),
+                    Shape::Prefetch => ppts.push(pt),
                 }
                 compiled.clear_bits(&mut bits);
             }
@@ -837,26 +886,40 @@ fn shape_curves(
         } else {
             (0.0, 0.0)
         };
-        let r0 = if rpts.is_empty() {
-            0.0
-        } else {
-            let mut v: Vec<f64> = rpts
-                .iter()
-                .map(|p| (p.0 - b0 - w0 * p.1) / p.2.max(1e-9))
-                .collect();
-            median(&mut v).max(0.0)
+        let med = |v: &[(f64, f64, f64)], f: fn(&(f64, f64, f64)) -> f64| -> Option<f64> {
+            let mut x: Vec<f64> = v.iter().map(f).collect();
+            (!x.is_empty()).then(|| median(&mut x))
         };
-        (base[di], word[di], row[di]) = (b0, w0, r0);
+        // rows: t_r = base + prefetch + row (every member's row read);
+        // prefetch: t_p = base + w_p·word + prefetch + r_p·row (few read).
+        let (p0, r0) = match (med(&rpts, |p| p.0), med(&ppts, |p| p.0)) {
+            (Some(tr), Some(tp)) => {
+                let wp = med(&ppts, |p| p.1).unwrap_or(0.0);
+                let rp = med(&ppts, |p| p.2).unwrap_or(0.0);
+                let read = if rp < 0.9 {
+                    ((tr - tp + wp * w0) / (1.0 - rp)).max(0.0)
+                } else {
+                    tr - b0
+                };
+                let read = read.min((tr - b0).max(0.0));
+                ((tr - b0 - read).max(0.0), read)
+            }
+            (Some(tr), None) => (0.0, (tr - b0).max(0.0)),
+            _ => (0.0, 0.0),
+        };
+        (base[di], word[di], prefetch[di], row[di]) = (b0, w0, p0, r0);
         doc.push(
             json!({"density": rho, "candidates_per_pass": m, "bitset_passes": wpts.len(),
-            "row_passes": rpts.len(), "base_ns": b0, "word_ns": w0, "row_ns": r0,
+            "row_passes": rpts.len(), "prefetch_passes": ppts.len(), "base_ns": b0, "word_ns": w0,
+            "prefetch_ns": p0, "row_ns": r0,
             "bitset_points": wpts.iter().map(|p| [p.0, p.1]).collect::<Vec<_>>(),
-            "row_ns_per_cand": rpts.iter().map(|p| p.0).collect::<Vec<_>>()}),
+            "row_ns_per_cand": rpts.iter().map(|p| p.0).collect::<Vec<_>>(),
+            "prefetch_points": ppts.iter().map(|p| [p.0, p.1, p.2]).collect::<Vec<_>>()}),
         );
     }
     let report = json!({"rare_label_postings": floor, "bitset_labels": with_bits.len(),
         "row_labels": without.len(), "by_density": doc});
-    (base, word, row, report)
+    (base, word, prefetch, row, report)
 }
 
 /// Per query: compiling a calibration predicate, splitting it against the static bitsets and

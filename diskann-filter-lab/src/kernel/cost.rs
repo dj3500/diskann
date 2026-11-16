@@ -28,9 +28,11 @@
 //! read in place). The candidates checked by `scan` and `distance_first` are members of
 //! `union(c*)`: `pred` is the cost of checking a member (the residual clauses). Calibrations
 //! with the shape-resolved curves (batch A1b) price it from the query's residual clauses:
-//! `base(ρ) + words·word(ρ) + rows·row(ρ)`, with the bitset words probed and the row reads
-//! expected from the clauses' labels and the survival estimates ([`MemberWork`]), measured
-//! cold (a scan touches each candidate once). Batch A1 calibrations use one curve per class
+//! `base(ρ) + words·word(ρ) + prefetch·pf(ρ) + reads·row(ρ)`, with the bitset words probed and
+//! the row reads expected from the clauses' labels and the survival estimates
+//! ([`MemberWork`]); every member's row is prefetched (`prefetch` = 1) when a residual clause
+//! has labels without a bitset, read or not. They are measured cold (a scan touches each
+//! candidate once). Batch A1 calibrations use one curve per class
 //! (residual clauses reading rows or bitset-only: `pred_row`, `pred_bits`, measured on
 //! re-sampled, hence warm, members), batch B6 the miss-dominated `pred` curve; the cost of a
 //! galloping step depends on the gap `p/s` (`gallop(p/s)`, cache misses in long lists), B6
@@ -123,13 +125,18 @@ pub struct UnitCosts {
     pub heap_bound_extra_kl: Vec<Vec<f64>>,
     /// Checks of members of `union(c*)` by residual shape, measured cold (each candidate
     /// touched once) at each density: per candidate (`check_base_ns`), per static-bitset
-    /// word probed (`check_word_ns`) and per row read (`check_row_ns`); empty in older
-    /// calibrations (then `pred_row_ns` / `pred_bits_ns`). With them the sketch probe costs
-    /// the same per sampled point (every residual clause evaluated) and enters the crossover.
+    /// word probed (`check_word_ns`), per row prefetched (`check_prefetch_ns`: the exact path
+    /// prefetches every member's row when a residual clause has labels without a bitset, read
+    /// or not) and per row read and checked after it (`check_row_ns`); empty in older
+    /// calibrations (then `pred_row_ns` / `pred_bits_ns`; without `check_prefetch_ns` the row
+    /// cost includes the prefetch). With them the sketch probe costs the same per sampled
+    /// point (every residual clause evaluated) and enters the crossover.
     #[serde(default)]
     pub check_base_ns: Vec<f64>,
     #[serde(default)]
     pub check_word_ns: Vec<f64>,
+    #[serde(default)]
+    pub check_prefetch_ns: Vec<f64>,
     #[serde(default)]
     pub check_row_ns: Vec<f64>,
     /// Per query: compiling the predicate and planning (0 if not calibrated).
@@ -169,6 +176,7 @@ impl Default for UnitCosts {
             heap_bound_extra_kl: Vec::new(),
             check_base_ns: Vec::new(),
             check_word_ns: Vec::new(),
+            check_prefetch_ns: Vec::new(),
             check_row_ns: Vec::new(),
             query_ns: 0.0,
         }
@@ -230,6 +238,11 @@ impl UnitCosts {
             "the shape-resolved check curves need one value per density"
         );
         anyhow::ensure!(
+            self.check_prefetch_ns.is_empty()
+                || (self.check_prefetch_ns.len() == n && self.check_base_ns.len() == n),
+            "the row prefetch curve needs the shape-resolved curves, one value per density"
+        );
+        anyhow::ensure!(
             self.gallop_gap.len() == self.gallop_gap_ns.len()
                 && self.gallop_gap.windows(2).all(|w| w[0] < w[1])
                 && self.gallop_gap.iter().all(|&g| g >= 1.0),
@@ -272,6 +285,7 @@ impl UnitCosts {
                 .chain(self.heap_bound_extra_kl.iter().flatten())
                 .chain(&self.check_base_ns)
                 .chain(&self.check_word_ns)
+                .chain(&self.check_prefetch_ns)
                 .chain(&self.check_row_ns)
                 .chain(&[self.query_ns])
                 .all(|x| x.is_finite() && *x >= 0.0),
@@ -333,8 +347,14 @@ impl UnitCosts {
         if !self.has_shape() {
             return self.pred_member(w.class_rows, rho);
         }
+        let prefetch = if self.check_prefetch_ns.is_empty() {
+            0.0
+        } else {
+            w.prefetch * self.curve(&self.check_prefetch_ns, rho)
+        };
         self.curve(&self.check_base_ns, rho)
             + w.words * self.curve(&self.check_word_ns, rho)
+            + prefetch
             + w.rows * self.curve(&self.check_row_ns, rho)
     }
 
@@ -681,11 +701,13 @@ impl Estimates {
 
 /// Expected work of checking one member of `union(c*)` on the residual clauses (positions
 /// `1..` of the Boolean order, as [`super::eval`]'s static evaluator does): static-bitset
-/// words probed and row reads. `class_rows`: some residual clause reads rows (the class of the
-/// older per-class curves).
+/// words probed, rows prefetched (the exact path prefetches every member's row when a
+/// residual clause has labels without a bitset) and rows read. `class_rows`: some residual
+/// clause reads rows (the class of the older per-class curves).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MemberWork {
     pub words: f64,
+    pub prefetch: f64,
     pub rows: f64,
     pub class_rows: bool,
 }
@@ -696,9 +718,9 @@ impl MemberWork {
     /// (`survival[j − 1]`: the fraction of `union(c*)` satisfying clauses `1..=j`). A clause
     /// probes its bitset words in decreasing label frequency until one is set: a member that
     /// fails it probes every word, one that passes about one; a failed clause without row
-    /// labels ends the check; the row is read once if some clause has row labels. `full`: no
-    /// early end (the probe evaluates every clause); `upper`: the worst case (every word
-    /// probed, the row read).
+    /// labels ends the check; the row is read once if some clause has row labels and the check
+    /// gets there. `full`: no early end (the probe evaluates every clause); `upper`: the worst
+    /// case (every word probed, the row read).
     pub fn of(q: &Compiled, split: bool, survival: &[f64], full: bool, upper: bool) -> Self {
         let c = q.n_clauses();
         let class_rows = q.residual_reads_rows(split);
@@ -711,6 +733,7 @@ impl MemberWork {
         if !split {
             return Self {
                 words: 0.0,
+                prefetch: 1.0,
                 rows: 1.0,
                 class_rows,
             };
@@ -741,6 +764,7 @@ impl MemberWork {
         }
         Self {
             words,
+            prefetch: if row { 1.0 } else { 0.0 },
             rows: if row { reach } else { 0.0 },
             class_rows,
         }
@@ -1091,13 +1115,16 @@ mod tests {
         // Clause 1 (one word, a row label: no early end) passes half, clause 2 half of them.
         let surv = [0.5, 0.25];
         let w = MemberWork::of(&q, true, &surv, false, false);
-        assert_eq!((w.words, w.rows, w.class_rows), (1.0 + 2.0, 0.5, true));
+        assert_eq!(
+            (w.words, w.prefetch, w.rows, w.class_rows),
+            (1.0 + 2.0, 1.0, 0.5, true)
+        );
         let full = MemberWork::of(&q, true, &surv, true, false);
-        assert_eq!((full.words, full.rows), (3.0, 1.0));
+        assert_eq!((full.words, full.prefetch, full.rows), (3.0, 1.0, 1.0));
         let up = MemberWork::of(&q, true, &surv, false, true);
         assert_eq!((up.words, up.rows), (4.0, 1.0));
         let rows = MemberWork::of(&q, false, &surv, false, false);
-        assert_eq!((rows.words, rows.rows), (0.0, 1.0));
+        assert_eq!((rows.words, rows.prefetch, rows.rows), (0.0, 1.0, 1.0));
         // The shape-resolved curves; older calibrations use the class curve.
         let mut c = UnitCosts {
             pred_row_ns: vec![100.0; 6],
@@ -1116,6 +1143,16 @@ mod tests {
             c.probe(100.0, 32.0, &full, 1e-3),
             100.0 * c.sketch_ns + 32.0 * 94.0
         );
+        // Every member's row is prefetched; the reads follow the survival.
+        c.check_prefetch_ns = vec![20.0; 6];
+        c.validate().unwrap();
+        assert_eq!(c.member(&w, 1e-3), 4.0 + 3.0 * 10.0 + 20.0 + 0.5 * 60.0);
+        let bits_only = MemberWork {
+            prefetch: 0.0,
+            rows: 0.0,
+            ..w
+        };
+        assert_eq!(c.member(&bits_only, 1e-3), 4.0 + 3.0 * 10.0);
         c.check_row_ns.pop();
         assert!(c.validate().is_err());
     }

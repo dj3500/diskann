@@ -145,7 +145,12 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.as_array().unwrap().len() == hl.len()));
     // Cold member checks by residual shape and the per-query cost.
-    for key in ["check_base_ns", "check_word_ns", "check_row_ns"] {
+    for key in [
+        "check_base_ns",
+        "check_word_ns",
+        "check_prefetch_ns",
+        "check_row_ns",
+    ] {
         let v = curve(key);
         assert_eq!(v.len(), densities, "{key}");
         assert!(v.iter().all(|x| x.is_finite() && *x >= 0.0), "{key}: {v:?}");
