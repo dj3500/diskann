@@ -47,8 +47,10 @@
 //! under `heap_bound` laziness (the heap fills after about `K/r` evaluations at match rate
 //! `r`; afterwards the nodes found inside the K-th distance are checked, a number that grows
 //! sublinearly with `L`: measured per list size, older calibrations one `extra(K)`),
-//! `P = φ·D` under `distance_first`; it costs `D·dist_g + P·pred_g`. The laziness terms are
-//! calibrated; without them `P = D` (batch B6).
+//! `P = φ·D` under `distance_first`; it costs `D·dist_g(L) + P·pred_g`. The laziness terms are
+//! calibrated; without them `P = D` (batch B6). `dist_g(L)` is the calibrated cost per
+//! distance, raised where a predicate-free search at list size `L` costs more per distance
+//! (long beams; `graph_dist_ns_curve`); without that curve it is a constant.
 
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +144,13 @@ pub struct UnitCosts {
     /// Per query: compiling the predicate and planning (0 if not calibrated).
     #[serde(default)]
     pub query_ns: f64,
+    /// Graph search: list sizes (increasing) and ns per distance computation of a
+    /// predicate-free search at each; empty in older calibrations (then `graph_dist_ns` at
+    /// every size).
+    #[serde(default)]
+    pub graph_dist_ns_l: Vec<f64>,
+    #[serde(default)]
+    pub graph_dist_ns_curve: Vec<f64>,
     /// Unfiltered effort curve of the graph (base-derived queries): `effort_l[i][j]` is the
     /// list size at which the mean unfiltered recall at `effort_k[j]` neighbours reaches
     /// `effort_r[i]` (both increasing); empty when not calibrated.
@@ -188,6 +197,8 @@ impl Default for UnitCosts {
             check_prefetch_ns: Vec::new(),
             check_row_ns: Vec::new(),
             query_ns: 0.0,
+            graph_dist_ns_l: Vec::new(),
+            graph_dist_ns_curve: Vec::new(),
             effort_r: Vec::new(),
             effort_k: Vec::new(),
             effort_l: Vec::new(),
@@ -283,6 +294,16 @@ impl UnitCosts {
                             .iter()
                             .all(|r| r.len() == self.heap_bound_l.len())),
             "extra(K, L) needs one row per heap size and one value per list size"
+        );
+        anyhow::ensure!(
+            self.graph_dist_ns_l.len() == self.graph_dist_ns_curve.len()
+                && self.graph_dist_ns_l.windows(2).all(|w| w[0] < w[1])
+                && self.graph_dist_ns_l.iter().all(|&l| l >= 1.0)
+                && self
+                    .graph_dist_ns_curve
+                    .iter()
+                    .all(|x| x.is_finite() && *x >= 0.0),
+            "the graph cost by list size needs increasing sizes (>= 1), one cost each"
         );
         anyhow::ensure!(
             self.effort_l.len() == self.effort_r.len()
@@ -423,6 +444,26 @@ impl UnitCosts {
         loglog(&self.graph_l, &self.graph_l_dists, l)
     }
 
+    /// Cost of one distance computation of a graph search at list size `l`: `graph_dist_ns`,
+    /// or more where the cost by list size (log-linear in `L`, clamped at the ends) is higher.
+    pub fn graph_dist_at(&self, l: f64) -> f64 {
+        let (ls, v) = (&self.graph_dist_ns_l, &self.graph_dist_ns_curve);
+        if ls.is_empty() {
+            return self.graph_dist_ns;
+        }
+        let last = ls.len() - 1;
+        let at = if l <= ls[0] {
+            v[0]
+        } else if l >= ls[last] {
+            v[last]
+        } else {
+            let i = ls.partition_point(|&x| x <= l);
+            let t = (l.ln() - ls[i - 1].ln()) / (ls[i].ln() - ls[i - 1].ln());
+            v[i - 1] + t * (v[i] - v[i - 1])
+        };
+        self.graph_dist_ns.max(at)
+    }
+
     /// Nominal cost of an eager graph search at list size `l` (every distance with a
     /// predicate).
     pub fn graph(&self, l: f64) -> f64 {
@@ -483,7 +524,7 @@ impl UnitCosts {
     /// Nominal cost of a graph search at list size `l` (heap size `k`, match rate `rate`,
     /// laziness `laziness`): the distances and the predicate evaluations they lead to.
     pub fn graph_cost(&self, l: f64, k: usize, rate: f64, laziness: Laziness) -> f64 {
-        self.graph_dists(l) * self.graph_dist_ns
+        self.graph_dists(l) * self.graph_dist_at(l)
             + self.graph_preds(l, k, rate, laziness) * self.graph_pred_ns
     }
 
@@ -503,7 +544,7 @@ impl UnitCosts {
         } else {
             d
         };
-        d * self.graph_dist_ns + checks * self.graph_pred_ns
+        d * self.graph_dist_at(l) + checks * self.graph_pred_ns
     }
 
     /// The calibrated unfiltered list size for mean recall `r` at `kprime` neighbours:
@@ -1163,6 +1204,32 @@ mod tests {
         assert!(bad.validate().is_err());
         let text = serde_json::to_string(&c).unwrap();
         assert_eq!(serde_json::from_str::<UnitCosts>(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn long_beams_raise_the_graph_distance_cost() {
+        let mut c = UnitCosts {
+            graph_dist_ns: 70.0,
+            graph_dist_ns_l: vec![100.0, 1000.0, 10000.0],
+            graph_dist_ns_curve: vec![50.0, 60.0, 120.0],
+            ..UnitCosts::default()
+        };
+        c.validate().unwrap();
+        // Never below the constant; log-linear between sizes; clamped at the ends.
+        assert_eq!(c.graph_dist_at(10.0), 70.0);
+        assert_eq!(c.graph_dist_at(1000.0), 70.0);
+        assert!((c.graph_dist_at(10000f64.sqrt() * 1000f64.sqrt()) - 90.0).abs() < 1e-9);
+        assert_eq!(c.graph_dist_at(1e6), 120.0);
+        let base = c.graph_dists(10000.0) * 120.0
+            + c.graph_preds(10000.0, 10, 1.0, Laziness::Eager) * c.graph_pred_ns;
+        assert!((c.graph_cost(10000.0, 10, 1.0, Laziness::Eager) - base).abs() < 1e-6);
+        // Without the curve: the constant (batch B6 / stage A1 calibrations).
+        c.graph_dist_ns_l.clear();
+        c.graph_dist_ns_curve.clear();
+        assert_eq!(c.graph_dist_at(1e6), 70.0);
+        c.graph_dist_ns_l = vec![100.0, 10.0];
+        c.graph_dist_ns_curve = vec![1.0, 1.0];
+        assert!(c.validate().is_err());
     }
 
     #[test]

@@ -144,6 +144,10 @@ fn calibration_measures_member_checks_galloping_and_laziness() {
     let rows = c["heap_bound_extra_kl"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.as_array().unwrap().len() == hl.len()));
+    // ns per distance by list size, up to L = 40,960.
+    let dl = curve("graph_dist_ns_l");
+    assert_eq!(dl.last(), Some(&40960.0), "{dl:?}");
+    assert!(curve("graph_dist_ns_curve").iter().all(|x| *x > 0.0));
     // Cold member checks by residual shape and the per-query cost.
     for key in [
         "check_base_ns",

@@ -41,7 +41,10 @@
 //!   predicates gives ns per predicate evaluation and the distance computations per list size
 //!   (`D(L)`, also summarized by a least-squares line `α`, `β`); `heap_bound` searches at
 //!   K = 10 and 100 give the predicate evaluations beyond `K/r` per list size
-//!   (`extra(K, L)`), `distance_first` searches their share of the distances.
+//!   (`extra(K, L)`), `distance_first` searches their share of the distances. The
+//!   predicate-free search also gives ns per distance by list size (`graph_dist_ns_curve` at
+//!   `graph_dist_ns_l`), extended to L = 40,960 with a quarter of the queries: maintaining a
+//!   long beam costs more per distance.
 
 use std::{path::Path, time::Instant};
 
@@ -423,6 +426,7 @@ pub fn calibrate<T: Element>(
     let (mut heap_bound_l, mut heap_bound_extra_kl) = (Vec::new(), Vec::new());
     let (mut graph_l, mut graph_l_dists) = (Vec::new(), Vec::new());
     let mut distance_first_frac = 0.0;
+    let (mut graph_dist_ns_l, mut graph_dist_ns_curve) = (Vec::new(), Vec::new());
     let (mut graph_dist_ns, mut graph_pred_ns, mut graph_alpha, mut graph_beta) = {
         let d = UnitCosts::default();
         (
@@ -523,6 +527,44 @@ pub fn calibrate<T: Element>(
         }
         graph_dist_ns = sums[0][0] / sums[0][1].max(1.0);
         graph_pred_ns = ((sums[1][0] - graph_dist_ns * sums[1][1]) / sums[1][2].max(1.0)).max(0.0);
+        // ns per distance of the predicate-free search by list size, up to the largest list
+        // sizes that planned searches reach (L₀ × 16): beam maintenance grows with L. The
+        // large sizes use a quarter of the queries.
+        for v in &by_l {
+            let l = v["L"].as_f64().unwrap_or(0.0);
+            let (t, nd) = (
+                v["deferred"]["ns_per_query"].as_f64().unwrap_or(0.0),
+                v["deferred"]["n_dist"].as_f64().unwrap_or(0.0),
+            );
+            if nd > 0.0 {
+                graph_dist_ns_l.push(l);
+                graph_dist_ns_curve.push(t / nd);
+            }
+        }
+        let few = (qrows.len() / 4).max(1);
+        for l in [5120usize, 10240, 20480, 40960] {
+            let mut tv = Vec::new();
+            let mut nd = 0.0;
+            for _ in 0..opts.reps {
+                let t = Instant::now();
+                nd = 0.0;
+                for i in 0..few {
+                    let q = Query {
+                        vector: qm.row(i),
+                        cnf: preds.get(i % preds.len().max(1)),
+                        view: None,
+                    };
+                    nd += st
+                        .search(&plans[0], &ix, &q, l, &mut ids, &mut ds, None)
+                        .n_dist as f64;
+                }
+                tv.push(t.elapsed().as_nanos() as f64);
+            }
+            if nd > 0.0 {
+                graph_dist_ns_l.push(l as f64);
+                graph_dist_ns_curve.push(median(&mut tv) / nd);
+            }
+        }
         // Least squares of the eager search's distance computations per query against L.
         let xs: Vec<f64> = ls.iter().map(|&l| l as f64).collect();
         let ys: Vec<f64> = by_l
@@ -615,6 +657,7 @@ pub fn calibrate<T: Element>(
         }
         graph_doc = json!({"graph": gpath, "queries": qrows.len(), "by_L": by_l,
             "starts": if label_starts.is_some() { "label(c*)+global" } else { "global" },
+            "dist_ns_by_L": {"L": graph_dist_ns_l, "ns": graph_dist_ns_curve},
             "laziness": {"rates": rates, "by_K_L": lazy_rows, "heap_bound_k": heap_bound_k,
                 "heap_bound_extra": heap_bound_extra, "heap_bound_l": heap_bound_l,
                 "heap_bound_extra_kl": heap_bound_extra_kl,
@@ -652,6 +695,8 @@ pub fn calibrate<T: Element>(
         check_prefetch_ns,
         check_row_ns,
         query_ns,
+        graph_dist_ns_l,
+        graph_dist_ns_curve,
         // The effort curve is calibrated separately (base-derived queries).
         ..UnitCosts::default()
     };

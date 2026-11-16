@@ -217,8 +217,9 @@ mostly misses of the first clause) and on members of the calibration predicates'
 checked like the exact path's candidates, separately for predicates whose residual clauses
 read rows and bitset-only ones (`pred_row_ns`, `pred_bits_ns`; used for `scan` and `df`);
 merge and bitmap costs; galloping steps by gap, measured with the gallop plan on label pairs
-whose posting lengths have that ratio (`gallop_gap_ns`: cache misses grow with the gap); graph-search costs per distance and per predicate, and the
-predicate evaluations of `heap_bound` and `distance_first` searches (below). It takes a few
+whose posting lengths have that ratio (`gallop_gap_ns`: cache misses grow with the gap); graph-search costs per distance and per predicate (and per distance by list size up to
+L = 40,960: long beams cost more per distance), and the predicate evaluations of `heap_bound`
+and `distance_first` searches (below). It takes a few
 seconds (1M points) to two minutes (40M) per dataset; the costs are loaded with the experiment
 or configuration key `calibration`. Calibrations without the newer terms reproduce the batch-B6
 cost model.
