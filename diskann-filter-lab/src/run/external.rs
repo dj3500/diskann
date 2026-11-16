@@ -13,6 +13,9 @@
 //!   `algorithm` = `knn-postfilter` | `inline` | `inline-adaptive` / `inline-adaptive(s, f)` |
 //!   `multihop` | `beta(β)` | `pathseer`; `provider` = `forward` (default) | `bitmap`. The
 //!   provider is compiled for every query inside the timer.
+//!   With `provider = "encoded(<label index>)"` (the encoded label index of open upstream PRs
+//!   #1319 / #1477, built by `flab label-index`), `algorithm` = `multihop` (#1319) |
+//!   `hybrid(T)` / `hybrid(max)` (#1477's count-routed search; [`crate::upstream::encoded`]).
 //! - `engine = "dylib"`: a shared library (`library`) implementing the C ABI below, opened on
 //!   the dataset directory with its own `index` path and a free-form `params` string.
 //!
@@ -59,6 +62,7 @@ use crate::{
     kernel::search::{Counters, Query, Route},
     labels::LabelStore,
     upstream::{
+        encoded::{self, EncodedAlgorithm, EncodedProvider, EncodedRoute},
         filter::{BitmapFilter, ForwardFilter, PredicateFilter},
         index::{self, LoadedIndex},
         search::{Algorithm, QueryStats, Searcher},
@@ -124,6 +128,30 @@ pub fn open<T: Element>(
     max_l: usize,
 ) -> Result<Box<dyn External<T>>> {
     match spec {
+        ExternalSpec::Upstream {
+            algorithm,
+            provider,
+        } if provider.starts_with("encoded(") => {
+            let path = provider
+                .strip_prefix("encoded(")
+                .and_then(|r| r.strip_suffix(')'))
+                .context("provider = \"encoded(<label index path>)\"")?;
+            let algorithm = encoded::parse_algorithm(algorithm)?;
+            match T::DTYPE {
+                DType::U8 => Ok(Box::new(Encoded::<u8>::open(
+                    graph,
+                    algorithm,
+                    Path::new(path),
+                    ds.labels.clone(),
+                )?)),
+                DType::F32 => Ok(Box::new(Encoded::<f32>::open(
+                    graph,
+                    algorithm,
+                    Path::new(path),
+                    ds.labels.clone(),
+                )?)),
+            }
+        }
         ExternalSpec::Upstream {
             algorithm,
             provider,
@@ -310,6 +338,111 @@ impl<T: Element, U: VectorRepr + Element + 'static> External<T> for Upstream<U> 
             }
         };
         Ok((self.counters(&stats, calls, matches), [0; 5]))
+    }
+
+    fn describe(&self) -> Value {
+        self.desc.clone()
+    }
+}
+
+/// Upstream PRs #1319 / #1477 through the adapter ([`crate::upstream::encoded`]).
+struct Encoded<U: VectorRepr + 'static> {
+    loaded: &'static LoadedIndex<U>,
+    algorithm: EncodedAlgorithm,
+    provider: EncodedProvider,
+    n_start: u64,
+    desc: Value,
+}
+
+impl<U: VectorRepr + Element + 'static> Encoded<U> {
+    fn open(
+        graph: &Path,
+        algorithm: EncodedAlgorithm,
+        label_index: &Path,
+        labels: Arc<LabelStore>,
+    ) -> Result<Self> {
+        let prefix = graph
+            .to_str()
+            .with_context(|| format!("{}: not UTF-8", graph.display()))?;
+        let loaded: &'static LoadedIndex<U> = Box::leak(Box::new(
+            index::load::<U>(prefix).with_context(|| format!("upstream index {prefix}"))?,
+        ));
+        ensure!(
+            loaded.n_data == labels.n_points(),
+            "{prefix}: {} data points, the labels have {}",
+            loaded.n_data,
+            labels.n_points()
+        );
+        let provider = EncodedProvider::open(label_index, labels)?;
+        let desc = json!({
+            "engine": "upstream",
+            "algorithm": algorithm.name(),
+            "algorithm_doc": match algorithm {
+                EncodedAlgorithm::Multihop => "PR #1319: MultihopFilterSearch with the encoded index's CNF plan as the per-node test (static dispatch on the plan's point evaluator)",
+                EncodedAlgorithm::Hybrid { .. } => "PR #1477: HybridFilterSearch (U = min over clauses of the sum of label counts; U = 0: empty; U < T: exhaustive scan of the enumerated candidates; else multihop)",
+            },
+            "provider": "encoded",
+            "provider_doc": "diskann-label-index (PR #1477 head 17a8266a, incl. #1319): CNF plan compiled per query inside the timer from clause strings; exact admission (forward-row re-check) of plan positives when the plan reads a Bloom row",
+            "label_index": provider.describe(),
+            "index": prefix,
+            "n_data": loaded.n_data,
+            "start_ids": loaded.start_ids,
+            "max_observed_degree": loaded.header.max_observed_degree,
+            "search_api": "DiskANNIndex::search, beam width 1, strategy default post-processor; futures polled on the calling thread",
+            "n_dist": "upstream cmps (+ the start-point distances on the graph route, which upstream does not count); exhaustive route: candidates scored",
+            "n_pred": "plan evaluations (graph route) + exact admission checks",
+            "extras": "ext_x0 = routing bound U (u64::MAX: not computed), ext_x1 = candidates enumerated by the exhaustive route (before admission), ext_x2 = plan positives rejected by exact admission (Bloom false positives), ext_x3 = exact admission checks",
+        });
+        Ok(Self {
+            loaded,
+            algorithm,
+            provider,
+            n_start: loaded.start_ids.len() as u64,
+            desc,
+        })
+    }
+}
+
+impl<T: Element, U: VectorRepr + Element + 'static> External<T> for Encoded<U> {
+    fn search(
+        &mut self,
+        q: &Query<'_, T>,
+        l: usize,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> Result<(Counters, [u64; 5])> {
+        let vector: &[U] = bytemuck::cast_slice(q.vector);
+        let s = self.provider.search(
+            &self.loaded.index,
+            self.algorithm,
+            l,
+            vector,
+            q.cnf,
+            ids,
+            dists,
+        )?;
+        let route = match s.route {
+            Some(EncodedRoute::Graph) | None => Route::Graph,
+            Some(EncodedRoute::Exhaustive) => Route::Exact,
+            Some(EncodedRoute::Empty) => Route::Empty,
+        };
+        let graph = route == Route::Graph;
+        let counters = Counters {
+            n_dist: u64::from(s.up_cmps) + if graph { self.n_start } else { 0 },
+            n_pred: s.calls + s.exact_checks,
+            n_expand: 0,
+            n_hops: u64::from(s.up_hops),
+            n_match_seen: s.plan_pos - s.false_pos,
+            n_exact_cand: if graph { 0 } else { u64::from(s.up_cmps) },
+            n_out: u64::from(s.n_out),
+            n_start: if graph { self.n_start } else { 0 },
+            route,
+            ..Counters::default()
+        };
+        Ok((
+            counters,
+            [0, s.bound, s.candidates_enumerated, s.false_pos, s.exact_checks],
+        ))
     }
 
     fn describe(&self) -> Value {

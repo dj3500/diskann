@@ -13,6 +13,7 @@
 //! an index saved by upstream, with the lab's predicate providers ([`filter`]), a per-query
 //! timer and the lab's run outputs ([`run`]). Used by the `flab-upstream` binary.
 
+pub mod encoded;
 pub mod filter;
 pub mod index;
 pub mod queries;

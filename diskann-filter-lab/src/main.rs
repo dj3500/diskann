@@ -65,6 +65,9 @@ enum Command {
     Sketches(SketchesCommand),
     /// Measure the unit costs of the cost model on this machine and dataset (JSON).
     Calibrate(CalibrateArgs),
+    /// Build the encoded label index of upstream PRs #1319 / #1477 (`diskann-label-index`) from
+    /// a label store, for the `encoded(...)` provider of the upstream engine.
+    LabelIndex(LabelIndexArgs),
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
     /// kernel and write run directories (see `run` in the crate documentation).
     Run(RunArgs),
@@ -223,6 +226,28 @@ struct ImportGraphArgs {
     #[arg(short, long)]
     output: PathBuf,
     /// Write a JSON report (inputs, header, node space, statistics, checks).
+    #[arg(long)]
+    report: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct LabelIndexArgs {
+    /// Label store (`labels.flab`).
+    #[arg(long)]
+    labels: PathBuf,
+    /// Exact rows for the `E` most frequent labels and Bloom rows for the others; all labels
+    /// exact when omitted (#1319's bitslice).
+    #[arg(long)]
+    exact: Option<u32>,
+    /// Bloom rows (with `--exact`).
+    #[arg(long, default_value_t = 128)]
+    bloom_bits: u32,
+    /// Bloom hash functions per label (with `--exact`).
+    #[arg(long, default_value_t = 4)]
+    bloom_hashes: u32,
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Write a JSON report (sizes, build times).
     #[arg(long)]
     report: Option<PathBuf>,
 }
@@ -440,6 +465,30 @@ fn main() -> Result<()> {
         Command::GtCompare(args) => run_compare(&args),
         Command::ImportGraph(args) => import_graph(&args),
         Command::ImportStarts(args) => import_starts(&args),
+        Command::LabelIndex(a) => {
+            let t = std::time::Instant::now();
+            let labels = diskann_filter_lab::labels::LabelStore::read(&a.labels)?;
+            let load_s = t.elapsed().as_secs_f64();
+            let layout = match a.exact {
+                None => diskann_filter_lab::upstream::encoded::Layout::ExactOnly,
+                Some(exact) => diskann_filter_lab::upstream::encoded::Layout::Bloom {
+                    exact,
+                    bits: a.bloom_bits,
+                    hashes: a.bloom_hashes,
+                },
+            };
+            let mut report = diskann_filter_lab::upstream::encoded::build(&labels, &a.output, layout)?;
+            report["labels"] = serde_json::json!(a.labels);
+            report["labels_load_s"] = serde_json::json!(load_s);
+            report["n_points"] = serde_json::json!(labels.n_points());
+            report["n_labels_store"] = serde_json::json!(labels.n_labels());
+            let text = serde_json::to_string_pretty(&report)?;
+            println!("{text}");
+            if let Some(r) = &a.report {
+                std::fs::write(r, text + "\n")?;
+            }
+            Ok(())
+        }
         Command::Starts(StartsCommand::Build(args)) => {
             match DType::from_path(&run::data::base_file(&args.dataset)?)? {
                 DType::U8 => build_starts::<u8>(&args),

@@ -343,6 +343,12 @@ provider = "forward"             # forward (default) | bitmap
 graph = "/path/to/index"         # a DiskANN index prefix saved by upstream
 
 [[config]]
+name = "hybrid"
+engine = "upstream"
+algorithm = "hybrid(30000)"      # with an encoded provider: multihop | hybrid(T) | hybrid(max)
+provider = "encoded(/path/to/labels.danlbl)"   # label index of PRs #1319 / #1477 (`flab label-index`)
+
+[[config]]
 name = "other"
 engine = "dylib"                 # a shared library implementing the C ABI of run::external
 library = "/path/to/libengine.so"
@@ -670,6 +676,18 @@ providers, a per-query timer and the lab's run outputs (module `upstream`).
 | `multihop` | `MultihopFilterSearch` | best K matches |
 | `beta` | `BetaFilter` layer over `Knn` (`--beta`) | L candidates post-filtered to the best K matches, with recomputed true distances |
 | `pathseer` | `PathSeer` (open upstream PR #1506, applied to this branch's `diskann` crate) | best K of its L matches |
+
+**Encoded label index (open upstream PRs #1319 / #1477, applied to this branch).** `flab label-index
+--labels labels.flab [--exact E --bloom-bits B --bloom-hashes k] -o index.danlbl` writes the PRs'
+label index (crate `diskann-label-index`): one dense bit row per label (#1319's bitslice), or exact
+rows for the `E` most frequent labels and `B` shared Bloom rows for the others (#1477). The external
+engine's provider `encoded(<file>)` compiles each query's CNF into the index's flat plan inside the
+timer and runs `multihop` (#1319: the plan's point evaluator as the per-node test, static dispatch)
+or `hybrid(T)` (#1477's `HybridFilterSearch`: the bound `U` = smallest clause's sum of label counts;
+`U = 0` returns nothing, `U < T` scores the enumerated candidates exhaustively, otherwise multihop).
+Plan positives of a query that reads a Bloom row are re-checked on the point's label row before they
+are accepted, in both routes (neither PR does this), so answers are exact. Extra columns: `ext_x0` =
+`U`, `ext_x1` = enumerated candidates, `ext_x2` = rejected Bloom positives, `ext_x3` = exact checks.
 
 Predicate providers (`--providers`) implement upstream's `QueryLabelProvider`:
 

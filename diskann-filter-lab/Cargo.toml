@@ -23,6 +23,7 @@ anyhow.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }
 clap = { workspace = true, features = ["derive"] }
 diskann.workspace = true
+diskann-label-index.workspace = true
 diskann-providers.workspace = true
 diskann-vector.workspace = true
 hashbrown.workspace = true
