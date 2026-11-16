@@ -334,6 +334,8 @@ pub enum EvalMode {
 pub struct Plan {
     pub kernel: Kernel,
     projection: Option<Vec<u32>>,
+    /// Admission `projection(c*)`: navigation evaluates only the query's binding clause.
+    project_smallest: bool,
     two_hop_cap: usize,
     eval: EvalMode,
     /// `θ` of the `static_bits(θ)` mode.
@@ -512,6 +514,7 @@ impl Plan {
         Ok(Self {
             kernel: kernel.clone(),
             projection,
+            project_smallest: kernel.admission == Admission::ProjectionSmallest,
             two_hop_cap,
             eval,
             static_theta,
@@ -560,15 +563,17 @@ impl Plan {
         let force = k.start_admission == StartAdmission::Force;
         let g_adm = match &k.admission {
             Admission::All => nav_w,
-            Admission::Strict | Admission::Projection(_) => 0.0,
+            Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest => 0.0,
             Admission::Cutoff(t) => (*t as f32 * q.max_nav_weight()).min(nav_w),
         };
         let g_aux = if self.n_aux > 0 { k.aux_g } else { 0.0 };
         let g_max = g_adm.max(if force { nav_w } else { 0.0 }).max(g_aux);
         let mut p = score::Params {
             g_max,
-            nonmatch_in_beam: !matches!(k.admission, Admission::Strict | Admission::Projection(_))
-                || force
+            nonmatch_in_beam: !matches!(
+                k.admission,
+                Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest
+            ) || force
                 || self.n_aux > 0,
             ..score::Params::default()
         };
@@ -781,6 +786,9 @@ impl Searcher {
             plan.projection.as_deref(),
             &mut self.bits,
         );
+        if plan.project_smallest {
+            self.compiled.project_smallest();
+        }
         let stat = (plan.eval == EvalMode::StaticBits).then(|| {
             let b = ix
                 .bitsets
@@ -2442,7 +2450,9 @@ fn run<T: Element, P: Eval, S: Score>(
     let two_hop = matches!(kernel.expander, Expander::TwoHop(_));
     let admission = match kernel.admission {
         Admission::All => AdmissionRule::All,
-        Admission::Strict | Admission::Projection(_) => AdmissionRule::Match,
+        Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest => {
+            AdmissionRule::Match
+        }
         Admission::Cutoff(t) => AdmissionRule::Cutoff(t),
     };
 
