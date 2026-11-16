@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use super::{
     build,
     builder::{slots, BuildParams, Order},
-    replay, BuildElement, Pools, PruneRule, ReplayMode, ReplayParams,
+    replay, BuildElement, Candidates, Pools, PruneRule, ReplayMode, ReplayParams,
 };
 use crate::{
     diskann_io,
@@ -44,6 +44,16 @@ pub struct BuildArgs {
     /// `coverage(R, α, B[, k])` or `split(R_geo, R_lab[, α])`.
     #[arg(long, default_value = "alpha(64, 1.2)")]
     pub prune: String,
+    /// Candidate generation of the insertions: `blind`, `filtered(<subset>[, <budget>|R[,
+    /// <L_f>]])` (subset `all`, `<θ>` or `n/<k>`: one label-filtered search per label of the
+    /// subset, rarest first, at most `budget` per point, default R) or
+    /// `penalized(<λ>|inf[, raw|penalized])` (λ in units of the median squared
+    /// nearest-neighbor distance).
+    #[arg(long, default_value = "blind")]
+    pub candidates: String,
+    /// Sample size of the nearest-neighbor distance scale of penalized insertion.
+    #[arg(long, default_value_t = 256)]
+    pub nn_sample: usize,
     /// Replay these recorded pools with the rule instead of building (no searches).
     #[arg(long)]
     pub replay: Option<PathBuf>,
@@ -130,6 +140,11 @@ fn run_typed<T: BuildElement>(args: &BuildArgs, base_path: &Path) -> Result<()> 
     let created = sys::utc_timestamp(false);
     let load_start = sys::load_average();
     let rule: PruneRule = args.prune.parse()?;
+    let candidates: Candidates = args.candidates.parse()?;
+    anyhow::ensure!(
+        args.replay.is_none() || candidates == Candidates::Blind,
+        "a replay uses recorded pools: --candidates applies to builds only"
+    );
     let labels_path = args
         .labels
         .clone()
@@ -137,10 +152,10 @@ fn run_typed<T: BuildElement>(args: &BuildArgs, base_path: &Path) -> Result<()> 
 
     let t_load = Instant::now();
     let base = Matrix::<T>::read_bin(base_path)?;
-    let labels = if rule.needs_labels() {
+    let labels = if rule.needs_labels() || candidates.needs_labels() {
         let path = labels_path
             .as_ref()
-            .context("label-aware rules need --labels or --dataset")?;
+            .context("label-aware rules and candidates need --labels or --dataset")?;
         Some(LabelStore::read(path)?)
     } else {
         None
@@ -213,9 +228,11 @@ fn run_typed<T: BuildElement>(args: &BuildArgs, base_path: &Path) -> Result<()> 
             threads: args.threads,
             capture: args.pools.is_some(),
             final_prune: args.final_prune,
+            candidates,
+            nn_sample: args.nn_sample,
         };
         eprintln!(
-            "building over {} × {} {} points with {rule}, L_build {}, batches ≤ {}, {} threads{}",
+            "building over {} × {} {} points with {rule}, candidates {candidates}, L_build {}, batches ≤ {}, {} threads{}",
             base.nrows(),
             base.ncols(),
             T::NAME,
@@ -243,6 +260,7 @@ fn run_typed<T: BuildElement>(args: &BuildArgs, base_path: &Path) -> Result<()> 
             },
             "final_prune": params.final_prune,
             "start": "frozen copy of the medoid (auxiliary node n_data)",
+            "candidates": out.candidates,
         });
         let mut stats = serde_json::to_value(&out.stats)?;
         if let (Some(path), Some(pools)) = (&args.pools, &out.pools) {
