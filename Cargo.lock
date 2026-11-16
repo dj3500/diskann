@@ -626,6 +626,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "diskann",
+ "diskann-label-index",
  "diskann-providers",
  "diskann-utils",
  "diskann-vector",
@@ -706,6 +707,17 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "diskann-label-index"
+version = "0.55.1-pre.1"
+dependencies = [
+ "diskann",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3048,6 +3060,12 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "zerocopy"

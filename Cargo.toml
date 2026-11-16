@@ -17,6 +17,7 @@ members = [
     "diskann-providers",
     "diskann-disk",
     "diskann-label-filter",
+    "diskann-label-index",
     "diskann-garnet",
     "diskann-inmem",
     # Infrastructure
@@ -67,6 +68,7 @@ diskann-providers = { path = "diskann-providers", default-features = false, vers
 diskann-inmem = { path = "diskann-inmem", default-features = false, version = "0.62.0" }
 diskann-disk = { path = "diskann-disk", version = "0.62.0" }
 diskann-label-filter = { path = "diskann-label-filter", version = "0.62.0" }
+diskann-label-index = { path = "diskann-label-index", version = "0.55.1-pre.1" }
 # Infra
 diskann-benchmark-runner = { path = "diskann-benchmark-runner", version = "0.62.0" }
 diskann-benchmark-core = { path = "diskann-benchmark-core", version = "0.62.0" }
@@ -115,6 +117,7 @@ tokio = "1.48.0"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.20"
 vfs = "0.12.1"
+xxhash-rust = { version = "=0.8.19", features = ["xxh3"] }
 
 [profile.release]
 opt-level = 3

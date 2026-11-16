@@ -25,11 +25,14 @@
 //! * There exists a time-of-check, time-of-use window between label checks and distance
 //!   computations.
 //!
-//! * The [`QueryLabelProvider`] is checked behind a trait object.
+//! * A `dyn` [`QueryLabelProvider`] uses indirect calls. Keeping the provider type concrete allows
+//!   the compiler to specialize and inline the filtered-search hot path.
 //!
 //! * By default, the [`FilteredAccessor`] is not passed to search post-processing.
 //!
 //! * As of writing, [`QueryLabelProvider`] does not have batched accesses.
+
+use std::marker::PhantomData;
 
 use crate::{
     ANNResult,
@@ -49,20 +52,34 @@ where
     /// When used with [`Filtered`], callers may assume that `i` was yielded from a
     /// callback from [`glue::SearchAccessor::expand_beam`].
     fn is_match(&self, i: I) -> bool;
+
+    /// Prefetch data needed to classify `i`.
+    ///
+    /// The default is a no-op.
+    fn prefetch(&self, _i: I) {}
+
+    /// Return how many classifications ahead callers should prefetch.
+    ///
+    /// The default disables label prefetching.
+    fn prefetch_lookahead(&self) -> usize {
+        0
+    }
 }
 
-// Move this external to the `QueryLabelProvider` call so the indirect call has a slightly
-// simpler signature. Does it matter? Probably not.
-fn decide<T, I>(provider: &T, i: I) -> Decision<I>
+/// A label provider that can enumerate candidates for exhaustive filtered search.
+///
+/// The bound is conservative for true matches and may be much smaller than the number
+/// of candidates when membership is approximate. `visit_candidates` must yield each
+/// candidate at most once, exclude frozen graph start points, and include every true match.
+pub trait CandidateLabelProvider<I>: QueryLabelProvider<I>
 where
     I: VectorId,
-    T: QueryLabelProvider<I> + ?Sized,
 {
-    if provider.is_match(i) {
-        Decision::accept(i)
-    } else {
-        Decision::reject(i)
-    }
+    /// Return a conservative true-match bound, or `None` when counts are unavailable.
+    fn match_upper_bound(&self) -> Option<u64>;
+
+    /// Visit every candidate ID, including any approximate-filter false positives.
+    fn visit_candidates(&self, visit: impl FnMut(I));
 }
 
 /// A [`SearchStrategy`](glue::SearchStrategy) adaptor that creates a
@@ -72,33 +89,50 @@ where
 /// mixes per-query information (the [`QueryLabelProvider`]) with a general strategy
 /// type, but is done as a convenience to also avoid wrapper types for the query that
 /// Rust's coherence rules would otherwise require.
+///
+/// `L` defaults to a trait object for heterogeneous providers, while callers that retain a
+/// concrete provider type get static dispatch.
 #[derive(Debug, Clone, Copy)]
-pub struct Filtered<'a, S, I> {
+pub struct Filtered<'a, S, I, L: ?Sized = dyn QueryLabelProvider<I> + 'a>
+where
+    I: VectorId,
+    L: QueryLabelProvider<I>,
+{
     strategy: S,
-    labels: &'a dyn QueryLabelProvider<I>,
+    labels: &'a L,
+    _id: PhantomData<fn(I)>,
 }
 
-impl<'a, S, I> Filtered<'a, S, I> {
+impl<'a, S, I, L> Filtered<'a, S, I, L>
+where
+    I: VectorId,
+    L: QueryLabelProvider<I> + ?Sized,
+{
     /// Construct a new [`Filtered`] that will apply the `labels` filter to
     /// `SearchAccessors` yielded from `strategy`.
     ///
     /// Note that this embeds query-specific state with the strategy, so use with caution.
-    pub fn new(strategy: S, labels: &'a dyn QueryLabelProvider<I>) -> Self {
-        Self { strategy, labels }
+    pub fn new(strategy: S, labels: &'a L) -> Self {
+        Self {
+            strategy,
+            labels,
+            _id: PhantomData,
+        }
     }
 
     /// Return the contained [`QueryLabelProvider`].
-    pub fn labels(&self) -> &'a dyn QueryLabelProvider<I> {
+    pub fn labels(&self) -> &'a L {
         self.labels
     }
 }
 
-impl<'a, S, DP, T> glue::SearchStrategy<'a, DP, T> for Filtered<'_, S, DP::InternalId>
+impl<'a, S, DP, T, L> glue::SearchStrategy<'a, DP, T> for Filtered<'_, S, DP::InternalId, L>
 where
     DP: DataProvider,
     S: glue::SearchStrategy<'a, DP, T>,
+    L: QueryLabelProvider<DP::InternalId> + ?Sized + 'a,
 {
-    type SearchAccessor = FilteredAccessor<'a, S::SearchAccessor>;
+    type SearchAccessor = FilteredAccessor<'a, S::SearchAccessor, L>;
     type SearchAccessorError = S::SearchAccessorError;
 
     fn search_accessor(
@@ -115,11 +149,13 @@ where
     }
 }
 
-impl<'a, S, DP, T, O> glue::DefaultPostProcessor<'a, DP, T, O> for Filtered<'_, S, DP::InternalId>
+impl<'a, S, DP, T, O, L> glue::DefaultPostProcessor<'a, DP, T, O>
+    for Filtered<'_, S, DP::InternalId, L>
 where
     S: glue::DefaultPostProcessor<'a, DP, T, O>,
     DP: DataProvider,
     O: Send,
+    L: QueryLabelProvider<DP::InternalId> + ?Sized + 'a,
 {
     type Processor = glue::Pipeline<Unfiltered, S::Processor>;
 
@@ -134,41 +170,63 @@ where
 ///
 /// See: [`Filtered`], [`QueryLabelProvider`].
 #[derive(Debug)]
-pub struct FilteredAccessor<'a, A>
+pub struct FilteredAccessor<'a, A, L: ?Sized = dyn QueryLabelProvider<<A as HasId>::Id> + 'a>
 where
     A: HasId,
+    L: QueryLabelProvider<A::Id>,
 {
     inner: A,
-    labels: &'a dyn QueryLabelProvider<A::Id>,
+    labels: &'a L,
 }
 
-impl<'a, A> FilteredAccessor<'a, A>
+impl<'a, A, L> FilteredAccessor<'a, A, L>
 where
     A: HasId,
+    L: QueryLabelProvider<A::Id> + ?Sized,
 {
     #[cfg(test)]
-    pub(crate) fn new(inner: A, labels: &'a dyn QueryLabelProvider<A::Id>) -> Self {
+    pub(crate) fn new(inner: A, labels: &'a L) -> Self {
         Self { inner, labels }
     }
 }
 
-impl<A> HasId for FilteredAccessor<'_, A>
+impl<A, L> HasId for FilteredAccessor<'_, A, L>
 where
     A: HasId,
+    L: QueryLabelProvider<A::Id> + ?Sized,
 {
     type Id = A::Id;
 }
 
-impl<'a, A> glue::FilteredAccessor for FilteredAccessor<'a, A>
+impl<A, L> glue::RandomAccessQueryDistance for FilteredAccessor<'_, A, L>
+where
+    A: glue::RandomAccessQueryDistance,
+    L: QueryLabelProvider<A::Id> + ?Sized,
+{
+    fn distance_to_id(&mut self, id: Self::Id) -> ANNResult<f32> {
+        self.inner.distance_to_id(id)
+    }
+}
+
+impl<'a, A, L> glue::FilteredAccessor for FilteredAccessor<'a, A, L>
 where
     A: glue::SearchAccessor,
+    L: QueryLabelProvider<A::Id> + ?Sized,
 {
     async fn start_point_distances<F>(&mut self, mut f: F) -> ANNResult<()>
     where
         F: FnMut(Decision<Self::Id>, f32) + Send,
     {
+        let labels = self.labels;
         self.inner
-            .start_point_distances(|id, distance| f(decide(self.labels, id), distance))
+            .start_point_distances(|id, distance| {
+                let decision = if labels.is_match(id) {
+                    Decision::accept(id)
+                } else {
+                    Decision::reject(id)
+                };
+                f(decision, distance);
+            })
             .await
     }
 
@@ -183,9 +241,15 @@ where
         P: glue::HybridPredicate<Self::Id> + Send + Sync,
         F: FnMut(Decision<Self::Id>, f32) + Send,
     {
+        let labels = self.labels;
         self.inner
             .expand_beam(ids, pred, |id, distance| {
-                on_neighbors(decide(self.labels, id), distance)
+                let decision = if labels.is_match(id) {
+                    Decision::accept(id)
+                } else {
+                    Decision::reject(id)
+                };
+                on_neighbors(decision, distance);
             })
             .await
     }
@@ -222,9 +286,10 @@ where
 #[derive(Debug, Clone, Copy)]
 pub struct Unfiltered;
 
-impl<A, T, O> glue::SearchPostProcessStep<FilteredAccessor<'_, A>, T, O> for Unfiltered
+impl<A, T, O, L> glue::SearchPostProcessStep<FilteredAccessor<'_, A, L>, T, O> for Unfiltered
 where
     A: HasId,
+    L: QueryLabelProvider<A::Id> + ?Sized,
 {
     type Error<NextError>
         = NextError
@@ -235,7 +300,7 @@ where
     fn post_process_step<I, B, Next>(
         &self,
         next: &Next,
-        accessor: &mut FilteredAccessor<'_, A>,
+        accessor: &mut FilteredAccessor<'_, A, L>,
         query: T,
         candidates: I,
         output: &mut B,
@@ -252,49 +317,60 @@ where
 /// A [`glue::HybridPredicate`] that uses an additional [`QueryLabelProvider`] to skip
 /// computing distances to items that do not satisfy the predicate.
 #[derive(Debug)]
-struct EvalFiltered<'a, P, I>
-where
-    I: VectorId,
-{
+struct EvalFiltered<'a, P, L: ?Sized> {
     inner: P,
-    labels: &'a dyn QueryLabelProvider<I>,
+    labels: &'a L,
 }
 
-impl<'a, P, I> EvalFiltered<'a, P, I>
-where
-    I: VectorId,
-{
-    fn new(inner: P, labels: &'a dyn QueryLabelProvider<I>) -> Self {
+impl<'a, P, L: ?Sized> EvalFiltered<'a, P, L> {
+    fn new(inner: P, labels: &'a L) -> Self {
         Self { inner, labels }
     }
 }
 
-impl<P, I> glue::Predicate<I> for EvalFiltered<'_, P, I>
+impl<P, I, L> glue::Predicate<I> for EvalFiltered<'_, P, L>
 where
     P: glue::Predicate<I>,
     I: VectorId,
+    L: QueryLabelProvider<I> + ?Sized,
 {
     fn eval(&self, item: &I) -> bool {
         self.inner.eval(item) && self.labels.is_match(*item)
     }
-}
 
-impl<P, I> glue::PredicateMut<I> for EvalFiltered<'_, P, I>
-where
-    P: glue::PredicateMut<Accept<I>>,
-    I: VectorId,
-{
-    fn eval_mut(&mut self, item: &I) -> bool {
-        // Order must be `label` -> `inner` because we have to know an ID is accepted before
-        // passing it to `eval_mut`.
-        self.labels.is_match(*item) && self.inner.eval_mut(&Accept::new(*item))
+    #[inline]
+    fn prefetch(&self, item: &I) {
+        self.labels.prefetch(*item);
+    }
+
+    #[inline]
+    fn prefetch_lookahead(&self) -> usize {
+        self.labels.prefetch_lookahead()
     }
 }
 
-impl<P, I> glue::HybridPredicate<I> for EvalFiltered<'_, P, I>
+impl<P, I, L> glue::PredicateMut<I> for EvalFiltered<'_, P, L>
 where
     P: glue::Predicate<I> + glue::PredicateMut<Accept<I>>,
     I: VectorId,
+    L: QueryLabelProvider<I> + ?Sized,
+{
+    fn eval_mut(&mut self, item: &I) -> bool {
+        if !self.inner.eval(item) {
+            return false;
+        }
+        if !self.labels.is_match(*item) {
+            return false;
+        }
+        self.inner.eval_mut(&Accept::new(*item))
+    }
+}
+
+impl<P, I, L> glue::HybridPredicate<I> for EvalFiltered<'_, P, L>
+where
+    P: glue::Predicate<I> + glue::PredicateMut<Accept<I>>,
+    I: VectorId,
+    L: QueryLabelProvider<I> + ?Sized,
 {
 }
 

@@ -43,6 +43,7 @@ use crate::{
 };
 
 mod filtered_range_search;
+mod hybrid_filter_search;
 mod inline_filter_search;
 mod knn_search;
 pub(crate) mod multihop_filter_search;
@@ -68,6 +69,7 @@ pub(crate) mod scratch;
 /// - [`FilteredRange`] - Filtered range search
 /// - [`Diverse`] - Diversity-aware search (feature-gated)
 /// - [`MultihopFilterSearch`] - Label-filtered search with multi-hop expansion
+/// - [`HybridFilterSearch`] - Count-routed multihop or exhaustive filtered search
 /// - [`InlineFilterSearch`] - Inline filtered search with optional adaptive L sizing
 /// - [`PathSeer`] - Two-phase filtered search for in-memory graphs
 /// - [`RecordedKnn`] - K-NN search with path recording for debugging
@@ -117,6 +119,9 @@ where
 }
 
 pub use filtered_range_search::FilteredRange;
+pub use hybrid_filter_search::{
+    HybridFilterSearch, HybridFilterSearchError, HybridPhaseTimings, HybridSearchStats,
+};
 pub use inline_filter_search::{AdaptiveL, InlineFilterSearch};
 pub use knn_search::{Knn, KnnSearchError, RecordedKnn};
 pub use multihop_filter_search::MultihopFilterSearch;
