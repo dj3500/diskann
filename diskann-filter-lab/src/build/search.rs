@@ -4,13 +4,43 @@
  */
 
 //! Greedy search for insertion candidates (upstream DiskANN's `search_internal` with beam
-//! width 1, as used by `insert` and `multi_insert`).
+//! width 1, as used by `insert` and `multi_insert`), with an optional [`Ranking`]: which nodes
+//! may enter the list (label-filtered insertion) and the key that orders it (penalized
+//! insertion).
 
 use super::{adjacency::Adjacency, prune::Candidate, Points};
 use crate::vectors::Element;
 
+/// How an insertion search admits and orders nodes. The default methods give the label-blind
+/// search (every node admitted, ordered by squared distance).
+pub(crate) trait Ranking {
+    /// Whether node `v` may enter the list; checked before its distance is computed. A
+    /// rejected node is marked visited and never evaluated again.
+    #[inline(always)]
+    fn admit(&mut self, _v: u32) -> bool {
+        true
+    }
+
+    /// Called for every admitted unvisited node before the distances of an expansion are
+    /// computed (e.g. to prefetch its label row).
+    #[inline(always)]
+    fn prepare(&mut self, _v: u32) {}
+
+    /// The list key of node `v` at squared distance `d`.
+    #[inline(always)]
+    fn key(&mut self, _v: u32, d: f32) -> f32 {
+        d
+    }
+}
+
+/// The label-blind ranking.
+pub(crate) struct Blind;
+
+impl Ranking for Blind {}
+
 #[derive(Debug, Clone, Copy)]
 struct Slot {
+    key: f32,
     dist: f32,
     id: u32,
     expanded: bool,
@@ -26,8 +56,12 @@ pub(crate) struct Searcher {
     beam: Vec<Slot>,
     cursor: usize,
     fresh: Vec<u32>,
-    /// Nodes expanded by the last search, in expansion order, with their distances.
+    /// Nodes expanded by the last search, in expansion order, with their squared distances.
     pub(crate) expanded: Vec<Candidate>,
+    /// The list keys of [`Self::expanded`] (equal to the distances for the blind ranking).
+    pub(crate) expanded_keys: Vec<f32>,
+    /// Admission tests of the last search.
+    pub(crate) n_admit: u64,
 }
 
 impl Searcher {
@@ -39,6 +73,8 @@ impl Searcher {
             cursor: 0,
             fresh: Vec::new(),
             expanded: Vec::new(),
+            expanded_keys: Vec::new(),
+            n_admit: 0,
         }
     }
 
@@ -55,18 +91,41 @@ impl Searcher {
         start: u32,
         l: usize,
     ) -> u64 {
+        self.search_ranked(adjacency, points, query, start, l, &mut Blind)
+    }
+
+    /// [`Self::search`] with a [`Ranking`]: only admitted nodes (the start included) enter the
+    /// list, which is ordered by the ranking's key (ties: a new entry goes before entries
+    /// with an equal key). Returns the number of distance computations.
+    pub(crate) fn search_ranked<T: Element, R: Ranking>(
+        &mut self,
+        adjacency: &Adjacency,
+        points: &Points<'_, T>,
+        query: &[T],
+        start: u32,
+        l: usize,
+        ranking: &mut R,
+    ) -> u64 {
         let capacity = l + 1;
         self.beam.clear();
         self.cursor = 0;
         self.expanded.clear();
+        self.expanded_keys.clear();
         self.touched.clear();
+        self.n_admit = 1;
         self.mark(start);
-        self.insert(capacity, start, T::squared_l2(query, points.get(start)));
+        if !ranking.admit(start) {
+            self.reset_visited();
+            return 0;
+        }
+        let d0 = T::squared_l2(query, points.get(start));
+        self.insert(capacity, start, ranking.key(start, d0), d0);
         let mut n_dist = 1u64;
         while self.cursor < self.beam.len() {
             let node = self.beam[self.cursor];
             self.beam[self.cursor].expanded = true;
             self.expanded.push(Candidate::new(node.id, node.dist));
+            self.expanded_keys.push(node.key);
             self.cursor += 1;
             while self.cursor < self.beam.len() && self.beam[self.cursor].expanded {
                 self.cursor += 1;
@@ -74,20 +133,29 @@ impl Searcher {
             self.fresh.clear();
             for &v in adjacency.neighbors(node.id) {
                 if self.mark(v) {
-                    self.fresh.push(v);
-                    points.prefetch(v);
+                    self.n_admit += 1;
+                    if ranking.admit(v) {
+                        self.fresh.push(v);
+                        points.prefetch(v);
+                        ranking.prepare(v);
+                    }
                 }
             }
             n_dist += self.fresh.len() as u64;
             for i in 0..self.fresh.len() {
                 let v = self.fresh[i];
-                self.insert(capacity, v, T::squared_l2(query, points.get(v)));
+                let d = T::squared_l2(query, points.get(v));
+                self.insert(capacity, v, ranking.key(v, d), d);
             }
         }
+        self.reset_visited();
+        n_dist
+    }
+
+    fn reset_visited(&mut self) {
         for &v in &self.touched {
             self.visited[v as usize / 64] = 0;
         }
-        n_dist
     }
 
     /// Marks `v` visited; whether it was not visited before.
@@ -106,18 +174,19 @@ impl Searcher {
     }
 
     #[inline]
-    fn insert(&mut self, capacity: usize, id: u32, dist: f32) {
+    fn insert(&mut self, capacity: usize, id: u32, key: f32, dist: f32) {
         let len = self.beam.len();
-        if len == capacity && self.beam[len - 1].dist < dist {
+        if len == capacity && self.beam[len - 1].key < key {
             return;
         }
-        let pos = self.beam.partition_point(|s| s.dist < dist);
+        let pos = self.beam.partition_point(|s| s.key < key);
         if len == capacity {
             self.beam.pop();
         }
         self.beam.insert(
             pos,
             Slot {
+                key,
                 dist,
                 id,
                 expanded: false,
