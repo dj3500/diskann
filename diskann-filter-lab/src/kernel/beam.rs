@@ -363,6 +363,8 @@ impl PostfilterBeam for Beam<u32> {
 
 /// Bits of a [`PackedBeam`] entry below the key: the node id, its state and the expanded flag.
 const PACKED_ID: u64 = (1 << 28) - 1;
+/// Graphs with at most this many nodes fit [`PackedBeam`]'s 28-bit ids.
+pub const PACKED_MAX_NODES: usize = 1 << 28;
 const PACKED_STATE_SHIFT: u32 = 28;
 const PACKED_EXPANDED: u64 = 1 << 31;
 

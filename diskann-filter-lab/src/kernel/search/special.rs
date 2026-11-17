@@ -14,7 +14,7 @@ use crate::kernel::planner::Fallback;
 use crate::{
     bitsets::LabelBitsets,
     kernel::{
-        beam::{Inserted, PostfilterBeam, State},
+        beam::{Inserted, PostfilterBeam, State, PACKED_MAX_NODES},
         collect::Collector,
         eval::{Eval, EvalCtx, RowScan},
         fkey, pack, profile, unpack,
@@ -256,7 +256,8 @@ impl Searcher {
         ids: &mut [u32],
         dists: &mut [f32],
     ) -> usize {
-        if self.packed_beam {
+        // The packed beam holds 28-bit ids; larger graphs keep the ordinary beam.
+        if self.packed_beam && ix.graph.n_nodes() <= PACKED_MAX_NODES {
             let mut beam = std::mem::take(&mut self.pbeam);
             let n = self
                 .postfilter_loop::<T, P, _>(&mut beam, ix, q, l, bits, deferred, ctr, ids, dists);

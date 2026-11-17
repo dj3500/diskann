@@ -165,7 +165,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`, C++ OR-filtered search), `exact` (capacity `L`, C++ multi-filter search) |
 | `aux_g` | penalty of auxiliary nodes in graded keys (0) |
 | `row_prefetch` | `off` (default), `on`: prefetch the adjacency row of the closest unexpanded node (the next expansion, unless a closer node arrives first) while the current node is expanded; changes no answer or counter |
-| `packed_beam` | `off` (default), `on`: the post-filter loop (preset and route) keeps its beam in one array of `u64` entries (key, expanded flag, state, 28-bit node id) instead of a key array and a slot array: the same beam semantics, one array to search and move per insertion; changes no answer or counter |
+| `packed_beam` | `off` (default), `on`: the post-filter loop (preset and route) keeps its beam in one array of `u64` entries (key, expanded flag, state, 28-bit node id) instead of a key array and a slot array: the same beam semantics, one array to search and move per insertion; changes no answer or counter; graphs with more than 2^28 nodes keep the ordinary beam |
 
 Illegal combinations are rejected when the configuration is validated (for example `deferred`
 needs `all` / `distance` / `final_beam`; `match_aware` needs `heap`; `bitmap` needs a
