@@ -994,6 +994,29 @@ fn auxiliary_nodes_navigate_but_are_never_answers() {
 }
 
 #[test]
+fn aux_only_expands_routers_only() {
+    // A router (id 5) over points 0, 2 and 4 is the only start; the matching point 3 is
+    // reachable only through data points, which `aux_only` never expands.
+    let rows: &[&[&str]] = &[&["x=1"], &["x=0"], &["x=1"], &["x=1"], &["x=1"]];
+    let (base, mut g, labels) = line(rows, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    g.set_starts(vec![5]).unwrap();
+    let pred = [vec!["x=1"]];
+    let edits = [
+        ("admission", "strict"),
+        ("laziness", "predicate_first"),
+        ("collector", "heap"),
+    ];
+    let k = kernel(&[&edits[..], &[("expander", "aux_only")]].concat());
+    let (ids, ctr) = run_line(&base, &g, &labels, &[5], &k, &pred, 3.2, 6, 6);
+    assert_eq!(ids, [4, 2, 0]);
+    assert_eq!((ctr.n_expand, ctr.n_aux_expand), (1, 1));
+    assert_eq!((ctr.n_dist, ctr.n_aux_dist), (4, 1));
+    let (ids, _) = run_line(&base, &g, &labels, &[5], &kernel(&edits), &pred, 3.2, 6, 6);
+    assert_eq!(ids, [3, 4, 2, 0]);
+}
+
+#[test]
 fn many_clauses_use_mode_2() {
     let mut b = LabelStoreBuilder::new();
     let names: Vec<String> = (0..70).map(|i| format!("c{i}=1")).collect();

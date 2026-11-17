@@ -1714,6 +1714,8 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     projected: bool,
     aux_g: f32,
     n_data: u32,
+    /// Expander `aux_only`: data points are never expanded.
+    aux_only: bool,
     lazy_ok: bool,
     /// Prefetch the next expansion's adjacency row (the kernel's `row_prefetch`).
     row_prefetch: bool,
@@ -2230,6 +2232,10 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                     None => break,
                 }
             }
+            if self.aux_only {
+                let n_data = self.n_data;
+                frontier.retain(|&n| n >= n_data);
+            }
             c.n_expand += frontier.len() as u64;
             if self.row_prefetch {
                 // The next step's first node (speculative) loads while this step expands.
@@ -2498,6 +2504,7 @@ fn run<T: Element, P: Eval, S: Score>(
         projected: compiled.is_projected(),
         aux_g: kernel.aux_g,
         n_data,
+        aux_only: kernel.expander == Expander::AuxOnly,
         lazy_ok: !adaptive.sampling(),
         row_prefetch: kernel.row_prefetch,
         beam,
