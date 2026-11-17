@@ -114,6 +114,13 @@ impl Searcher {
             if n >= n_data {
                 c.n_aux_expand += 1;
             }
+            if self.row_prefetch {
+                // The next expansion's row (speculative: a closer neighbour of `n` may come first)
+                // loads while the distances of `n`'s neighbours are computed.
+                if let Some(next) = beam.peek_id() {
+                    graph.prefetch_row(next);
+                }
+            }
             nbrs.clear();
             for &v in graph.neighbors(n) {
                 if !self.visited.test_and_set(v) {
@@ -249,6 +256,11 @@ impl Searcher {
             c.n_expand += 1;
             if n >= n_data {
                 c.n_aux_expand += 1;
+            }
+            if self.row_prefetch {
+                if let Some(next) = beam.peek_id() {
+                    graph.prefetch_row(next);
+                }
             }
             nbrs.clear();
             for &v in graph.neighbors(n) {

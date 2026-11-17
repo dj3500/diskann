@@ -486,11 +486,16 @@ impl Plan {
         } else {
             ExactEval::RowScan
         };
+        // The memory-timing option `row_prefetch` keeps a preset's fast path (it takes the flag).
+        let roles = Kernel {
+            row_prefetch: false,
+            ..kernel.clone()
+        };
         let fast = if eval != EvalMode::RowScan {
             FastPath::None
-        } else if *kernel == Preset::Postfilter.kernel() {
+        } else if roles == Preset::Postfilter.kernel() {
             FastPath::Postfilter
-        } else if *kernel == Preset::UpstreamInline.kernel() {
+        } else if roles == Preset::UpstreamInline.kernel() {
             FastPath::Inline
         } else {
             FastPath::None
@@ -656,6 +661,8 @@ pub struct Searcher {
     last_estimates: Estimates,
     /// Every node a post-filter route evaluated, as packed (distance, id).
     log: Vec<u64>,
+    /// The current plan's `row_prefetch` (set at the start of every search).
+    row_prefetch: bool,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
 }
@@ -690,6 +697,7 @@ impl Searcher {
             probe: Probe::new(),
             last_estimates: Estimates::default(),
             log: Vec::new(),
+            row_prefetch: false,
             trace: None,
         }
     }
@@ -736,6 +744,7 @@ impl Searcher {
         assert_eq!(ids.len(), dists.len());
         let k = ids.len();
         let kernel = &plan.kernel;
+        self.row_prefetch = kernel.row_prefetch;
         let mut ctr = Counters {
             timing: kernel.phase_times,
             ..Counters::default()
@@ -1532,6 +1541,8 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     aux_g: f32,
     n_data: u32,
     lazy_ok: bool,
+    /// Prefetch the next expansion's adjacency row (the kernel's `row_prefetch`).
+    row_prefetch: bool,
     // The beam, the visited set, the answers and the counters are held by value (moved out of
     // the `Searcher` for the query), so that the hot loop, which takes `&mut self`, knows that
     // nothing else aliases them and keeps their state in registers.
@@ -2046,6 +2057,12 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                 }
             }
             c.n_expand += frontier.len() as u64;
+            if self.row_prefetch {
+                // The next step's first node (speculative) loads while this step expands.
+                if let Some(next) = self.beam.peek_id() {
+                    self.graph.prefetch_row(next);
+                }
+            }
             if TWO_HOP {
                 rejected.clear();
             }
@@ -2303,6 +2320,7 @@ fn run<T: Element, P: Eval, S: Score>(
         aux_g: kernel.aux_g,
         n_data,
         lazy_ok: !adaptive.sampling(),
+        row_prefetch: kernel.row_prefetch,
         beam,
         visited: std::mem::take(visited),
         answers: std::mem::take(answers),

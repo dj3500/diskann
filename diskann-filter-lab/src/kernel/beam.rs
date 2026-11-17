@@ -225,6 +225,13 @@ impl<K: BeamKey> Beam<K> {
         self.has_unexpanded().then(|| self.keys[self.cursor])
     }
 
+    /// Id of the closest unexpanded entry (the node the next [`Beam::pop`] returns unless a
+    /// closer node is inserted first).
+    #[inline(always)]
+    pub fn peek_id(&self) -> Option<u32> {
+        self.has_unexpanded().then(|| self.slots[self.cursor].id)
+    }
+
     /// Marks the closest unexpanded entry as expanded and returns its id.
     #[inline]
     pub fn pop(&mut self) -> Option<u32> {

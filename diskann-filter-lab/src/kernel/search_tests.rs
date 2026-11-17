@@ -907,6 +907,75 @@ fn fast_paths_agree_with_the_configurable_loop() {
     }
 }
 
+#[test]
+fn row_prefetch_changes_no_answer_and_keeps_the_fast_paths() {
+    let f = fixture(300, 23, true);
+    let ix = f.index();
+    let presets = [
+        ("postfilter", super::search::FastPath::Postfilter),
+        ("upstream-inline", super::search::FastPath::Inline),
+    ];
+    for (preset, fast) in presets {
+        let off = Preset::parse(preset).unwrap().kernel();
+        let mut on = off.clone();
+        on.set("row_prefetch", "on").unwrap();
+        let (a, b) = (Plan::new(&off, &ix).unwrap(), Plan::new(&on, &ix).unwrap());
+        assert_eq!(
+            b.fast_path(),
+            fast,
+            "{preset}: row_prefetch keeps the fast path"
+        );
+        let mut st = Searcher::for_index(&ix, &[&a, &b]);
+        for q in 0..f.preds.len() {
+            let (x, cx) = search(&f, &mut st, &a, q, 40, 10, None);
+            let (y, cy) = search(&f, &mut st, &b, q, 40, 10, None);
+            assert_eq!(x, y, "{preset} q={q}");
+            assert_eq!(cx, cy, "{preset} counters q={q}");
+        }
+    }
+    // The configurable loop (k-hp-ad) and the hybrid's post-filter route (every graph-routed
+    // query takes it; an expensive exact path routes every query to the graph).
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let route = khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", "always"),
+    ]);
+    let mut routed = 0;
+    for kernel in [khpad(&[]), route] {
+        let mut on = kernel.clone();
+        on.set("row_prefetch", "on").unwrap();
+        let (a, b) = (
+            Plan::new(&kernel, &ix).unwrap(),
+            Plan::new(&on, &ix).unwrap(),
+        );
+        let mut st = Searcher::for_index(&ix, &[&a, &b]);
+        for q in 0..f.preds.len() {
+            let (x, cx) = search_ix(&f, &ix, &mut st, &a, q, 20, 10);
+            let (y, cy) = search_ix(&f, &ix, &mut st, &b, q, 20, 10);
+            assert_eq!(x, y, "q={q}");
+            assert_eq!(cx, cy, "counters q={q}");
+            routed += usize::from(cx.route == Route::Postfilter);
+        }
+    }
+    assert!(routed > 0, "the post-filter route was taken");
+}
+
 // ------------------------------------------------- exact path v2, laziness, crossovers (B6)
 
 fn search_ix(

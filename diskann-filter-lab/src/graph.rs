@@ -279,6 +279,14 @@ impl Graph {
         &self.adjacency.as_slice()[start..start + self.r_max]
     }
 
+    /// Prefetch hint for node `id`'s out-degree and the first cache lines of its adjacency row
+    /// (at most `r_max` slots), so that an expansion that comes soon finds them in cache.
+    #[inline(always)]
+    pub fn prefetch_row(&self, id: u32) {
+        diskann_vector::prefetch_hint_max::<1, _>(&self.degrees[id as usize..id as usize + 1]);
+        diskann_vector::prefetch_hint_max::<4, _>(self.row(id));
+    }
+
     /// Start (entry) nodes in priority order.
     pub fn starts(&self) -> &[u32] {
         &self.starts

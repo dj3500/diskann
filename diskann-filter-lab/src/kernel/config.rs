@@ -391,6 +391,10 @@ pub struct Kernel {
     pub hopeless_gate: bool,
     /// How the cost model counts the row reads of member checks.
     pub row_reads: RowReads,
+    /// Prefetch the adjacency row of the next node to expand while the current node's
+    /// neighbours are evaluated (A7; off reproduces the earlier loops exactly). Changes no
+    /// answer, only memory timing.
+    pub row_prefetch: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -454,6 +458,7 @@ impl Default for Kernel {
             postfilter_starts: PostfilterStarts::Global,
             hopeless_gate: true,
             row_reads: RowReads::Clause,
+            row_prefetch: false,
         }
     }
 }
@@ -948,6 +953,13 @@ impl Kernel {
                 }
             }
             "row_reads" => self.row_reads = RowReads::parse(value)?,
+            "row_prefetch" => {
+                self.row_prefetch = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown row_prefetch {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1135,6 +1147,9 @@ impl Kernel {
         }
         if !self.hopeless_gate {
             j["hopeless_gate"] = json!("off");
+        }
+        if self.row_prefetch {
+            j["row_prefetch"] = json!("on");
         }
         if self.row_reads != RowReads::Clause {
             j["row_reads"] = json!(self.row_reads.to_string());
