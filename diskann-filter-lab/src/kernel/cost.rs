@@ -38,7 +38,8 @@
 //! residual clauses (`hot_j` bitset words per word reached, priced like a member check's words
 //! with the shape-resolved curves; labels without a bitset by galloping cursors over their
 //! postings, moved only when a word reaches the clause's next entry: at most
-//! `min(W·reach_j, P_j)` times, priced as labels of the clause's mean posting length) and
+//! `min(W·reach_j, P_j)` times, priced as labels of the clause's mean posting length, plus
+//! each cursor's first seek over its list at the largest calibrated gap's step cost) and
 //! stops at the first clause that clears it (`reach_j`: the chance that a word of `A/W`
 //! members survives clauses `1..j`); it is a candidate only with the A6 enumeration costs.
 //! The candidates checked by `scan` and `distance_first` are members of `union(c*)`: `pred`
@@ -467,6 +468,30 @@ impl UnitCosts {
         } else {
             self.probe_ns
         }
+    }
+
+    /// Cost of one galloping step at the largest calibrated gap (miss-bound steps).
+    pub fn gallop_cold(&self) -> f64 {
+        self.gallop_gap_ns.last().copied().unwrap_or(self.gallop_ns)
+    }
+
+    /// [`Self::curve`] of two curves at the same density (one interpolation).
+    fn curve2(&self, a: &[f64], b: &[f64], rho: f64) -> (f64, f64) {
+        let d = &self.density;
+        if rho <= d[0] {
+            return (a[0], b[0]);
+        }
+        let last = d.len() - 1;
+        if rho >= d[last] {
+            return (a[last], b[last]);
+        }
+        let i = d.partition_point(|&x| x <= rho);
+        let (x0, x1) = (d[i - 1].ln(), d[i].ln());
+        let t = (rho.ln() - x0) / (x1 - x0);
+        (
+            a[i - 1] + t * (a[i] - a[i - 1]),
+            b[i - 1] + t * (b[i] - b[i - 1]),
+        )
     }
 
     /// Cost of one modelled galloping step at gap `gap` (posting entries per galloped
@@ -1168,10 +1193,7 @@ impl PlanInputs<'_> {
         let per_word = a / w;
         let rho = (a / n).clamp(0.0, 1.0);
         let (base, probe) = if c.has_shape() {
-            (
-                c.curve(&c.check_base_ns, rho),
-                c.curve(&c.check_word_ns, rho),
-            )
+            c.curve2(&c.check_base_ns, &c.check_word_ns, rho)
         } else {
             (c.pred_member(false, rho), 0.0)
         };
@@ -1188,7 +1210,11 @@ impl PlanInputs<'_> {
                     .copied()
                     .unwrap_or(1.0)
                     .clamp(0.0, 1.0);
-                1.0 - (1.0 - s).powf(per_word)
+                if per_word > 1.0 + 1e-9 {
+                    1.0 - (1.0 - s).powf(per_word)
+                } else {
+                    s
+                }
             };
             let p = if prev > 0.0 {
                 (cur / prev).min(1.0)
@@ -1205,12 +1231,16 @@ impl PlanInputs<'_> {
             cost += at * (base + reads * probe);
             // The cursors of the labels without a bitset move at most once per entry or word
             // reached; priced as `r` labels of the clause's mean length (an upper bound of the
-            // per-label sum: the steps are concave in the length; one evaluation per clause).
+            // per-label sum: the steps are concave in the length; one evaluation per clause),
+            // plus each cursor's first seek: a gallop over its list at the step cost of the
+            // largest calibrated gap (cold lists).
             let (r, pj) = (rare(j).len() as f64, posts(j));
             let events = at.min(pj);
             if r > 0.0 && events >= 1.0 {
                 let gap = pj / (r * events);
-                cost += r * c.gallop(gap) * events * (1.0 + (1.0 + gap).log2());
+                cost += r
+                    * (c.gallop(gap) * events * (1.0 + (1.0 + gap).log2())
+                        + c.gallop_cold() * (1.0 + pj / r).log2());
             }
             reach *= if upper { 1.0 } else { p };
             prev = cur;
