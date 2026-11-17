@@ -280,6 +280,8 @@ pub struct Decision {
     pub l: usize,
     /// The graph search is a post-filter search (list size `l`).
     pub postfilter: bool,
+    /// The post-filter search starts from the configured starts (else the global ones).
+    pub postfilter_configured: bool,
 }
 
 #[cfg(test)]

@@ -204,6 +204,12 @@ pub enum PostfilterStarts {
     Global,
     /// The configured `starts` of the kernel (e.g. per-label starts of `c*`).
     Configured,
+    /// The configured starts for a narrow predicate (estimated match rate below
+    /// [`BROAD_RATE`](super::cost::BROAD_RATE), where the planner also enlarges the list), the
+    /// global starts for a broad one: its matches are everywhere, so per-label starts carry no
+    /// information about where they are, and the route is an unfiltered search, from the entry
+    /// point the graph was built to be navigable from.
+    ByRate,
 }
 
 impl PostfilterStarts {
@@ -211,8 +217,18 @@ impl PostfilterStarts {
         Ok(match s.trim() {
             "global" => Self::Global,
             "configured" => Self::Configured,
-            _ => bail!("unknown postfilter_starts {s:?} (global, configured)"),
+            "by_rate" => Self::ByRate,
+            _ => bail!("unknown postfilter_starts {s:?} (global, configured, by_rate)"),
         })
+    }
+
+    /// Whether the route starts from the configured starts at estimated match rate `rate`.
+    pub fn configured_at(self, rate: f64) -> bool {
+        match self {
+            Self::Global => false,
+            Self::Configured => true,
+            Self::ByRate => rate < super::cost::BROAD_RATE,
+        }
     }
 }
 
@@ -221,6 +237,7 @@ impl fmt::Display for PostfilterStarts {
         f.write_str(match self {
             Self::Global => "global",
             Self::Configured => "configured",
+            Self::ByRate => "by_rate",
         })
     }
 }
@@ -391,6 +408,13 @@ pub struct Kernel {
     pub hopeless_gate: bool,
     /// How the cost model counts the row reads of member checks.
     pub row_reads: RowReads,
+    /// Prefetch the adjacency row of the next node to expand while the current node's
+    /// neighbours are evaluated (A7; off reproduces the earlier loops exactly). Changes no
+    /// answer, only memory timing.
+    pub row_prefetch: bool,
+    /// The post-filter loop's beam packs each entry into one `u64` (`PackedBeam`, A7): the same
+    /// beam semantics, one array to search and move per insertion. Changes no answer.
+    pub packed_beam: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -454,6 +478,8 @@ impl Default for Kernel {
             postfilter_starts: PostfilterStarts::Global,
             hopeless_gate: true,
             row_reads: RowReads::Clause,
+            row_prefetch: false,
+            packed_beam: false,
         }
     }
 }
@@ -948,6 +974,20 @@ impl Kernel {
                 }
             }
             "row_reads" => self.row_reads = RowReads::parse(value)?,
+            "row_prefetch" => {
+                self.row_prefetch = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown row_prefetch {v:?} (on, off)"),
+                }
+            }
+            "packed_beam" => {
+                self.packed_beam = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown packed_beam {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1135,6 +1175,12 @@ impl Kernel {
         }
         if !self.hopeless_gate {
             j["hopeless_gate"] = json!("off");
+        }
+        if self.row_prefetch {
+            j["row_prefetch"] = json!("on");
+        }
+        if self.packed_beam {
+            j["packed_beam"] = json!("on");
         }
         if self.row_reads != RowReads::Clause {
             j["row_reads"] = json!(self.row_reads.to_string());

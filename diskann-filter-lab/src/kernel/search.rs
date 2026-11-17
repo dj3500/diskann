@@ -10,14 +10,14 @@ use std::marker::PhantomData;
 use anyhow::{bail, ensure, Result};
 
 use super::{
-    beam::{Beam, BeamKey, Inserted, State},
+    beam::{Beam, BeamKey, Inserted, PackedBeam, State},
     collect::{Answers, Collector},
     config::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{
-        Crossover, EstimateSource, ExactChecks, PostfilterRoute, PostfilterStarts, RowReads,
-        StartAdmission, StartSource, Terminator,
+        Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
+        StartSource, Terminator,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -487,11 +487,18 @@ impl Plan {
         } else {
             ExactEval::RowScan
         };
+        // The timing-only options `row_prefetch` and `packed_beam` keep a preset's fast path (it
+        // takes the flags).
+        let roles = Kernel {
+            row_prefetch: false,
+            packed_beam: false,
+            ..kernel.clone()
+        };
         let fast = if eval != EvalMode::RowScan {
             FastPath::None
-        } else if *kernel == Preset::Postfilter.kernel() {
+        } else if roles == Preset::Postfilter.kernel() {
             FastPath::Postfilter
-        } else if *kernel == Preset::UpstreamInline.kernel() {
+        } else if roles == Preset::UpstreamInline.kernel() {
             FastPath::Inline
         } else {
             FastPath::None
@@ -660,6 +667,12 @@ pub struct Searcher {
     last_estimates: Estimates,
     /// Every node a post-filter route evaluated, as packed (distance, id).
     log: Vec<u64>,
+    /// The current plan's `row_prefetch` (set at the start of every search).
+    row_prefetch: bool,
+    /// The current plan's `packed_beam` (set at the start of every search).
+    packed_beam: bool,
+    /// The post-filter loop's beam with `packed_beam`.
+    pbeam: PackedBeam,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
 }
@@ -694,6 +707,9 @@ impl Searcher {
             probe: Probe::new(),
             last_estimates: Estimates::default(),
             log: Vec::new(),
+            row_prefetch: false,
+            packed_beam: false,
+            pbeam: PackedBeam::default(),
             trace: None,
         }
     }
@@ -740,6 +756,8 @@ impl Searcher {
         assert_eq!(ids.len(), dists.len());
         let k = ids.len();
         let kernel = &plan.kernel;
+        self.row_prefetch = kernel.row_prefetch;
+        self.packed_beam = kernel.packed_beam;
         let mut ctr = Counters {
             timing: kernel.phase_times,
             ..Counters::default()
@@ -836,7 +854,17 @@ impl Searcher {
                 self.answers.finish(ids, dists)
             } else if d.postfilter {
                 let t = tic(&ctr);
-                let n = self.postfilter(plan, ix, q, d.l, exact_stat, &mut ctr, ids, dists);
+                let n = self.postfilter(
+                    plan,
+                    ix,
+                    q,
+                    d.l,
+                    d.postfilter_configured,
+                    exact_stat,
+                    &mut ctr,
+                    ids,
+                    dists,
+                );
                 toc(t, &mut ctr.t_graph_ns);
                 n
             } else {
@@ -972,12 +1000,18 @@ impl Searcher {
             _ => l,
         };
         let mut g0 = costs.graph_cost(l0 as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
-        let pf_starts = match kernel.postfilter_starts {
-            PostfilterStarts::Global => ix.global.len(),
-            PostfilterStarts::Configured => start_count(kernel, ix, &self.compiled),
+        let (configured_starts, global_starts) =
+            (start_count(kernel, ix, &self.compiled), ix.global.len());
+        let pf_starts = |rate: f64| {
+            if kernel.postfilter_starts.configured_at(rate) {
+                configured_starts
+            } else {
+                global_starts
+            }
         };
         if kernel.postfilter != PostfilterRoute::Off {
-            g0 = g0.min(postfilter_option(costs, l0, k, bounds.m / bounds.n, n, pf_starts).1);
+            let rate = bounds.m / bounds.n;
+            g0 = g0.min(postfilter_option(costs, l0, k, rate, n, pf_starts(rate)).1);
         }
         let pi = PlanInputs {
             q: &self.compiled,
@@ -1022,6 +1056,7 @@ impl Searcher {
                 est_graph: g0,
                 l,
                 postfilter: false,
+                postfilter_configured: false,
             };
         }
         let est = self.estimates(plan, ix, exact_stat, ctr);
@@ -1059,7 +1094,7 @@ impl Searcher {
         // The post-filter alternative at a list size that holds the K nearest matches.
         let mut postfilter = false;
         if kernel.postfilter != PostfilterRoute::Off {
-            let (l_pf, g_pf) = postfilter_option(costs, l_run, k, rate, n, pf_starts);
+            let (l_pf, g_pf) = postfilter_option(costs, l_run, k, rate, n, pf_starts(rate));
             if g_pf.is_finite()
                 && (kernel.postfilter == PostfilterRoute::Always || hopeless || g_pf <= g)
             {
@@ -1074,11 +1109,12 @@ impl Searcher {
             est_graph: g,
             l: l_run,
             postfilter,
+            postfilter_configured: postfilter && kernel.postfilter_starts.configured_at(rate),
         }
     }
 
     /// The post-filter route: an unfiltered search with list size `l` from the graph's global
-    /// starts; the answers of a `heap(K)` collector over the evaluated nodes, found by
+    /// starts (the configured ones with `configured_starts`); the answers of a `heap(K)` collector over the evaluated nodes, found by
     /// checking them in distance order until `K` matches (with the static bitsets when the
     /// index has them).
     #[expect(
@@ -1091,6 +1127,7 @@ impl Searcher {
         ix: &Index<'_, T>,
         q: &Query<'_, T>,
         l: usize,
+        configured_starts: bool,
         exact_stat: Option<&LabelBitsets>,
         ctr: &mut Counters,
         ids: &mut [u32],
@@ -1098,25 +1135,22 @@ impl Searcher {
     ) -> usize {
         ctr.route = Route::Postfilter;
         self.visited.clear();
-        match plan.kernel.postfilter_starts {
-            PostfilterStarts::Global => {
-                self.starts.clear();
-                for &v in ix.global {
-                    if !self.visited.test_and_set(v) {
-                        self.starts.push(v);
-                    }
+        if configured_starts {
+            self.select_starts(plan, ix, q, ctr);
+        } else {
+            self.starts.clear();
+            for &v in ix.global {
+                if !self.visited.test_and_set(v) {
+                    self.starts.push(v);
                 }
-            }
-            PostfilterStarts::Configured => {
-                self.select_starts(plan, ix, q, ctr);
             }
         }
         ctr.n_start = self.starts.len() as u64;
         match exact_stat {
             Some(b) => {
-                self.postfilter_loop::<T, StaticBits>(ix, q, l, Some(b), true, ctr, ids, dists)
+                self.postfilter_beam::<T, StaticBits>(ix, q, l, Some(b), true, ctr, ids, dists)
             }
-            None => self.postfilter_loop::<T, RowScan>(ix, q, l, None, true, ctr, ids, dists),
+            None => self.postfilter_beam::<T, RowScan>(ix, q, l, None, true, ctr, ids, dists),
         }
     }
 
@@ -1536,6 +1570,8 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     aux_g: f32,
     n_data: u32,
     lazy_ok: bool,
+    /// Prefetch the next expansion's adjacency row (the kernel's `row_prefetch`).
+    row_prefetch: bool,
     // The beam, the visited set, the answers and the counters are held by value (moved out of
     // the `Searcher` for the query), so that the hot loop, which takes `&mut self`, knows that
     // nothing else aliases them and keeps their state in registers.
@@ -2050,6 +2086,12 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                 }
             }
             c.n_expand += frontier.len() as u64;
+            if self.row_prefetch {
+                // The next step's first node (speculative) loads while this step expands.
+                if let Some(next) = self.beam.peek_id() {
+                    self.graph.prefetch_row(next);
+                }
+            }
             if TWO_HOP {
                 rejected.clear();
             }
@@ -2307,6 +2349,7 @@ fn run<T: Element, P: Eval, S: Score>(
         aux_g: kernel.aux_g,
         n_data,
         lazy_ok: !adaptive.sampling(),
+        row_prefetch: kernel.row_prefetch,
         beam,
         visited: std::mem::take(visited),
         answers: std::mem::take(answers),

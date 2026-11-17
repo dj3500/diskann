@@ -21,7 +21,7 @@ use std::{
 use anyhow::{ensure, Context, Result};
 use hashbrown::HashMap;
 
-use crate::container;
+use crate::{container, permute::Permutation};
 
 /// File magic of `labels.flab`.
 pub const MAGIC: &[u8; 8] = b"FLABLBL\0";
@@ -213,6 +213,56 @@ impl LabelStore {
             .with_context(|| format!("writing {}", path.display()))
     }
 
+    /// The store under the new ids of `p`: rows in the new order, postings mapped and sorted
+    /// (in place, on up to `threads` threads). Consumes the store so that the old forward
+    /// store is freed before the postings are mapped.
+    pub fn permute(self, p: &Permutation, threads: usize) -> Result<Self> {
+        ensure!(
+            p.len() == self.n_points,
+            "the permutation covers {} points, the store has {}",
+            p.len(),
+            self.n_points
+        );
+        let mut row_offsets = Vec::with_capacity(self.n_points + 1);
+        row_offsets.push(0u64);
+        let mut row_labels = Vec::with_capacity(self.row_labels.len());
+        for &old in p.old_of_new() {
+            row_labels.extend_from_slice(self.row(old));
+            row_offsets.push(row_labels.len() as u64);
+        }
+        let Self {
+            n_points,
+            label_category,
+            label_names,
+            category_names,
+            category_start,
+            posting_offsets,
+            mut posting_points,
+            dict_hash,
+            ..
+        } = self;
+        map_runs(
+            &posting_offsets,
+            &mut posting_points,
+            p.new_of_old(),
+            threads,
+        );
+        let store = Self {
+            n_points,
+            label_category,
+            label_names,
+            category_names,
+            category_start,
+            row_offsets,
+            row_labels,
+            posting_offsets,
+            posting_points,
+            dict_hash,
+        };
+        store.validate()?;
+        Ok(store)
+    }
+
     /// Writes the `labels.flab` format to any writer.
     pub fn write_to<W: Write>(&self, w: W) -> Result<()> {
         let params = [
@@ -339,6 +389,42 @@ impl LabelStore {
         );
         Ok(())
     }
+}
+
+/// Maps every value of the CSR rows `values` (row `i` = `values[offsets[i]..offsets[i + 1]]`)
+/// through `map` and sorts each row, on up to `threads` threads (contiguous row ranges of
+/// about equal size).
+fn map_runs(offsets: &[u64], values: &mut [u32], map: &[u32], threads: usize) {
+    let n_rows = offsets.len() - 1;
+    let total = values.len();
+    let threads = threads.max(1);
+    let mut cuts = vec![0usize];
+    for t in 1..threads {
+        let target = (total as u128 * t as u128 / threads as u128) as u64;
+        cuts.push(offsets.partition_point(|&o| o < target).min(n_rows));
+    }
+    cuts.push(n_rows);
+    cuts.dedup();
+    std::thread::scope(|s| {
+        let mut rest = values;
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let len = (offsets[b] - offsets[a]) as usize;
+            let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(len);
+            rest = tail;
+            let base = offsets[a];
+            s.spawn(move || {
+                for i in a..b {
+                    let run =
+                        &mut chunk[(offsets[i] - base) as usize..(offsets[i + 1] - base) as usize];
+                    for v in run.iter_mut() {
+                        *v = map[*v as usize];
+                    }
+                    run.sort_unstable();
+                }
+            });
+        }
+    });
 }
 
 /// Checks a CSR: `n_rows + 1` monotone offsets covering `values`, every row strictly

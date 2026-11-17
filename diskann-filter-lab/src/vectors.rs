@@ -107,7 +107,7 @@ impl<T: Element> Matrix<T> {
     pub fn zeros(nrows: usize, ncols: usize) -> Self {
         let bytes = nrows * ncols * std::mem::size_of::<T>();
         Self {
-            lines: vec![CacheLine::zeroed(); bytes.div_ceil(64)],
+            lines: crate::hugepages::filled(bytes.div_ceil(64), CacheLine::zeroed()),
             nrows,
             ncols,
             _element: PhantomData,

@@ -14,10 +14,10 @@ use crate::kernel::planner::Fallback;
 use crate::{
     bitsets::LabelBitsets,
     kernel::{
-        beam::{Inserted, State},
+        beam::{Inserted, PostfilterBeam, State, PACKED_MAX_NODES},
         collect::Collector,
         eval::{Eval, EvalCtx, RowScan},
-        fkey, pack, unpack,
+        fkey, pack, profile, unpack,
     },
     vectors::Element,
 };
@@ -52,7 +52,7 @@ impl Searcher {
         ids: &mut [u32],
         dists: &mut [f32],
     ) -> usize {
-        self.postfilter_loop::<T, RowScan>(ix, q, l, None, false, ctr, ids, dists)
+        self.postfilter_beam::<T, RowScan>(ix, q, l, None, false, ctr, ids, dists)
     }
 
     /// Unfiltered search with list size `l` from the selected starts, then collection with the
@@ -69,8 +69,9 @@ impl Searcher {
         clippy::too_many_arguments,
         reason = "the per-query inputs and outputs"
     )]
-    pub(super) fn postfilter_loop<T: Element, P: Eval>(
+    pub(super) fn postfilter_loop<T: Element, P: Eval, B: PostfilterBeam>(
         &mut self,
+        beam: &mut B,
         ix: &Index<'_, T>,
         q: &Query<'_, T>,
         l: usize,
@@ -85,9 +86,8 @@ impl Searcher {
         log.clear();
         let n_data = ix.graph.n_data() as u32;
         let (graph, vectors, qv) = (ix.graph, ix.vectors, q.vector);
-        let beam = &mut self.beam32;
         let cap = l + self.starts.len();
-        beam.reset(cap, cap, false, false);
+        beam.start(cap);
         let mut c = Counters::default();
         for &s in &self.starts {
             let d = T::squared_l2(qv, vectors.get(s));
@@ -103,22 +103,38 @@ impl Searcher {
             };
             if let Inserted::At {
                 evicted: Some(_), ..
-            } = beam.insert(fkey(d), d, s, state)
+            } = beam.offer(fkey(d), s, state)
             {
                 c.n_evict += 1;
             }
         }
         let nbrs = &mut self.nbrs;
+        // Phase cycle counts of profiling builds (`profile::ENABLED`; constant-folded away
+        // otherwise).
+        let mut prof = [0u64; profile::SLOTS];
+        let mut t = profile::now();
         while let Some(n) = beam.pop() {
             c.n_expand += 1;
             if n >= n_data {
                 c.n_aux_expand += 1;
+            }
+            if self.row_prefetch {
+                // The next expansion's row (speculative: a closer neighbour of `n` may come first)
+                // loads while the distances of `n`'s neighbours are computed.
+                if let Some(next) = beam.peek_id() {
+                    graph.prefetch_row(next);
+                }
             }
             nbrs.clear();
             for &v in graph.neighbors(n) {
                 if !self.visited.test_and_set(v) {
                     nbrs.push(v);
                 }
+            }
+            if profile::ENABLED {
+                let t1 = profile::now();
+                prof[profile::EXPAND] += t1 - t;
+                t = t1;
             }
             let len = nbrs.len();
             c.n_dist += len as u64;
@@ -141,13 +157,32 @@ impl Searcher {
                     c.n_aux_dist += 1;
                     State::Aux
                 };
+                let timed = profile::ENABLED && prof[profile::INSERTS] % profile::SAMPLE_EVERY == 0;
+                let t2 = if timed { profile::now() } else { 0 };
                 if let Inserted::At {
                     evicted: Some(_), ..
-                } = beam.insert(fkey(d), d, v, state)
+                } = beam.offer(fkey(d), v, state)
                 {
                     c.n_evict += 1;
                 }
+                if profile::ENABLED {
+                    if timed {
+                        prof[profile::INSERT_SAMPLED] += profile::now() - t2;
+                        prof[profile::SAMPLED] += 1;
+                    }
+                    prof[profile::INSERTS] += 1;
+                }
             }
+            if profile::ENABLED {
+                let t1 = profile::now();
+                prof[profile::NEIGHBOURS] += t1 - t;
+                t = t1;
+            }
+        }
+        if profile::ENABLED {
+            let t1 = profile::now();
+            prof[profile::EXPAND] += t1 - t;
+            t = t1;
         }
         c.n_hops = c.n_expand;
         let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
@@ -196,7 +231,45 @@ impl Searcher {
         }
         ctr.add(&c);
         ctr.final_l = beam.search_l() as u64;
-        self.answers.finish(ids, dists)
+        let n = self.answers.finish(ids, dists);
+        if profile::ENABLED {
+            prof[profile::CHECK] += profile::now() - t;
+            profile::add(&prof);
+        }
+        n
+    }
+
+    /// [`Self::postfilter_loop`] with the plan's beam (`packed_beam`), taken out of the searcher
+    /// for the loop.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    pub(super) fn postfilter_beam<T: Element, P: Eval>(
+        &mut self,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        bits: Option<&LabelBitsets>,
+        deferred: bool,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
+        // The packed beam holds 28-bit ids; larger graphs keep the ordinary beam.
+        if self.packed_beam && ix.graph.n_nodes() <= PACKED_MAX_NODES {
+            let mut beam = std::mem::take(&mut self.pbeam);
+            let n = self
+                .postfilter_loop::<T, P, _>(&mut beam, ix, q, l, bits, deferred, ctr, ids, dists);
+            self.pbeam = beam;
+            n
+        } else {
+            let mut beam = std::mem::take(&mut self.beam32);
+            let n = self
+                .postfilter_loop::<T, P, _>(&mut beam, ix, q, l, bits, deferred, ctr, ids, dists);
+            self.beam32 = beam;
+            n
+        }
     }
 
     /// The `upstream-inline` preset after start selection: every evaluated node navigates,
@@ -249,6 +322,11 @@ impl Searcher {
             c.n_expand += 1;
             if n >= n_data {
                 c.n_aux_expand += 1;
+            }
+            if self.row_prefetch {
+                if let Some(next) = beam.peek_id() {
+                    graph.prefetch_row(next);
+                }
             }
             nbrs.clear();
             for &v in graph.neighbors(n) {

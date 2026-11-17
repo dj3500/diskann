@@ -173,7 +173,9 @@ impl<R: Read + Seek> Reader<R> {
     /// Reads section `i`, which must hold exactly `len` elements of `T`.
     pub fn section<T: Pod>(&mut self, i: usize, len: usize) -> Result<Vec<T>> {
         self.locate::<T>(i, len)?;
-        let mut out = vec![T::zeroed(); len];
+        // Large sections (label rows, postings, bitsets, sketches) are read into memory advised
+        // for transparent huge pages.
+        let mut out = crate::hugepages::filled(len, T::zeroed());
         self.section_into(i, &mut out)?;
         Ok(out)
     }

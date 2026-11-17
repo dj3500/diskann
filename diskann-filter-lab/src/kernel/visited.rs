@@ -26,8 +26,7 @@ impl Visited {
     )]
     pub fn new(n: usize) -> Self {
         let words = n.div_ceil(64);
-        let mut bits = Vec::with_capacity(words);
-        bits.resize(words, 0);
+        let bits = crate::hugepages::filled(words, 0);
         let mut touched = Vec::with_capacity(words);
         touched.resize(words, 0);
         touched.clear();

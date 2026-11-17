@@ -225,6 +225,13 @@ impl<K: BeamKey> Beam<K> {
         self.has_unexpanded().then(|| self.keys[self.cursor])
     }
 
+    /// Id of the closest unexpanded entry (the node the next [`Beam::pop`] returns unless a
+    /// closer node is inserted first).
+    #[inline(always)]
+    pub fn peek_id(&self) -> Option<u32> {
+        self.has_unexpanded().then(|| self.slots[self.cursor].id)
+    }
+
     /// Marks the closest unexpanded entry as expanded and returns its id.
     #[inline]
     pub fn pop(&mut self) -> Option<u32> {
@@ -301,6 +308,174 @@ impl<K: BeamKey> Beam<K> {
     }
 }
 
+/// The beam operations of the post-filter loop (distance keys, distances decoded from the
+/// keys), implemented by [`Beam<u32>`] and [`PackedBeam`].
+pub trait PostfilterBeam: Default {
+    /// [`Beam::reset`] with `search_l = capacity`, not resizable, distances from the keys.
+    fn start(&mut self, capacity: usize);
+    fn offer(&mut self, key: u32, id: u32, state: State) -> Inserted;
+    fn pop(&mut self) -> Option<u32>;
+    fn peek_id(&self) -> Option<u32>;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn entry(&self, i: usize) -> Entry;
+    fn search_l(&self) -> usize;
+}
+
+impl PostfilterBeam for Beam<u32> {
+    #[inline]
+    fn start(&mut self, capacity: usize) {
+        self.reset(capacity, capacity, false, false);
+    }
+
+    #[inline(always)]
+    fn offer(&mut self, key: u32, id: u32, state: State) -> Inserted {
+        self.insert(key, 0.0, id, state)
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<u32> {
+        Beam::pop(self)
+    }
+
+    #[inline(always)]
+    fn peek_id(&self) -> Option<u32> {
+        Beam::peek_id(self)
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        Beam::len(self)
+    }
+
+    #[inline(always)]
+    fn entry(&self, i: usize) -> Entry {
+        Beam::entry(self, i)
+    }
+
+    #[inline(always)]
+    fn search_l(&self) -> usize {
+        Beam::search_l(self)
+    }
+}
+
+/// Bits of a [`PackedBeam`] entry below the key: the node id, its state and the expanded flag.
+const PACKED_ID: u64 = (1 << 28) - 1;
+/// Graphs with at most this many nodes fit [`PackedBeam`]'s 28-bit ids.
+pub const PACKED_MAX_NODES: usize = 1 << 28;
+const PACKED_STATE_SHIFT: u32 = 28;
+const PACKED_EXPANDED: u64 = 1 << 31;
+
+/// A beam of distance keys whose entries are one `u64` each: the key in the high 32 bits, then
+/// the expanded flag, the state (3 bits) and the node id (28 bits, ids below 2^28). The same
+/// semantics as [`Beam<u32>`] without stored distances (ties go first, a full beam evicts its
+/// last entry, the cursor points at the first unexpanded entry), but an insertion searches and
+/// moves one array of 8-byte entries instead of a key array and a slot array (12 bytes per
+/// entry in two moves).
+#[derive(Debug, Clone, Default)]
+pub struct PackedBeam {
+    entries: Vec<u64>,
+    capacity: usize,
+    cursor: usize,
+}
+
+impl PackedBeam {
+    #[inline(always)]
+    fn state_of(e: u64) -> State {
+        match (e >> PACKED_STATE_SHIFT) & 7 {
+            0 => State::Unknown,
+            1 => State::NoMatch,
+            2 => State::Match,
+            3 => State::Partial,
+            _ => State::Aux,
+        }
+    }
+}
+
+impl PostfilterBeam for PackedBeam {
+    fn start(&mut self, capacity: usize) {
+        assert!(capacity > 0, "the beam capacity must be positive");
+        self.entries.clear();
+        self.capacity = capacity;
+        self.cursor = 0;
+        let reserve = capacity.min(1 << 20);
+        if self.entries.capacity() < reserve {
+            self.entries.reserve(reserve);
+        }
+    }
+
+    #[inline(always)]
+    fn offer(&mut self, key: u32, id: u32, state: State) -> Inserted {
+        debug_assert!(u64::from(id) <= PACKED_ID, "node id {id} exceeds 28 bits");
+        let size = self.entries.len();
+        let full = size == self.capacity;
+        if full && (self.entries[size - 1] >> 32) < u64::from(key) {
+            return Inserted::Dropped;
+        }
+        // The first entry whose key is not below `key` (entries with an equal key compare
+        // greater than the key with zero low bits): the new entry goes before them.
+        let probe = u64::from(key) << 32;
+        let rank = lower_bound(&self.entries, probe);
+        let evicted = if full {
+            self.entries.pop().map(|e| (e & PACKED_ID) as u32)
+        } else {
+            None
+        };
+        self.entries.insert(
+            rank,
+            probe | (u64::from(state as u8) << PACKED_STATE_SHIFT) | u64::from(id),
+        );
+        if rank < self.cursor {
+            self.cursor = rank;
+        }
+        Inserted::At { rank, evicted }
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<u32> {
+        if self.cursor >= self.entries.len() {
+            return None;
+        }
+        let at = self.cursor;
+        self.entries[at] |= PACKED_EXPANDED;
+        self.cursor += 1;
+        while self.cursor < self.entries.len() && self.entries[self.cursor] & PACKED_EXPANDED != 0 {
+            self.cursor += 1;
+        }
+        Some((self.entries[at] & PACKED_ID) as u32)
+    }
+
+    #[inline(always)]
+    fn peek_id(&self) -> Option<u32> {
+        self.entries
+            .get(self.cursor)
+            .map(|&e| (e & PACKED_ID) as u32)
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    fn entry(&self, i: usize) -> Entry {
+        let e = self.entries[i];
+        Entry {
+            id: (e & PACKED_ID) as u32,
+            d: funkey((e >> 32) as u32),
+            state: Self::state_of(e),
+            expanded: e & PACKED_EXPANDED != 0,
+        }
+    }
+
+    #[inline(always)]
+    fn search_l(&self) -> usize {
+        self.capacity
+    }
+}
+
 /// Index of the first key `>= key`.
 #[inline(always)]
 fn lower_bound<K: BeamKey>(keys: &[K], key: K) -> usize {
@@ -345,6 +520,55 @@ mod tests {
         assert_eq!(lower_bound::<u32>(&[], 5), 0);
         assert_eq!(lower_bound(&[5u32], 5), 0);
         assert_eq!(lower_bound(&[5u32], 6), 1);
+    }
+
+    /// The packed beam behaves exactly like `Beam<u32>` without stored distances: the same
+    /// insertion results, pops, peeks and entries on random sequences with many tied keys.
+    #[test]
+    fn the_packed_beam_matches_the_beam() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for cap in [1usize, 2, 5, 17, 64] {
+            let (mut a, mut b) = (Beam::<u32>::new(), PackedBeam::default());
+            PostfilterBeam::start(&mut a, cap);
+            b.start(cap);
+            for step in 0..2000 {
+                if next(4) == 0 {
+                    assert_eq!(
+                        PostfilterBeam::peek_id(&a),
+                        b.peek_id(),
+                        "cap {cap} step {step}"
+                    );
+                    assert_eq!(
+                        PostfilterBeam::pop(&mut a),
+                        b.pop(),
+                        "cap {cap} step {step}"
+                    );
+                } else {
+                    let key = fkey(next(40) as f32);
+                    let id = next(1 << 28) as u32;
+                    let state = [State::Unknown, State::Aux, State::Match][next(3) as usize];
+                    assert_eq!(
+                        a.offer(key, id, state),
+                        b.offer(key, id, state),
+                        "cap {cap} step {step}"
+                    );
+                }
+                assert_eq!(PostfilterBeam::len(&a), b.len());
+                for i in 0..b.len() {
+                    assert_eq!(
+                        PostfilterBeam::entry(&a, i),
+                        b.entry(i),
+                        "cap {cap} step {step} at {i}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

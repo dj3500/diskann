@@ -1507,13 +1507,18 @@ impl PlanInputs<'_> {
     }
 }
 
+/// Match rate from which a predicate is broad: upstream's list multiplier is 1 (at least every
+/// second point matches, so the unfiltered neighbourhood holds the matches) and the post-filter
+/// route's `by_rate` starts are the global ones.
+pub const BROAD_RATE: f64 = 0.5;
+
 /// Upstream DiskANN's adaptive-L multiplier at match rate `rate`: 1 (≥ 50 %), 2 (10–50 %),
 /// `2^{−log10 rate}` below 10 %, clamped to `[1, scale]` (`scale` at rate 0).
 pub fn l_multiplier(rate: f64, scale: f64) -> f64 {
     if rate.is_nan() || rate <= 0.0 {
         return scale.max(1.0);
     }
-    let m = if rate >= 0.5 {
+    let m = if rate >= BROAD_RATE {
         1.0
     } else if rate >= 0.1 {
         2.0

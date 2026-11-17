@@ -29,6 +29,7 @@ use crate::{
     container,
     labels::LabelStore,
     parallel::par_map,
+    permute::Permutation,
     predicate::{intersects, Cnf, PredicateSet},
     vectors::{Element, Matrix},
 };
@@ -382,6 +383,37 @@ impl GroundTruth {
         let kth = dists[k - 1];
         let end = dists.partition_point(|&d| d <= kth);
         (&ids[..end], &dists[..end])
+    }
+
+    /// The ground truth under the new point ids of `p` (each band re-sorted by (distance, id)).
+    pub fn permuted(&self, p: &Permutation) -> Result<Self> {
+        ensure!(
+            p.len() == self.n_points as usize,
+            "the permutation covers {} points, the ground truth {}",
+            p.len(),
+            self.n_points
+        );
+        let mut out = self.clone();
+        let mut band: Vec<(f32, u32)> = Vec::new();
+        for q in 0..self.n_queries() {
+            let (a, b) = (
+                self.band_offsets[q] as usize,
+                self.band_offsets[q + 1] as usize,
+            );
+            band.clear();
+            band.extend(
+                self.band_dists[a..b]
+                    .iter()
+                    .zip(&self.band_ids[a..b])
+                    .map(|(&d, &id)| (d, p.new_id(id))),
+            );
+            band.sort_by(by_distance_then_id);
+            for (i, &(d, id)) in band.iter().enumerate() {
+                out.band_dists[a + i] = d;
+                out.band_ids[a + i] = id;
+            }
+        }
+        Ok(out)
     }
 
     /// Writes the extended format.

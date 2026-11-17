@@ -372,6 +372,103 @@ fn configs() -> Vec<(String, Kernel)> {
     out
 }
 
+/// A relabeled index (an isomorphic id layout, `crate::permute`) answers with the same points:
+/// for every configuration the same answer distances and, below the K-th distance (where ties
+/// are broken by id), the same points; the configurations without id-dependent rules expand
+/// the same nodes.
+#[test]
+fn permuted_layouts_return_the_same_answers() {
+    use crate::permute::{permute_rows, Permutation};
+    for aux in [false, true] {
+        let f = fixture(300, 41 + u64::from(aux), aux);
+        let n = f.base.nrows();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let mut rng = Lcg(5);
+        for i in (1..n).rev() {
+            order.swap(i, rng.below(i as u32 + 1) as usize);
+        }
+        let p = Permutation::from_order(order).unwrap();
+        let labels = f.labels.clone().permute(&p, 3).unwrap();
+        let starts = f.starts.permuted(&p).unwrap();
+        let g = Fixture {
+            base: permute_rows(&f.base, &p),
+            queries: f.queries.clone(),
+            graph: f.graph.permuted(&p).unwrap(),
+            preds: f.preds.clone(),
+            sample: SampleIndex::build(&starts, &labels).unwrap(),
+            bitsets: LabelBitsets::build(&labels, 1),
+            starts,
+            labels,
+        };
+        for v in 0..n as u32 {
+            assert_eq!(g.labels.row(p.new_id(v)), f.labels.row(v));
+        }
+        let (ia, ib) = (f.index(), g.index());
+        for (name, kernel) in configs() {
+            let pa = Plan::new(&kernel, &ia).unwrap();
+            let pb = Plan::new(&kernel, &ib).unwrap();
+            let mut sa = Searcher::for_index(&ia, &[&pa]);
+            let mut sb = Searcher::for_index(&ib, &[&pb]);
+            let same_nodes = ["postfilter", "upstream-inline", "cp"].contains(&name.as_str());
+            for q in 0..f.preds.len() {
+                for l in [10, 40] {
+                    let (ra, ca) = search(&f, &mut sa, &pa, q, l, 10, None);
+                    let (rb, cb) = search(&g, &mut sb, &pb, q, l, 10, None);
+                    let what = format!("{name} aux={aux} q={q} L={l}");
+                    let (da, db): (Vec<f32>, Vec<f32>) = (
+                        ra.iter().map(|x| x.0).collect(),
+                        rb.iter().map(|x| x.0).collect(),
+                    );
+                    assert_eq!(da, db, "{what}: answer distances");
+                    if let Some(&kth) = da.last() {
+                        let below = |r: &[(f32, u32)], map: bool| {
+                            let mut ids: Vec<u32> = r
+                                .iter()
+                                .filter(|x| x.0 < kth)
+                                .map(|x| if map { p.new_id(x.1) } else { x.1 })
+                                .collect();
+                            ids.sort_unstable();
+                            ids
+                        };
+                        assert_eq!(below(&ra, true), below(&rb, false), "{what}: answers");
+                    }
+                    if same_nodes {
+                        assert_eq!(
+                            (ca.n_dist, ca.n_expand, ca.n_pred),
+                            (cb.n_dist, cb.n_expand, cb.n_pred),
+                            "{what}: counters"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Profiling builds count the post-filter loop's phases: every distance computation after the
+/// starts is one insertion attempt, and one in `SAMPLE_EVERY` of them is timed.
+#[cfg(feature = "phase-profile")]
+#[test]
+fn the_phase_profile_counts_the_post_filter_loop() {
+    use super::profile;
+    let f = fixture(300, 9, false);
+    let ix = f.index();
+    let plan = Plan::new(&Preset::parse("postfilter").unwrap().kernel(), &ix).unwrap();
+    let mut st = Searcher::for_index(&ix, &[&plan]);
+    profile::take();
+    let (mut dists, mut sampled) = (0, 0);
+    for q in 0..f.preds.len() {
+        let (_, ctr) = search(&f, &mut st, &plan, q, 40, 10, None);
+        let d = ctr.n_dist - ctr.n_start;
+        dists += d;
+        sampled += d.div_ceil(profile::SAMPLE_EVERY);
+    }
+    let p = profile::take();
+    assert_eq!((p[profile::INSERTS], p[profile::SAMPLED]), (dists, sampled));
+    assert!(p[profile::EXPAND] > 0 && p[profile::NEIGHBOURS] > p[profile::INSERT_SAMPLED]);
+    assert_eq!(profile::take(), [0; profile::SLOTS]);
+}
+
 #[test]
 fn every_configuration_returns_valid_answers() {
     for aux in [false, true] {
@@ -905,6 +1002,135 @@ fn fast_paths_agree_with_the_configurable_loop() {
             }
         }
     }
+}
+
+/// `packed_beam` changes no answer or counter of the post-filter preset (fast path kept) and
+/// of the hybrid's post-filter route.
+#[test]
+fn the_packed_beam_changes_no_answer() {
+    let f = fixture(300, 29, true);
+    let ix = f.index();
+    let off = Preset::parse("postfilter").unwrap().kernel();
+    let mut on = off.clone();
+    on.set("packed_beam", "on").unwrap();
+    let (a, b) = (Plan::new(&off, &ix).unwrap(), Plan::new(&on, &ix).unwrap());
+    assert_eq!(b.fast_path(), super::search::FastPath::Postfilter);
+    let mut st = Searcher::for_index(&ix, &[&a, &b]);
+    for q in 0..f.preds.len() {
+        for l in [5, 40] {
+            let (x, cx) = search(&f, &mut st, &a, q, l, 10, None);
+            let (y, cy) = search(&f, &mut st, &b, q, l, 10, None);
+            assert_eq!((x, cx), (y, cy), "postfilter q={q} L={l}");
+        }
+    }
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let route = khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", "always"),
+        ("postfilter_starts", "by_rate"),
+    ]);
+    let mut on = route.clone();
+    on.set("packed_beam", "on").unwrap();
+    let (a, b) = (
+        Plan::new(&route, &ix).unwrap(),
+        Plan::new(&on, &ix).unwrap(),
+    );
+    let mut st = Searcher::for_index(&ix, &[&a, &b]);
+    let mut routed = 0;
+    for q in 0..f.preds.len() {
+        for kk in [1, 10] {
+            let (x, cx) = search_ix(&f, &ix, &mut st, &a, q, 20, kk);
+            let (y, cy) = search_ix(&f, &ix, &mut st, &b, q, 20, kk);
+            assert_eq!((x, cx), (y, cy), "route q={q} K={kk}");
+            routed += usize::from(cx.route == Route::Postfilter);
+        }
+    }
+    assert!(routed > 0);
+}
+
+#[test]
+fn row_prefetch_changes_no_answer_and_keeps_the_fast_paths() {
+    let f = fixture(300, 23, true);
+    let ix = f.index();
+    let presets = [
+        ("postfilter", super::search::FastPath::Postfilter),
+        ("upstream-inline", super::search::FastPath::Inline),
+    ];
+    for (preset, fast) in presets {
+        let off = Preset::parse(preset).unwrap().kernel();
+        let mut on = off.clone();
+        on.set("row_prefetch", "on").unwrap();
+        let (a, b) = (Plan::new(&off, &ix).unwrap(), Plan::new(&on, &ix).unwrap());
+        assert_eq!(
+            b.fast_path(),
+            fast,
+            "{preset}: row_prefetch keeps the fast path"
+        );
+        let mut st = Searcher::for_index(&ix, &[&a, &b]);
+        for q in 0..f.preds.len() {
+            let (x, cx) = search(&f, &mut st, &a, q, 40, 10, None);
+            let (y, cy) = search(&f, &mut st, &b, q, 40, 10, None);
+            assert_eq!(x, y, "{preset} q={q}");
+            assert_eq!(cx, cy, "{preset} counters q={q}");
+        }
+    }
+    // The configurable loop (k-hp-ad) and the hybrid's post-filter route (every graph-routed
+    // query takes it; an expensive exact path routes every query to the graph).
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let route = khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", "always"),
+    ]);
+    let mut routed = 0;
+    for kernel in [khpad(&[]), route] {
+        let mut on = kernel.clone();
+        on.set("row_prefetch", "on").unwrap();
+        let (a, b) = (
+            Plan::new(&kernel, &ix).unwrap(),
+            Plan::new(&on, &ix).unwrap(),
+        );
+        let mut st = Searcher::for_index(&ix, &[&a, &b]);
+        for q in 0..f.preds.len() {
+            let (x, cx) = search_ix(&f, &ix, &mut st, &a, q, 20, 10);
+            let (y, cy) = search_ix(&f, &ix, &mut st, &b, q, 20, 10);
+            assert_eq!(x, y, "q={q}");
+            assert_eq!(cx, cy, "counters q={q}");
+            routed += usize::from(cx.route == Route::Postfilter);
+        }
+    }
+    assert!(routed > 0, "the post-filter route was taken");
 }
 
 // ------------------------------------------------- exact path v2, laziness, crossovers (B6)
@@ -1703,6 +1929,66 @@ fn the_postfilter_route_with_the_configured_starts_keeps_the_heap_answers() {
         routed > 0 && fewer > 0,
         "routed {routed}, fewer checks {fewer}"
     );
+}
+
+#[test]
+fn by_rate_starts_are_the_global_ones_for_broad_predicates() {
+    // `postfilter_starts = by_rate`: the route of a broad predicate (estimated match rate at
+    // least 1/2) is the `global` route, that of a narrow one the `configured` route.
+    let f = fixture(300, 47, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let route = |starts: &'static str| {
+        khpad(&[
+            ("exact", "planned"),
+            ("crossover", "cost"),
+            ("estimates", "sketch"),
+            ("terminator", "posting_l(4)"),
+            ("laziness", "heap_bound"),
+            ("postfilter", "always"),
+            ("postfilter_starts", starts),
+        ])
+    };
+    let plans: Vec<Plan> = ["by_rate", "global", "configured"]
+        .into_iter()
+        .map(|s| Plan::new(&route(s), &ix).unwrap())
+        .collect();
+    let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+    let (mut broad, mut narrow) = (0, 0);
+    for q in 0..f.preds.len() {
+        for kk in [1, 10] {
+            let (out, ctr) = search_ix(&f, &ix, &mut st, &plans[0], q, 20, kk);
+            if ctr.route != Route::Postfilter {
+                continue;
+            }
+            let is_broad = ctr.m_hat as f64 / 300.0 >= super::cost::BROAD_RATE;
+            let want = &plans[if is_broad { 1 } else { 2 }];
+            let (wout, wctr) = search_ix(&f, &ix, &mut st, want, q, 20, kk);
+            assert_eq!(out, wout, "q={q} K={kk} broad={is_broad}");
+            assert_eq!(
+                (ctr.n_dist, ctr.n_start, ctr.final_l),
+                (wctr.n_dist, wctr.n_start, wctr.final_l),
+                "q={q} K={kk} broad={is_broad}"
+            );
+            if is_broad {
+                broad += 1;
+            } else {
+                narrow += 1;
+            }
+        }
+    }
+    assert!(broad > 0 && narrow > 0, "broad {broad}, narrow {narrow}");
 }
 
 #[test]

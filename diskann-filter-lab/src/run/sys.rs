@@ -158,10 +158,20 @@ pub fn heap_mempolicy() -> Option<String> {
     line.split_whitespace().nth(1).map(str::to_owned)
 }
 
+/// Anonymous memory of the process backed by transparent huge pages, in kB (from
+/// `/proc/self/smaps_rollup`).
+pub fn anon_huge_kb() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    let line = text.lines().find(|l| l.starts_with("AnonHugePages:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
 /// Placement and host information recorded with every run.
 pub fn host_info() -> Value {
     let cpu = current_cpu();
     json!({
+        "hugepages_advised": crate::hugepages::enabled(),
+        "anon_huge_kb": anon_huge_kb(),
         "hostname": std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|s| s.trim().to_owned()),
         "pid": std::process::id(),
         "cpu": cpu,

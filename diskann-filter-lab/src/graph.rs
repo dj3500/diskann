@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use crate::{
     container,
     labels::LabelStore,
+    permute::Permutation,
     predicate::Cnf,
     vectors::{DType, Element, Matrix},
 };
@@ -110,7 +111,7 @@ struct Aligned {
 impl Aligned {
     fn filled(len: usize, value: u32) -> Self {
         Self {
-            lines: vec![Line([value; 16]); len.div_ceil(16)],
+            lines: crate::hugepages::filled(len.div_ceil(16), Line([value; 16])),
             len,
         }
     }
@@ -225,7 +226,7 @@ impl Graph {
         Ok(Self {
             n_data: n_data as u32,
             r_max,
-            degrees: vec![0; n_nodes],
+            degrees: crate::hugepages::filled(n_nodes, 0),
             adjacency: Aligned::filled(slots, NO_NEIGHBOR),
             starts: Vec::new(),
             aux,
@@ -277,6 +278,14 @@ impl Graph {
     pub fn row(&self, id: u32) -> &[u32] {
         let start = id as usize * self.r_max;
         &self.adjacency.as_slice()[start..start + self.r_max]
+    }
+
+    /// Prefetch hint for node `id`'s out-degree and the first cache lines of its adjacency row
+    /// (at most `r_max` slots), so that an expansion that comes soon finds them in cache.
+    #[inline(always)]
+    pub fn prefetch_row(&self, id: u32) {
+        diskann_vector::prefetch_hint_max::<1, _>(&self.degrees[id as usize..id as usize + 1]);
+        diskann_vector::prefetch_hint_max::<4, _>(self.row(id));
     }
 
     /// Start (entry) nodes in priority order.
@@ -363,6 +372,26 @@ impl Graph {
         }
         self.starts = starts;
         Ok(())
+    }
+
+    /// The graph under the new ids of `p` (rows keep their neighbor order; auxiliary nodes
+    /// keep their ids).
+    pub fn permuted(&self, p: &Permutation) -> Result<Self> {
+        ensure!(
+            p.len() == self.n_data(),
+            "the permutation covers {} points, the graph has {} data points",
+            p.len(),
+            self.n_data()
+        );
+        let mut g = Self::new(self.n_data(), self.r_max, self.aux.clone())?;
+        let mut row = Vec::with_capacity(self.r_max);
+        for new in 0..self.n_nodes() as u32 {
+            row.clear();
+            row.extend(self.neighbors(p.old_id(new)).iter().map(|&v| p.new_id(v)));
+            g.set_neighbors(new, &row)?;
+        }
+        g.set_starts(self.starts.iter().map(|&s| p.new_id(s)).collect())?;
+        Ok(g)
     }
 
     /// Degrees and adjacency rows for bulk filling. The caller must restore the invariants

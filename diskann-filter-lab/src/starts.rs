@@ -28,7 +28,10 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use hashbrown::HashMap;
 
-use crate::{container, diskann_io::read_bin_header, graph::Graph, labels::LabelStore, text};
+use crate::{
+    container, diskann_io::read_bin_header, graph::Graph, labels::LabelStore, permute::Permutation,
+    text,
+};
 
 /// File magic of `starts.flab`.
 pub const MAGIC: &[u8; 8] = b"FLABSTR\0";
@@ -201,6 +204,28 @@ impl Starts {
     /// Start node of each sample entry.
     pub fn sample_start(&self) -> &[u32] {
         &self.sample_start
+    }
+
+    /// The table under the new ids of `p` (every list keeps its order; auxiliary nodes keep
+    /// their ids).
+    pub fn permuted(&self, p: &Permutation) -> Result<Self> {
+        ensure!(
+            p.len() == self.n_data as usize,
+            "the permutation covers {} points, the table {} data points",
+            p.len(),
+            self.n_data
+        );
+        let map = |v: &Vec<u32>| v.iter().map(|&x| p.new_id(x)).collect::<Vec<u32>>();
+        Ok(Self {
+            n_nodes: self.n_nodes,
+            n_data: self.n_data,
+            dict_hash: self.dict_hash,
+            global: map(&self.global),
+            label_offsets: self.label_offsets.clone(),
+            label_starts: map(&self.label_starts),
+            sample: map(&self.sample),
+            sample_start: map(&self.sample_start),
+        })
     }
 
     /// Writes `starts.flab` (see the crate `README.md` for the layout).
