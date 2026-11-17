@@ -18,6 +18,11 @@ path = "src/main.rs"
 name = "flab-upstream"
 path = "src/bin/flab_upstream.rs"
 
+[features]
+# Profiling builds: cycle counts of the post-filter loop's phases (`kernel::profile`), reported
+# by `flab run` per configuration and effort.
+phase-profile = []
+
 [dependencies]
 anyhow.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }

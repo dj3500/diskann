@@ -17,7 +17,7 @@ use crate::{
         beam::{Inserted, State},
         collect::Collector,
         eval::{Eval, EvalCtx, RowScan},
-        fkey, pack, unpack,
+        fkey, pack, profile, unpack,
     },
     vectors::Element,
 };
@@ -109,6 +109,10 @@ impl Searcher {
             }
         }
         let nbrs = &mut self.nbrs;
+        // Phase cycle counts of profiling builds (`profile::ENABLED`; constant-folded away
+        // otherwise).
+        let mut prof = [0u64; profile::SLOTS];
+        let mut t = profile::now();
         while let Some(n) = beam.pop() {
             c.n_expand += 1;
             if n >= n_data {
@@ -126,6 +130,11 @@ impl Searcher {
                 if !self.visited.test_and_set(v) {
                     nbrs.push(v);
                 }
+            }
+            if profile::ENABLED {
+                let t1 = profile::now();
+                prof[profile::EXPAND] += t1 - t;
+                t = t1;
             }
             let len = nbrs.len();
             c.n_dist += len as u64;
@@ -148,13 +157,32 @@ impl Searcher {
                     c.n_aux_dist += 1;
                     State::Aux
                 };
+                let timed = profile::ENABLED && prof[profile::INSERTS] % profile::SAMPLE_EVERY == 0;
+                let t2 = if timed { profile::now() } else { 0 };
                 if let Inserted::At {
                     evicted: Some(_), ..
                 } = beam.insert(fkey(d), d, v, state)
                 {
                     c.n_evict += 1;
                 }
+                if profile::ENABLED {
+                    if timed {
+                        prof[profile::INSERT_SAMPLED] += profile::now() - t2;
+                        prof[profile::SAMPLED] += 1;
+                    }
+                    prof[profile::INSERTS] += 1;
+                }
             }
+            if profile::ENABLED {
+                let t1 = profile::now();
+                prof[profile::NEIGHBOURS] += t1 - t;
+                t = t1;
+            }
+        }
+        if profile::ENABLED {
+            let t1 = profile::now();
+            prof[profile::EXPAND] += t1 - t;
+            t = t1;
         }
         c.n_hops = c.n_expand;
         let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
@@ -203,7 +231,12 @@ impl Searcher {
         }
         ctr.add(&c);
         ctr.final_l = beam.search_l() as u64;
-        self.answers.finish(ids, dists)
+        let n = self.answers.finish(ids, dists);
+        if profile::ENABLED {
+            prof[profile::CHECK] += profile::now() - t;
+            profile::add(&prof);
+        }
+        n
     }
 
     /// The `upstream-inline` preset after start selection: every evaluated node navigates,

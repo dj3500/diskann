@@ -445,6 +445,30 @@ fn permuted_layouts_return_the_same_answers() {
     }
 }
 
+/// Profiling builds count the post-filter loop's phases: every distance computation after the
+/// starts is one insertion attempt, and one in `SAMPLE_EVERY` of them is timed.
+#[cfg(feature = "phase-profile")]
+#[test]
+fn the_phase_profile_counts_the_post_filter_loop() {
+    use super::profile;
+    let f = fixture(300, 9, false);
+    let ix = f.index();
+    let plan = Plan::new(&Preset::parse("postfilter").unwrap().kernel(), &ix).unwrap();
+    let mut st = Searcher::for_index(&ix, &[&plan]);
+    profile::take();
+    let (mut dists, mut sampled) = (0, 0);
+    for q in 0..f.preds.len() {
+        let (_, ctr) = search(&f, &mut st, &plan, q, 40, 10, None);
+        let d = ctr.n_dist - ctr.n_start;
+        dists += d;
+        sampled += d.div_ceil(profile::SAMPLE_EVERY);
+    }
+    let p = profile::take();
+    assert_eq!((p[profile::INSERTS], p[profile::SAMPLED]), (dists, sampled));
+    assert!(p[profile::EXPAND] > 0 && p[profile::NEIGHBOURS] > p[profile::INSERT_SAMPLED]);
+    assert_eq!(profile::take(), [0; profile::SLOTS]);
+}
+
 #[test]
 fn every_configuration_returns_valid_answers() {
     for aux in [false, true] {

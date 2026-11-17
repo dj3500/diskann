@@ -45,6 +45,7 @@ pub mod eval;
 pub mod exact;
 pub mod materialize;
 pub mod planner;
+pub mod profile;
 pub mod score;
 pub mod search;
 #[cfg(test)]

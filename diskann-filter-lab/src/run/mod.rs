@@ -55,6 +55,7 @@ use crate::{
         config::{Crossover, EstimateSource, Materializer, PredicateMode, StartSource},
         cost::UnitCosts,
         entry::SampleIndex,
+        profile,
         search::{Counters, FastPath, Index, Plan, Query, Searcher},
         trace::Trace,
     },
@@ -906,6 +907,9 @@ fn run_k<T: Element>(
                         let (plan, ix) = (&cx.plans[ci], &cx.indices[ci]);
                         let out = &mut outs[ci];
                         let mut nondet = 0;
+                        // Phase cycle counts of the timed searches (profiling builds only).
+                        let mut phases = [0u64; profile::SLOTS];
+                        profile::take();
                         for (row, q) in cx.queries[ci].iter().enumerate() {
                             let (ids, dists): (&mut [u32], &mut [f32]) = if rep == 0 {
                                 (
@@ -919,12 +923,18 @@ fn run_k<T: Element>(
                             };
                             if exp.hot {
                                 st.search(plan, ix, q, l, &mut hot_ids, &mut hot_d, None);
+                                profile::take();
                             }
                             let cpu0 = sys::thread_cpu_ns();
                             let wall0 = Instant::now();
                             let ctr = st.search(plan, ix, q, l, ids, dists, None);
                             let wall = wall0.elapsed().as_nanos() as u64;
                             let cpu = sys::thread_cpu_ns() - cpu0;
+                            if profile::ENABLED {
+                                for (a, x) in phases.iter_mut().zip(profile::take()) {
+                                    *a += x;
+                                }
+                            }
                             if rep > 0
                                 && (out.ids[&l][row * k..(row + 1) * k] != tmp_ids[..]
                                     || out.dists[&l][row * k..(row + 1) * k]
@@ -945,6 +955,19 @@ fn run_k<T: Element>(
                             });
                         }
                         *out.nondeterministic.entry(l).or_insert(0) += nondet;
+                        if profile::ENABLED {
+                            let fields: Vec<String> = profile::NAMES
+                                .iter()
+                                .zip(&phases)
+                                .map(|(n, v)| format!("{n}={v}"))
+                                .collect();
+                            println!(
+                                "phase-profile config={} K={k} L={l} rep={rep} rows={} {}",
+                                c.name,
+                                cx.queries[ci].len(),
+                                fields.join(" ")
+                            );
+                        }
                     }
                 }
             }
