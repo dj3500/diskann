@@ -337,6 +337,12 @@ fn configs() -> Vec<(String, Kernel)> {
             ("laziness", "predicate_first"),
         ],
         &[
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
+        ],
+        &[("admission", "projection(c*)"), ("terminator", "exhaust")],
+        &[
             ("predicate", "static_bits(60)"),
             ("scorer", "multiplicative(1)"),
             ("collector", "heap"),
@@ -359,6 +365,13 @@ fn configs() -> Vec<(String, Kernel)> {
             ("predicate", "bitmap"),
             ("materializer", "dense_static"),
             ("collector", "heap"),
+        ],
+        &[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
         ],
     ];
     for (i, edits) in overrides.iter().enumerate() {
@@ -465,6 +478,7 @@ fn static_bits_do_not_change_answers_or_counters() {
         &[("admission", "cutoff(1)"), ("scorer", "additive(5)")],
         &[("scorer", "shifted(1)"), ("weights", "surprisal")],
         &[("admission", "projection(a)"), ("collector", "heap")],
+        &[("admission", "projection(c*)"), ("collector", "heap")],
         &[("admission", "strict"), ("expander", "two_hop")],
         &[("starts", "sample(3)+global"), ("collector", "all")],
         &[("exact", "scan_smallest_clause(70)")],
@@ -520,6 +534,70 @@ fn static_bits_do_not_change_answers_or_counters() {
     .is_err());
     k.set("predicate", "static_bits(100)").unwrap();
     assert!(Plan::new(&k, &ix_high).is_ok());
+}
+
+#[test]
+fn nav_bitmaps_do_not_change_answers_or_counters() {
+    // `bitmap` + `dense_nav` (the navigation clauses materialized, the others on the row) gives
+    // the default evaluator's answers and counters, with or without static bitsets, also
+    // under clause projections (where `dense` / `dense_static` are not allowed).
+    let f = fixture(300, 17, true);
+    let ix_bits = f.index();
+    let ix_none = Index {
+        bitsets: None,
+        costs: None,
+        sketches: None,
+        ..f.index()
+    };
+    let edits: &[&[(&str, &str)]] = &[
+        &[],
+        &[("admission", "strict"), ("collector", "final_beam")],
+        &[
+            ("admission", "strict"),
+            ("expander", "two_hop(3)"),
+            ("start_admission", "force"),
+        ],
+        &[("admission", "projection(c*)"), ("collector", "heap")],
+        &[
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
+            ("terminator", "exhaust"),
+        ],
+        &[("admission", "projection(a)"), ("collector", "heap")],
+        &[
+            ("admission", "projection(a, c)"),
+            ("collector", "final_beam"),
+        ],
+        &[("collector", "heap"), ("laziness", "distance_first")],
+    ];
+    let mut checked = 0;
+    for e in edits {
+        let mut base = Kernel::default();
+        for (key, value) in e.iter() {
+            base.set(key, value).unwrap();
+        }
+        let mut k = base.clone();
+        k.set("predicate", "bitmap").unwrap();
+        k.set("materializer", "dense_nav").unwrap();
+        for ix in [&ix_bits, &ix_none] {
+            let pa = Plan::new(&base, ix).unwrap();
+            let pb = Plan::new(&k, ix).unwrap_or_else(|err| panic!("{e:?}: {err}"));
+            let mut st = Searcher::for_index(ix, &[&pa, &pb]);
+            for q in 0..f.preds.len() {
+                for l in [10, 30] {
+                    let (oa, mut ca) = search_ix(&f, ix, &mut st, &pa, q, l, 10);
+                    let (ob, mut cb) = search_ix(&f, ix, &mut st, &pb, q, l, 10);
+                    for c in [&mut ca, &mut cb] {
+                        [c.res_words, c.res_rows, c.c1_words, c.c1_rows] = [0; 4];
+                    }
+                    assert_eq!((oa, ca), (ob, cb), "{e:?} q={q} L={l}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "{checked}");
 }
 
 #[test]
@@ -1756,4 +1834,76 @@ fn the_graph_crossover_never_takes_the_exact_path() {
             assert!(exact > 0, "the cost crossover never took the exact path");
         }
     }
+}
+
+#[test]
+fn projection_smallest_navigates_on_the_binding_clause() {
+    // `projection(c*)` equals `projection(<category>)` of the clause with the smallest U_c when
+    // that clause is the only one of its category (every non-empty query of the fixture).
+    let f = fixture(300, 21, false);
+    let ix = f.index();
+    let plan = |admission: &str| {
+        let mut k = Kernel::default();
+        for (key, value) in [
+            ("admission", admission),
+            ("collector", "heap"),
+            ("starts", "label(c*)+global"),
+            ("expander", "two_hop(3)"),
+        ] {
+            k.set(key, value).unwrap();
+        }
+        Plan::new(&k, &ix).unwrap()
+    };
+    let star = plan("projection(c*)");
+    let by_category: Vec<(String, Plan)> = ["a", "b", "c"]
+        .iter()
+        .map(|c| ((*c).to_owned(), plan(&format!("projection({c})"))))
+        .collect();
+    let mut plans = vec![&star];
+    plans.extend(by_category.iter().map(|(_, p)| p));
+    let mut st = Searcher::for_index(&ix, &plans);
+    let (mut checked, mut multi) = (0, 0);
+    for q in 0..f.preds.len() {
+        let cnf = f.preds.get(q);
+        if cnf.n_clauses() == 0 || cnf.clauses().any(|c| c.is_empty()) {
+            continue;
+        }
+        let mut best = (u64::MAX, 0);
+        for (i, clause) in cnf.clauses().enumerate() {
+            let u: u64 = clause.iter().map(|&l| f.labels.posting_len(l) as u64).sum();
+            if u < best.0 {
+                best = (u, i);
+            }
+        }
+        let cat = f
+            .labels
+            .category_name(f.labels.category(cnf.clause(best.1)[0]));
+        let same_category = cnf
+            .clauses()
+            .filter(|c| f.labels.category_name(f.labels.category(c[0])) == cat)
+            .count();
+        assert_eq!(same_category, 1);
+        let pk = &by_category.iter().find(|(c, _)| c == cat).unwrap().1;
+        multi += usize::from(cnf.n_clauses() > 1);
+        for l in [10, 30] {
+            let (oa, ca) = search(&f, &mut st, &star, q, l, 10, None);
+            let (ob, mut cb) = search(&f, &mut st, pk, q, l, 10, None);
+            if cnf.n_clauses() == 1 {
+                // A single clause is the whole predicate: no projection, so no re-check of the
+                // navigation matches (the category projection re-checks them).
+                assert!(ca.n_pred <= cb.n_pred);
+                cb.n_pred = ca.n_pred;
+            }
+            assert_eq!((&oa, &ca), (&ob, &cb), "q={q} L={l} c*={cat}");
+            for &(_, v) in &oa {
+                let row = f.labels.row(v);
+                assert!(
+                    cnf.clauses().all(|c| c.iter().any(|l| row.contains(l))),
+                    "q={q}: {v} is no match"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 40 && multi > 10, "{checked} {multi}");
 }

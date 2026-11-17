@@ -69,6 +69,10 @@ pub enum Admission {
     /// Nodes satisfying the clauses whose labels all lie in the named categories (only these
     /// clauses are evaluated during the search).
     Projection(Vec<String>),
+    /// Nodes satisfying the query's clause with the smallest `U_c` (`projection(c*)`, the
+    /// binding clause, chosen per query from the posting sizes; only that clause is evaluated
+    /// during the search).
+    ProjectionSmallest,
     /// Nodes failing at most `τ` clauses (unit count).
     Cutoff(u32),
 }
@@ -570,6 +574,7 @@ impl Admission {
                 arity(&name, &args, 0)?;
                 Self::Strict
             }
+            "projection" if args.len() == 1 && args[0] == "c*" => Self::ProjectionSmallest,
             "projection" => {
                 ensure!(
                     !args.is_empty(),
@@ -592,6 +597,7 @@ impl fmt::Display for Admission {
             Self::All => write!(f, "all"),
             Self::Strict => write!(f, "strict"),
             Self::Projection(c) => write!(f, "projection({})", c.join(", ")),
+            Self::ProjectionSmallest => write!(f, "projection(c*)"),
             Self::Cutoff(t) => write!(f, "cutoff({t})"),
         }
     }
@@ -810,7 +816,8 @@ fn parse_materializer(s: &str) -> Result<Materializer> {
         "dense" => Materializer::Dense,
         "sparse" => Materializer::Sparse,
         "dense_static" => Materializer::DenseStatic,
-        _ => bail!("unknown materializer {s:?} (none, dense, sparse, dense_static)"),
+        "dense_nav" => Materializer::DenseNav,
+        _ => bail!("unknown materializer {s:?} (none, dense, sparse, dense_static, dense_nav)"),
     })
 }
 
@@ -820,6 +827,7 @@ fn materializer_name(m: Materializer) -> &'static str {
         Materializer::Dense => "dense",
         Materializer::Sparse => "sparse",
         Materializer::DenseStatic => "dense_static",
+        Materializer::DenseNav => "dense_nav",
     }
 }
 
@@ -1083,8 +1091,13 @@ impl Kernel {
                 self.admission
             );
             ensure!(
-                !matches!(self.admission, Admission::Projection(_)),
-                "a clause projection cannot be evaluated on a materialized match set"
+                self.materializer == Materializer::DenseNav
+                    || !matches!(
+                        self.admission,
+                        Admission::Projection(_) | Admission::ProjectionSmallest
+                    ),
+                "a clause projection cannot be evaluated on a materialized match set (dense_nav \
+                 materializes the projected clauses)"
             );
         }
         if let Admission::Projection(c) = &self.admission {
@@ -1335,7 +1348,13 @@ mod tests {
             StartSource::parse_list("sample(10)+global").unwrap(),
             [StartSource::Sample(10), StartSource::Global]
         );
-        for s in ["all", "strict", "projection(C3, C4)", "cutoff(1)"] {
+        for s in [
+            "all",
+            "strict",
+            "projection(C3, C4)",
+            "projection(c*)",
+            "cutoff(1)",
+        ] {
             assert_eq!(Admission::parse(s).unwrap().to_string(), s);
         }
         for s in [
@@ -1465,6 +1484,17 @@ mod tests {
             ("predicate", "bitmap"),
             ("materializer", "dense"),
             ("admission", "projection(C3)")
+        ]));
+        assert!(!bad(&[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "projection(c*)"),
+            ("collector", "heap")
+        ]));
+        assert!(bad(&[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "cutoff(1)")
         ]));
         assert!(bad(&[("terminator", "adaptive_l(5, 2)")]));
         assert!(bad(&[("beam_width", "0")]));

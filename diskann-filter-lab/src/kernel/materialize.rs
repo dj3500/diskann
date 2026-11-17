@@ -15,6 +15,10 @@
 //! - **sparse**: the sorted list of matches, by merging the postings of the clause with the
 //!   smallest upper bound and filtering it against the other clauses with galloping searches
 //!   in their postings;
+//! - **dense_nav**: the bitmap of the *navigation* clauses only (all clauses, or the projected
+//!   ones, e.g. the binding clause under `projection(c*)`), with the static bitsets when the
+//!   index has them; the evaluator [`super::eval::NavBitmap`] completes the full predicate on
+//!   the row for the bitmap's members;
 //! - **row AND** (the exact plan `rowand`): the words of the data-point bitmap that hold
 //!   members of the first clause (`c*`), each ANDed with the other clauses word by word (the
 //!   static bitset words of their frequent labels; the postings of their other labels through
@@ -39,6 +43,8 @@ pub enum Materializer {
     Sparse,
     /// Dense, built with the index's static bitsets.
     DenseStatic,
+    /// Dense bitmap of the navigation clauses (static bitsets when the index has them).
+    DenseNav,
 }
 
 /// Merges `n` sorted lists (`list(i)`) and calls `f` on every distinct value in increasing
@@ -595,6 +601,65 @@ impl Materialized {
         read
     }
 
+    /// The dense bitmap of the navigation clauses of `q` ([`Compiled::nav`]: all clauses, or
+    /// the projected ones): the union of each clause's labels, ANDed across the clauses; labels
+    /// with a bitset in `sb` are ORed in word by word, the others scattered from their postings.
+    /// Without a projection it is the match bitmap of [`Self::build_dense`]; with no navigation
+    /// clause every point is set. Returns the posting entries plus the bitset words read.
+    pub fn build_dense_nav(
+        &mut self,
+        labels: &LabelStore,
+        q: &Compiled,
+        n_data: usize,
+        sb: Option<&LabelBitsets>,
+    ) -> u64 {
+        let words = n_data.div_ceil(64);
+        assert!(
+            self.dense.len() >= words,
+            "dense buffers were not allocated"
+        );
+        let sb = sb.filter(|b| b.n_points() == n_data);
+        if q.n_clauses() == 0 || q.nav().is_empty() {
+            let dense = &mut self.dense[..words];
+            dense.fill(u64::MAX);
+            if !n_data.is_multiple_of(64) {
+                dense[words - 1] = (1u64 << (n_data % 64)) - 1;
+            }
+            return 0;
+        }
+        let mut read = 0u64;
+        for (i, &j) in q.nav().iter().enumerate() {
+            let target = if i == 0 {
+                &mut self.dense[..words]
+            } else {
+                &mut self.tmp[..words]
+            };
+            target.fill(0);
+            for &l in q.clause(j as usize) {
+                match sb.and_then(|b| b.slot(l).map(|s| b.bitset(s))) {
+                    Some(bits) => {
+                        for (t, &b) in target.iter_mut().zip(bits) {
+                            *t |= b;
+                        }
+                        read += words as u64;
+                    }
+                    None => {
+                        for &p in labels.postings(l) {
+                            target[(p >> 6) as usize] |= 1u64 << (p & 63);
+                        }
+                        read += labels.posting_len(l) as u64;
+                    }
+                }
+            }
+            if i > 0 {
+                for (a, b) in self.dense[..words].iter_mut().zip(&self.tmp[..words]) {
+                    *a &= *b;
+                }
+            }
+        }
+        read
+    }
+
     /// Builds the sorted match list of `q` (galloping intersection); returns the number of
     /// candidates examined.
     pub fn build_sparse(&mut self, labels: &LabelStore, q: &Compiled, n_data: usize) -> u64 {
@@ -736,6 +801,21 @@ mod tests {
                 .filter(|&p| m.dense[(p >> 6) as usize] >> (p & 63) & 1 == 1)
                 .collect();
             assert_eq!(from_dense, expect, "query {i}");
+            // Without a projection the navigation bitmap is the match bitmap (with or without
+            // the bitsets); under projection(c*) it is the union of the binding clause.
+            for b in [Some(&sb), None] {
+                m.build_dense_nav(&s, &q, 200, b);
+                assert_eq!(m.dense, with_bitsets, "query {i} (dense_nav)");
+            }
+            q.project_smallest();
+            m.build_dense_nav(&s, &q, 200, Some(&sb));
+            let c0: Vec<u32> = (0..200u32)
+                .filter(|&p| q.n_clauses() == 0 || q.clause(0).iter().any(|l| s.row(p).contains(l)))
+                .collect();
+            let from_nav: Vec<u32> = (0..200u32)
+                .filter(|&p| m.dense[(p >> 6) as usize] >> (p & 63) & 1 == 1)
+                .collect();
+            assert_eq!(from_nav, c0, "query {i} (dense_nav, projection(c*))");
             q.clear_bits(&mut bits);
         }
     }

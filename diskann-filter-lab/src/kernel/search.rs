@@ -24,8 +24,8 @@ use super::{
     },
     entry::{self, SampleIndex, StartPredicate},
     eval::{
-        ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
-        StaticBits,
+        ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, NavBitmap, PredOut, RowScan,
+        SparseList, StaticBits,
     },
     exact::{self, ExactEval},
     materialize::{Materialized, Materializer},
@@ -321,6 +321,8 @@ pub enum EvalMode {
     Dense,
     Sparse,
     StaticBits,
+    /// Bitmap of the navigation clauses (`dense_nav`), the row for the other clauses.
+    NavBitmap,
 }
 
 /// A kernel configuration resolved against an index (validated once per run).
@@ -328,6 +330,8 @@ pub enum EvalMode {
 pub struct Plan {
     pub kernel: Kernel,
     projection: Option<Vec<u32>>,
+    /// Admission `projection(c*)`: navigation evaluates only the query's binding clause.
+    project_smallest: bool,
     two_hop_cap: usize,
     eval: EvalMode,
     /// `θ` of the `static_bits(θ)` mode.
@@ -375,6 +379,7 @@ impl Plan {
             (PredicateMode::Bitmap, Materializer::Dense | Materializer::DenseStatic) => {
                 EvalMode::Dense
             }
+            (PredicateMode::Bitmap, Materializer::DenseNav) => EvalMode::NavBitmap,
             (PredicateMode::Bitmap, _) => EvalMode::Sparse,
             (PredicateMode::StaticBits(_), _) => EvalMode::StaticBits,
         };
@@ -404,6 +409,12 @@ impl Plan {
             let b = ix.bitsets.ok_or_else(|| {
                 anyhow::anyhow!("the dense_static materializer needs static per-label bitsets")
             })?;
+            ensure!(
+                b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
+                "the static bitsets refer to another label store"
+            );
+        }
+        if let (Materializer::DenseNav, Some(b)) = (kernel.materializer, ix.bitsets) {
             ensure!(
                 b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
                 "the static bitsets refer to another label store"
@@ -499,6 +510,7 @@ impl Plan {
         Ok(Self {
             kernel: kernel.clone(),
             projection,
+            project_smallest: kernel.admission == Admission::ProjectionSmallest,
             two_hop_cap,
             eval,
             static_theta,
@@ -517,7 +529,7 @@ impl Plan {
     pub fn needs_dense(&self) -> bool {
         matches!(
             self.kernel.materializer,
-            Materializer::Dense | Materializer::DenseStatic
+            Materializer::Dense | Materializer::DenseStatic | Materializer::DenseNav
         ) || (self.kernel.exact.is_planned()
             && (self.kernel.exact_plans.contains(ExactPlan::Bitmap)
                 || self.kernel.exact_plans.contains(ExactPlan::RowAnd)))
@@ -547,15 +559,17 @@ impl Plan {
         let force = k.start_admission == StartAdmission::Force;
         let g_adm = match &k.admission {
             Admission::All => nav_w,
-            Admission::Strict | Admission::Projection(_) => 0.0,
+            Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest => 0.0,
             Admission::Cutoff(t) => (*t as f32 * q.max_nav_weight()).min(nav_w),
         };
         let g_aux = if self.n_aux > 0 { k.aux_g } else { 0.0 };
         let g_max = g_adm.max(if force { nav_w } else { 0.0 }).max(g_aux);
         let mut p = score::Params {
             g_max,
-            nonmatch_in_beam: !matches!(k.admission, Admission::Strict | Admission::Projection(_))
-                || force
+            nonmatch_in_beam: !matches!(
+                k.admission,
+                Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest
+            ) || force
                 || self.n_aux > 0,
             ..score::Params::default()
         };
@@ -751,6 +765,9 @@ impl Searcher {
             plan.projection.as_deref(),
             &mut self.bits,
         );
+        if plan.project_smallest {
+            self.compiled.project_smallest();
+        }
         let stat = (plan.eval == EvalMode::StaticBits).then(|| {
             let b = ix
                 .bitsets
@@ -1428,6 +1445,7 @@ fn dispatch<T: Element>(
         EvalMode::Dense => by_family!(DenseBitmap),
         EvalMode::Sparse => by_family!(SparseList),
         EvalMode::StaticBits => by_family!(StaticBits),
+        EvalMode::NavBitmap => by_family!(NavBitmap),
     }
 }
 
@@ -2262,6 +2280,9 @@ fn run<T: Element, P: Eval, S: Score>(
         Materializer::Sparse => {
             mat.build_sparse(ix.labels, compiled, n_data as usize);
         }
+        Materializer::DenseNav => {
+            mat.build_dense_nav(ix.labels, compiled, n_data as usize, ix.bitsets);
+        }
         Materializer::None => {}
     }
     let mut cx = EvalCtx::new(ix.labels, compiled, bits, &mat.dense, &mat.sparse);
@@ -2288,7 +2309,9 @@ fn run<T: Element, P: Eval, S: Score>(
     let two_hop = matches!(kernel.expander, Expander::TwoHop(_));
     let admission = match kernel.admission {
         Admission::All => AdmissionRule::All,
-        Admission::Strict | Admission::Projection(_) => AdmissionRule::Match,
+        Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest => {
+            AdmissionRule::Match
+        }
         Admission::Cutoff(t) => AdmissionRule::Cutoff(t),
     };
 
