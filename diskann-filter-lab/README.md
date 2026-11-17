@@ -151,7 +151,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
 | `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve; `effort_curve(cap)`: at most `cap` × the list size of an unselective query) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
-| `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
+| `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets), `dense_nav` (bitmap of the navigation clauses only — all clauses, or the projected ones such as `c*` — built with the static bitsets when the index has them; the other clauses of a projected query are checked on the row of the bitmap's members) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
 | `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap+rowand` (default) or any subset (`rowand` needs a calibration with the A6 enumeration costs) |
 | `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector), `graph` (graph only, track G: the estimates set the list size and the post-filter route, the exact path is never taken; the hopeless gate does not apply) |
@@ -169,7 +169,7 @@ are navigated, never evaluated against the predicate and never returned.
 
 Illegal combinations are rejected when the configuration is validated (for example `deferred`
 needs `all` / `distance` / `final_beam`; `match_aware` needs `heap`; `bitmap` needs a
-materializer and no projection).
+materializer, and no projection unless the materializer is `dense_nav`).
 
 Presets (`kernel::Preset`): `postfilter`, `upstream-inline`, `upstream-inline-adaptive` /
 `upstream-inline-adaptive(sample, scale)`, `upstream-multihop`, `upstream-beta(β)` (alias

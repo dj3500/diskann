@@ -842,7 +842,8 @@ fn parse_materializer(s: &str) -> Result<Materializer> {
         "dense" => Materializer::Dense,
         "sparse" => Materializer::Sparse,
         "dense_static" => Materializer::DenseStatic,
-        _ => bail!("unknown materializer {s:?} (none, dense, sparse, dense_static)"),
+        "dense_nav" => Materializer::DenseNav,
+        _ => bail!("unknown materializer {s:?} (none, dense, sparse, dense_static, dense_nav)"),
     })
 }
 
@@ -852,6 +853,7 @@ fn materializer_name(m: Materializer) -> &'static str {
         Materializer::Dense => "dense",
         Materializer::Sparse => "sparse",
         Materializer::DenseStatic => "dense_static",
+        Materializer::DenseNav => "dense_nav",
     }
 }
 
@@ -1129,11 +1131,13 @@ impl Kernel {
                 self.admission
             );
             ensure!(
-                !matches!(
-                    self.admission,
-                    Admission::Projection(_) | Admission::ProjectionSmallest
-                ),
-                "a clause projection cannot be evaluated on a materialized match set"
+                self.materializer == Materializer::DenseNav
+                    || !matches!(
+                        self.admission,
+                        Admission::Projection(_) | Admission::ProjectionSmallest
+                    ),
+                "a clause projection cannot be evaluated on a materialized match set (dense_nav \
+                 materializes the projected clauses)"
             );
         }
         if let Admission::Projection(c) = &self.admission {
@@ -1526,6 +1530,17 @@ mod tests {
             ("predicate", "bitmap"),
             ("materializer", "dense"),
             ("admission", "projection(C3)")
+        ]));
+        assert!(!bad(&[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "projection(c*)"),
+            ("collector", "heap")
+        ]));
+        assert!(bad(&[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "cutoff(1)")
         ]));
         assert!(bad(&[("terminator", "adaptive_l(5, 2)")]));
         assert!(bad(&[("beam_width", "0")]));

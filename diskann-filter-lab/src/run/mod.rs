@@ -362,7 +362,10 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             exp.configs
                 .iter()
                 .any(|c| {
-                    c.kernel.materializer == Materializer::DenseStatic || uses_exact_bitsets(c)
+                    matches!(
+                        c.kernel.materializer,
+                        Materializer::DenseStatic | Materializer::DenseNav
+                    ) || uses_exact_bitsets(c)
                 })
                 .then(|| ds.labels.n_points().div_ceil(64) as u64)
         });
@@ -569,7 +572,10 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "qsets": exp.qsets, "limit": exp.limit, "queries": exp.queries,
                 "mode": exp.mode.name(), "reps": exp.reps, "seed": exp.seed,
                 "bitsets": (matches!(c.kernel.predicate, PredicateMode::StaticBits(_))
-                    || c.kernel.materializer == Materializer::DenseStatic
+                    || matches!(
+                        c.kernel.materializer,
+                        Materializer::DenseStatic | Materializer::DenseNav
+                    )
                     || uses_exact_bitsets(c))
                     .then(|| bitsets_json["source"].clone()),
                 "calibration": uses_costs(c).then(|| c.calibration.clone()).flatten(),

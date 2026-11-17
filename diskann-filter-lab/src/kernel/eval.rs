@@ -19,6 +19,9 @@
 //!   stops at the first failing clause;
 //! - [`DenseBitmap`] / [`SparseList`] (`bitmap`): a lookup in a materialized match set; they
 //!   give the match bit only (no failed-clause count);
+//! - [`NavBitmap`] (`bitmap` with the `dense_nav` materializer): a lookup in the materialized
+//!   bitmap of the navigation clauses; under a clause projection the full predicate is
+//!   completed on the row of the bitmap's members (the clauses outside the projection);
 //! - [`StaticBits`] (`static_bits(θ)`): labels with at least `θ` points are tested in static
 //!   per-label bitsets ([`crate::bitsets::LabelBitsets`], O(1) per label, most frequent label
 //!   of a clause first); the clauses that no bitset satisfies and that have rarer labels are
@@ -557,6 +560,11 @@ pub struct DenseBitmap;
 #[derive(Debug, Clone, Copy)]
 pub struct SparseList;
 
+/// Lookup in a materialized bitmap of the navigation clauses (`dense_nav`); the other clauses
+/// of a projected query are checked on the row.
+#[derive(Debug, Clone, Copy)]
+pub struct NavBitmap;
+
 /// Static per-label bitsets for frequent labels, the row for the others.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticBits;
@@ -735,6 +743,44 @@ impl Eval for DenseBitmap {
     #[inline(always)]
     fn prefetch(cx: &EvalCtx<'_>, v: u32) {
         super::prefetch(cx.dense.as_ptr().wrapping_add((v >> 6) as usize));
+    }
+
+    #[inline(always)]
+    fn prefetch_offsets(_cx: &EvalCtx<'_>, _v: u32) {}
+}
+
+impl Eval for NavBitmap {
+    const NAME: &'static str = "bitmap(nav)";
+    const ROWS: bool = false;
+
+    #[inline(always)]
+    fn eval(cx: &EvalCtx<'_>, v: u32, _complete: bool) -> PredOut {
+        PredOut {
+            m: DenseBitmap::full(cx, v),
+            unit: 0,
+            g: 0.0,
+        }
+    }
+
+    #[inline(always)]
+    fn full(cx: &EvalCtx<'_>, v: u32) -> bool {
+        if !DenseBitmap::full(cx, v) {
+            return false;
+        }
+        let q = cx.q;
+        if !q.projected {
+            return true;
+        }
+        let row = cx.labels.row(v);
+        if !q.use_bits || row.len() > 4 * q.labels.len() {
+            return ClauseSearch::full(cx, v);
+        }
+        scan(cx, row, q.full_mask & !q.nav_mask) == 0
+    }
+
+    #[inline(always)]
+    fn prefetch(cx: &EvalCtx<'_>, v: u32) {
+        DenseBitmap::prefetch(cx, v);
     }
 
     #[inline(always)]
