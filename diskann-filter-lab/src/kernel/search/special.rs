@@ -14,7 +14,7 @@ use crate::kernel::planner::Fallback;
 use crate::{
     bitsets::LabelBitsets,
     kernel::{
-        beam::{Inserted, State},
+        beam::{Inserted, PostfilterBeam, State},
         collect::Collector,
         eval::{Eval, EvalCtx, RowScan},
         fkey, pack, profile, unpack,
@@ -52,7 +52,7 @@ impl Searcher {
         ids: &mut [u32],
         dists: &mut [f32],
     ) -> usize {
-        self.postfilter_loop::<T, RowScan>(ix, q, l, None, false, ctr, ids, dists)
+        self.postfilter_beam::<T, RowScan>(ix, q, l, None, false, ctr, ids, dists)
     }
 
     /// Unfiltered search with list size `l` from the selected starts, then collection with the
@@ -69,8 +69,9 @@ impl Searcher {
         clippy::too_many_arguments,
         reason = "the per-query inputs and outputs"
     )]
-    pub(super) fn postfilter_loop<T: Element, P: Eval>(
+    pub(super) fn postfilter_loop<T: Element, P: Eval, B: PostfilterBeam>(
         &mut self,
+        beam: &mut B,
         ix: &Index<'_, T>,
         q: &Query<'_, T>,
         l: usize,
@@ -85,9 +86,8 @@ impl Searcher {
         log.clear();
         let n_data = ix.graph.n_data() as u32;
         let (graph, vectors, qv) = (ix.graph, ix.vectors, q.vector);
-        let beam = &mut self.beam32;
         let cap = l + self.starts.len();
-        beam.reset(cap, cap, false, false);
+        beam.start(cap);
         let mut c = Counters::default();
         for &s in &self.starts {
             let d = T::squared_l2(qv, vectors.get(s));
@@ -103,7 +103,7 @@ impl Searcher {
             };
             if let Inserted::At {
                 evicted: Some(_), ..
-            } = beam.insert(fkey(d), d, s, state)
+            } = beam.offer(fkey(d), s, state)
             {
                 c.n_evict += 1;
             }
@@ -161,7 +161,7 @@ impl Searcher {
                 let t2 = if timed { profile::now() } else { 0 };
                 if let Inserted::At {
                     evicted: Some(_), ..
-                } = beam.insert(fkey(d), d, v, state)
+                } = beam.offer(fkey(d), v, state)
                 {
                     c.n_evict += 1;
                 }
@@ -237,6 +237,38 @@ impl Searcher {
             profile::add(&prof);
         }
         n
+    }
+
+    /// [`Self::postfilter_loop`] with the plan's beam (`packed_beam`), taken out of the searcher
+    /// for the loop.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    pub(super) fn postfilter_beam<T: Element, P: Eval>(
+        &mut self,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        bits: Option<&LabelBitsets>,
+        deferred: bool,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
+        if self.packed_beam {
+            let mut beam = std::mem::take(&mut self.pbeam);
+            let n = self
+                .postfilter_loop::<T, P, _>(&mut beam, ix, q, l, bits, deferred, ctr, ids, dists);
+            self.pbeam = beam;
+            n
+        } else {
+            let mut beam = std::mem::take(&mut self.beam32);
+            let n = self
+                .postfilter_loop::<T, P, _>(&mut beam, ix, q, l, bits, deferred, ctr, ids, dists);
+            self.beam32 = beam;
+            n
+        }
     }
 
     /// The `upstream-inline` preset after start selection: every evaluated node navigates,

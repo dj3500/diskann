@@ -412,6 +412,9 @@ pub struct Kernel {
     /// neighbours are evaluated (A7; off reproduces the earlier loops exactly). Changes no
     /// answer, only memory timing.
     pub row_prefetch: bool,
+    /// The post-filter loop's beam packs each entry into one `u64` (`PackedBeam`, A7): the same
+    /// beam semantics, one array to search and move per insertion. Changes no answer.
+    pub packed_beam: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -476,6 +479,7 @@ impl Default for Kernel {
             hopeless_gate: true,
             row_reads: RowReads::Clause,
             row_prefetch: false,
+            packed_beam: false,
         }
     }
 }
@@ -977,6 +981,13 @@ impl Kernel {
                     v => bail!("unknown row_prefetch {v:?} (on, off)"),
                 }
             }
+            "packed_beam" => {
+                self.packed_beam = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown packed_beam {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1167,6 +1178,9 @@ impl Kernel {
         }
         if self.row_prefetch {
             j["row_prefetch"] = json!("on");
+        }
+        if self.packed_beam {
+            j["packed_beam"] = json!("on");
         }
         if self.row_reads != RowReads::Clause {
             j["row_reads"] = json!(self.row_reads.to_string());

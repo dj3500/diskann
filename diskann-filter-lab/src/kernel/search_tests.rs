@@ -1004,6 +1004,66 @@ fn fast_paths_agree_with_the_configurable_loop() {
     }
 }
 
+/// `packed_beam` changes no answer or counter of the post-filter preset (fast path kept) and
+/// of the hybrid's post-filter route.
+#[test]
+fn the_packed_beam_changes_no_answer() {
+    let f = fixture(300, 29, true);
+    let ix = f.index();
+    let off = Preset::parse("postfilter").unwrap().kernel();
+    let mut on = off.clone();
+    on.set("packed_beam", "on").unwrap();
+    let (a, b) = (Plan::new(&off, &ix).unwrap(), Plan::new(&on, &ix).unwrap());
+    assert_eq!(b.fast_path(), super::search::FastPath::Postfilter);
+    let mut st = Searcher::for_index(&ix, &[&a, &b]);
+    for q in 0..f.preds.len() {
+        for l in [5, 40] {
+            let (x, cx) = search(&f, &mut st, &a, q, l, 10, None);
+            let (y, cy) = search(&f, &mut st, &b, q, l, 10, None);
+            assert_eq!((x, cx), (y, cy), "postfilter q={q} L={l}");
+        }
+    }
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let route = khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", "always"),
+        ("postfilter_starts", "by_rate"),
+    ]);
+    let mut on = route.clone();
+    on.set("packed_beam", "on").unwrap();
+    let (a, b) = (
+        Plan::new(&route, &ix).unwrap(),
+        Plan::new(&on, &ix).unwrap(),
+    );
+    let mut st = Searcher::for_index(&ix, &[&a, &b]);
+    let mut routed = 0;
+    for q in 0..f.preds.len() {
+        for kk in [1, 10] {
+            let (x, cx) = search_ix(&f, &ix, &mut st, &a, q, 20, kk);
+            let (y, cy) = search_ix(&f, &ix, &mut st, &b, q, 20, kk);
+            assert_eq!((x, cx), (y, cy), "route q={q} K={kk}");
+            routed += usize::from(cx.route == Route::Postfilter);
+        }
+    }
+    assert!(routed > 0);
+}
+
 #[test]
 fn row_prefetch_changes_no_answer_and_keeps_the_fast_paths() {
     let f = fixture(300, 23, true);

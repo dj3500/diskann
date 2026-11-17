@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use anyhow::{bail, ensure, Result};
 
 use super::{
-    beam::{Beam, BeamKey, Inserted, State},
+    beam::{Beam, BeamKey, Inserted, PackedBeam, State},
     collect::{Answers, Collector},
     config::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
@@ -486,9 +486,11 @@ impl Plan {
         } else {
             ExactEval::RowScan
         };
-        // The memory-timing option `row_prefetch` keeps a preset's fast path (it takes the flag).
+        // The timing-only options `row_prefetch` and `packed_beam` keep a preset's fast path (it
+        // takes the flags).
         let roles = Kernel {
             row_prefetch: false,
+            packed_beam: false,
             ..kernel.clone()
         };
         let fast = if eval != EvalMode::RowScan {
@@ -663,6 +665,10 @@ pub struct Searcher {
     log: Vec<u64>,
     /// The current plan's `row_prefetch` (set at the start of every search).
     row_prefetch: bool,
+    /// The current plan's `packed_beam` (set at the start of every search).
+    packed_beam: bool,
+    /// The post-filter loop's beam with `packed_beam`.
+    pbeam: PackedBeam,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
 }
@@ -698,6 +704,8 @@ impl Searcher {
             last_estimates: Estimates::default(),
             log: Vec::new(),
             row_prefetch: false,
+            packed_beam: false,
+            pbeam: PackedBeam::default(),
             trace: None,
         }
     }
@@ -745,6 +753,7 @@ impl Searcher {
         let k = ids.len();
         let kernel = &plan.kernel;
         self.row_prefetch = kernel.row_prefetch;
+        self.packed_beam = kernel.packed_beam;
         let mut ctr = Counters {
             timing: kernel.phase_times,
             ..Counters::default()
@@ -1135,9 +1144,9 @@ impl Searcher {
         ctr.n_start = self.starts.len() as u64;
         match exact_stat {
             Some(b) => {
-                self.postfilter_loop::<T, StaticBits>(ix, q, l, Some(b), true, ctr, ids, dists)
+                self.postfilter_beam::<T, StaticBits>(ix, q, l, Some(b), true, ctr, ids, dists)
             }
-            None => self.postfilter_loop::<T, RowScan>(ix, q, l, None, true, ctr, ids, dists),
+            None => self.postfilter_beam::<T, RowScan>(ix, q, l, None, true, ctr, ids, dists),
         }
     }
 
