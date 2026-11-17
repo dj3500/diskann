@@ -285,6 +285,9 @@ pub struct Decision {
     /// A post-filter search from the global starts offers the configured starts once it ends
     /// (`postfilter_starts = by_rate_late`).
     pub postfilter_late: bool,
+    /// A post-filter search from the global starts is followed by a second search from the
+    /// configured starts (`postfilter_starts = by_rate_both`).
+    pub postfilter_both: bool,
 }
 
 #[cfg(test)]

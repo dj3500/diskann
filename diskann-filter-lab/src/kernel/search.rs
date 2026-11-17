@@ -870,7 +870,8 @@ impl Searcher {
                     q,
                     d.l,
                     d.postfilter_configured,
-                    d.postfilter_late,
+                    d.postfilter_late || d.postfilter_both,
+                    d.postfilter_both,
                     exact_stat,
                     &mut ctr,
                     ids,
@@ -1071,6 +1072,7 @@ impl Searcher {
                 postfilter: false,
                 postfilter_configured: false,
                 postfilter_late: false,
+                postfilter_both: false,
             };
         }
         let est = self.estimates(plan, ix, exact_stat, ctr);
@@ -1135,6 +1137,7 @@ impl Searcher {
             postfilter,
             postfilter_configured: postfilter && kernel.postfilter_starts.configured_at(rate),
             postfilter_late: postfilter && kernel.postfilter_starts.late_at(rate),
+            postfilter_both: postfilter && kernel.postfilter_starts.both_at(rate),
         }
     }
 
@@ -1154,6 +1157,7 @@ impl Searcher {
         l: usize,
         configured_starts: bool,
         late_starts: bool,
+        second_search: bool,
         exact_stat: Option<&LabelBitsets>,
         ctr: &mut Counters,
         ids: &mut [u32],
@@ -1166,7 +1170,8 @@ impl Searcher {
             self.select_starts(plan, ix, q, ctr);
         } else {
             if late_starts {
-                // The configured starts other than the global ones, offered once the search ends.
+                // The configured starts other than the global ones, offered once the search ends
+                // (or seeding a second search, `second_search`).
                 self.select_starts(plan, ix, q, ctr);
                 let global = ix.global;
                 self.late
@@ -1181,6 +1186,62 @@ impl Searcher {
             }
         }
         ctr.n_start = self.starts.len() as u64;
+        // `by_rate_both`: the configured starts seed a second search instead of a late offer.
+        let mut second = Vec::new();
+        if second_search {
+            std::mem::swap(&mut second, &mut self.late);
+        }
+        let n = self.postfilter_pass(ix, q, l, exact_stat, ctr, ids, dists);
+        if second.is_empty() {
+            self.late = second;
+            return n;
+        }
+        // The second search shares the visited nodes: it stops where the first one has been.
+        self.starts.clear();
+        for &s in &second {
+            if !self.visited.test_and_set(s) {
+                self.starts.push(s);
+            }
+        }
+        second.clear();
+        self.late = second;
+        if self.starts.is_empty() {
+            return n;
+        }
+        ctr.n_late += self.starts.len() as u64;
+        let mut both: Vec<(f32, u32)> = dists[..n]
+            .iter()
+            .copied()
+            .zip(ids[..n].iter().copied())
+            .collect();
+        let final_l = ctr.final_l;
+        let n2 = self.postfilter_pass(ix, q, l, exact_stat, ctr, ids, dists);
+        ctr.final_l = final_l;
+        // The K nearest matches of both searches (disjoint evaluated nodes), by (distance, id).
+        both.extend(dists[..n2].iter().copied().zip(ids[..n2].iter().copied()));
+        both.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let k = ids.len().min(both.len());
+        for (i, &(d, id)) in both[..k].iter().enumerate() {
+            (ids[i], dists[i]) = (id, d);
+        }
+        k
+    }
+
+    /// One post-filter search from `self.starts` (with the visited set as the caller left it).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    fn postfilter_pass<T: Element>(
+        &mut self,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        exact_stat: Option<&LabelBitsets>,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
         match exact_stat {
             Some(b) => {
                 self.postfilter_beam::<T, StaticBits>(ix, q, l, Some(b), true, ctr, ids, dists)

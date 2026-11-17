@@ -2066,12 +2066,12 @@ fn by_rate_late_continues_from_closer_starts_and_never_loses() {
         sketches: Some(&sketches),
         ..f.index()
     };
-    let plans: Vec<Plan> = ["by_rate_late", "by_rate"]
+    let plans: Vec<Plan> = ["by_rate_late", "by_rate", "by_rate_both"]
         .into_iter()
         .map(|s| Plan::new(&postfilter_route(s), &ix).unwrap())
         .collect();
     let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
-    let mut broad = 0;
+    let (mut broad, mut second) = (0, 0);
     for q in 0..f.preds.len() {
         for kk in [1, 10] {
             for l in [1, 2, 20] {
@@ -2094,10 +2094,23 @@ fn by_rate_late_continues_from_closer_starts_and_never_loses() {
                 if ctr.n_dist > wctr.n_dist {
                     broad += 1;
                 }
+                // `by_rate_both`: the K nearest matches of `by_rate`'s search and a second one.
+                let (both, bctr) = search_ix(&f, &ix, &mut st, &plans[2], q, l, kk);
+                assert!(both.len() >= want.len(), "q={q} K={kk} L={l}");
+                for (i, (a, b)) in both.iter().zip(&want).enumerate() {
+                    assert!(a.0 <= b.0, "q={q} K={kk} L={l}: answer {i} {a:?} vs {b:?}");
+                }
+                if bctr.n_late == 0 {
+                    assert_eq!(both, want, "q={q} K={kk} L={l}");
+                } else {
+                    assert!(bctr.n_expand > wctr.n_expand, "q={q} K={kk} L={l}");
+                    second += 1;
+                }
             }
         }
     }
     assert!(broad > 0, "no broad predicate offered its starts");
+    assert!(second > 0, "no second search");
 }
 
 fn postfilter_route(starts: &str) -> Kernel {
@@ -2192,7 +2205,7 @@ fn by_rate_late_rescues_a_search_that_missed_the_query() {
         costs: Some(&costs),
         sketches: Some(&sketches),
     };
-    let plans: Vec<Plan> = ["by_rate_late", "by_rate"]
+    let plans: Vec<Plan> = ["by_rate_late", "by_rate", "by_rate_both"]
         .into_iter()
         .map(|s| Plan::new(&postfilter_route(s), &ix).unwrap())
         .collect();
@@ -2219,11 +2232,17 @@ fn by_rate_late_rescues_a_search_that_missed_the_query() {
     assert_eq!(late.len(), 10);
     assert!(late.iter().all(|&v| (v as usize) >= half), "{late:?}");
     assert!(lctr.n_late >= 1 && lctr.n_expand > pctr.n_expand);
-    // The query in the first cluster.
+    let (both, bctr) = run(&mut st, &plans[2], 0);
+    assert!(both.iter().all(|&v| (v as usize) >= half), "{both:?}");
+    assert!(bctr.n_late >= 1);
+    // The query in the first cluster: no start admitted; the second search finds only farther
+    // points of the second cluster, so the answers are `by_rate`'s.
     let (late, lctr) = run(&mut st, &plans[0], 1);
     let (plain, _) = run(&mut st, &plans[1], 1);
     assert_eq!(lctr.n_late, 0);
     assert_eq!(late, plain);
+    let (both, _) = run(&mut st, &plans[2], 1);
+    assert_eq!(both, plain);
 }
 
 #[test]

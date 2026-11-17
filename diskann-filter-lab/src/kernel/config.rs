@@ -215,6 +215,12 @@ pub enum PostfilterStarts {
     /// global starts missed the query's neighbourhood) is admitted and the search continues
     /// from it. A start the list does not admit costs one distance computation.
     ByRateLate,
+    /// `by_rate`, and a broad predicate's search from the global starts is followed by a second
+    /// search from the configured starts with the same list size, sharing the visited nodes (it
+    /// stops where the first search has been); the answers are the `K` nearest matches of both.
+    /// Never fewer or farther answers than `by_rate`; the second search costs little when both
+    /// reach the query's neighbourhood.
+    ByRateBoth,
 }
 
 impl PostfilterStarts {
@@ -224,9 +230,11 @@ impl PostfilterStarts {
             "configured" => Self::Configured,
             "by_rate" => Self::ByRate,
             "by_rate_late" => Self::ByRateLate,
-            _ => {
-                bail!("unknown postfilter_starts {s:?} (global, configured, by_rate, by_rate_late)")
-            }
+            "by_rate_both" => Self::ByRateBoth,
+            _ => bail!(
+                "unknown postfilter_starts {s:?} (global, configured, by_rate, by_rate_late, \
+                 by_rate_both)"
+            ),
         })
     }
 
@@ -235,7 +243,7 @@ impl PostfilterStarts {
         match self {
             Self::Global => false,
             Self::Configured => true,
-            Self::ByRate | Self::ByRateLate => rate < super::cost::BROAD_RATE,
+            Self::ByRate | Self::ByRateLate | Self::ByRateBoth => rate < super::cost::BROAD_RATE,
         }
     }
 
@@ -243,6 +251,12 @@ impl PostfilterStarts {
     /// configured starts once it ends.
     pub fn late_at(self, rate: f64) -> bool {
         self == Self::ByRateLate && !self.configured_at(rate)
+    }
+
+    /// Whether a search from the global starts at estimated match rate `rate` is followed by a
+    /// second search from the configured starts.
+    pub fn both_at(self, rate: f64) -> bool {
+        self == Self::ByRateBoth && !self.configured_at(rate)
     }
 }
 
@@ -253,6 +267,7 @@ impl fmt::Display for PostfilterStarts {
             Self::Configured => "configured",
             Self::ByRate => "by_rate",
             Self::ByRateLate => "by_rate_late",
+            Self::ByRateBoth => "by_rate_both",
         })
     }
 }
