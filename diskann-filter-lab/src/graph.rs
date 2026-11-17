@@ -110,7 +110,7 @@ struct Aligned {
 impl Aligned {
     fn filled(len: usize, value: u32) -> Self {
         Self {
-            lines: vec![Line([value; 16]); len.div_ceil(16)],
+            lines: crate::hugepages::filled(len.div_ceil(16), Line([value; 16])),
             len,
         }
     }
@@ -225,7 +225,7 @@ impl Graph {
         Ok(Self {
             n_data: n_data as u32,
             r_max,
-            degrees: vec![0; n_nodes],
+            degrees: crate::hugepages::filled(n_nodes, 0),
             adjacency: Aligned::filled(slots, NO_NEIGHBOR),
             starts: Vec::new(),
             aux,
