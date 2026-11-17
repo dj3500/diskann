@@ -18,7 +18,12 @@
 //! - **row AND** (the exact plan `rowand`): the words of the data-point bitmap that hold
 //!   members of the first clause (`c*`), each ANDed with the other clauses word by word (the
 //!   static bitset words of their frequent labels; the postings of their other labels through
-//!   galloping cursors), stopping at the first clause that clears it, then enumerated.
+//!   galloping cursors), stopping at the first clause that clears it, then enumerated;
+//! - **blocked bitmap** (the exact plan `bitmap`): the dense / dense_static bitmap computed and
+//!   enumerated one block of [`BLOCK`] words at a time in two block buffers (the postings
+//!   through cursors), a block's remaining clauses skipped once it is empty. No full-width
+//!   scratch is written: the full-width buffers' dirty lines (two bitmaps of n/64 words, 10 MB
+//!   at 40M) slowed the next queries (batch A6b).
 //!
 //! Static per-label bitsets (a sidecar built once, not per query) are in
 //! [`crate::bitsets`]; the `static_bits(θ)` evaluator ([`super::eval::StaticBits`]) reads them.
@@ -132,7 +137,14 @@ pub struct Materialized {
     rw_words: Vec<u32>,
     rw_masks: Vec<u64>,
     rw_cursors: Vec<usize>,
+    /// Blocked bitmap: the block, a clause's block, the cursors of every query label.
+    bm_block: Vec<u64>,
+    bm_clause: Vec<u64>,
+    bm_cursors: Vec<usize>,
 }
+
+/// Words per block of the blocked bitmap (8 KB: both block buffers stay in L1).
+pub const BLOCK: usize = 1024;
 
 /// Row AND: bitset words are prefetched this many surviving words ahead, for the first
 /// `RW_PREFETCH` bitset labels of the clause.
@@ -357,6 +369,128 @@ impl Materialized {
             }
         }
         cands
+    }
+
+    /// The matches of `q` into `self.matches` (sorted) by the blocked bitmap (see the module
+    /// documentation): the matches of [`Self::build_dense_static`] with `sb`, of
+    /// [`Self::build_dense`] without. Returns their number.
+    pub fn build_bitmap(
+        &mut self,
+        labels: &LabelStore,
+        q: &Compiled,
+        n_data: usize,
+        sb: Option<&LabelBitsets>,
+    ) -> u64 {
+        self.build_bitmap_in(labels, q, n_data, sb, BLOCK)
+    }
+
+    fn build_bitmap_in(
+        &mut self,
+        labels: &LabelStore,
+        q: &Compiled,
+        n_data: usize,
+        sb: Option<&LabelBitsets>,
+        block: usize,
+    ) -> u64 {
+        let words = n_data.div_ceil(64);
+        self.matches.clear();
+        let nc = q.n_clauses();
+        if nc == 0 {
+            self.matches.extend(0..n_data as u32);
+            return n_data as u64;
+        }
+        if let Some(sb) = sb {
+            assert_eq!(sb.n_points(), n_data, "bitsets of another point set");
+        }
+        let slot = |l: u32| sb.and_then(|b| b.slot(l)).map(|s| (sb.unwrap(), s));
+        let (blk, tmp, cursors, out) = (
+            &mut self.bm_block,
+            &mut self.bm_clause,
+            &mut self.bm_cursors,
+            &mut self.matches,
+        );
+        blk.resize(block, 0);
+        tmp.resize(block, 0);
+        cursors.clear();
+        cursors.resize(q.total_labels(), 0);
+        let mut w0 = 0;
+        while w0 < words {
+            let w1 = (w0 + block).min(words);
+            let len = w1 - w0;
+            let (lo, hi) = ((w0 as u32) << 6, (w1 as u64) << 6);
+            let mut first = 0;
+            let mut empty = false;
+            for j in 0..nc {
+                let clause = q.clause(j);
+                let cur = &mut cursors[first..first + clause.len()];
+                first += clause.len();
+                if empty {
+                    continue;
+                }
+                // A clause of one bitset label after the first: ANDed in directly.
+                if j > 0 && clause.len() == 1 {
+                    if let Some((b, s)) = slot(clause[0]) {
+                        let mut any = 0;
+                        for (a, &x) in blk[..len].iter_mut().zip(&b.bitset(s)[w0..w1]) {
+                            *a &= x;
+                            any |= *a;
+                        }
+                        empty = any == 0;
+                        continue;
+                    }
+                }
+                let target = if j == 0 {
+                    &mut blk[..len]
+                } else {
+                    &mut tmp[..len]
+                };
+                target.fill(0);
+                for (t, &l) in clause.iter().enumerate() {
+                    match slot(l) {
+                        Some((b, s)) => {
+                            for (a, &x) in target.iter_mut().zip(&b.bitset(s)[w0..w1]) {
+                                *a |= x;
+                            }
+                        }
+                        None => {
+                            let post = labels.postings(l);
+                            let mut p = gallop_lower_bound(post, cur[t], lo);
+                            while let Some(&v) = post.get(p) {
+                                if u64::from(v) >= hi {
+                                    break;
+                                }
+                                target[(v >> 6) as usize - w0] |= 1u64 << (v & 63);
+                                p += 1;
+                            }
+                            cur[t] = p;
+                        }
+                    }
+                }
+                let mut any = 0;
+                if j == 0 {
+                    for &x in blk[..len].iter() {
+                        any |= x;
+                    }
+                } else {
+                    for (a, &x) in blk[..len].iter_mut().zip(&tmp[..len]) {
+                        *a &= x;
+                        any |= *a;
+                    }
+                }
+                empty = any == 0;
+            }
+            if !empty {
+                for (i, &x) in blk[..len].iter().enumerate() {
+                    let mut x = x;
+                    while x != 0 {
+                        out.push((((w0 + i) as u32) << 6) | x.trailing_zeros());
+                        x &= x - 1;
+                    }
+                }
+            }
+            w0 = w1;
+        }
+        out.len() as u64
     }
 
     /// Builds the dense match bitmap of `q`; returns the number of posting entries read.
@@ -659,6 +793,15 @@ mod tests {
         for i in 0..preds.len() {
             q.compile(&s, preds.get(i), Weights::Unit, None, &mut bits);
             let expect: Vec<u32> = (0..n).filter(|&p| preds.get(i).matches(s.row(p))).collect();
+            for block in [1, 3, 7, BLOCK] {
+                m.build_bitmap_in(&s, &q, n as usize, None, block);
+                assert_eq!(m.matches, expect, "query {i}, blocked bitmap ({block})");
+                m.build_bitmap_in(&s, &q, n as usize, Some(&sb), block);
+                assert_eq!(
+                    m.matches, expect,
+                    "query {i}, blocked bitmap, bitsets ({block})"
+                );
+            }
             m.build_rowand(&s, &q, n as usize, None);
             assert_eq!(m.matches, expect, "query {i} without bitsets");
             q.split_static(&s, &sb, sb.theta(), false);

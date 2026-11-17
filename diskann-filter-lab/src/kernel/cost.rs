@@ -21,7 +21,9 @@
 //! gallop          merge(c*) + Σ_{j≥1} Σ_{ℓ∈c_j} probes(S_{j−1}, |post ℓ|) + M·dist(M/n),
 //!                 S_j = A·survival_j, probes(s, p) = gallop·s·(1 + log2(1 + p/s))
 //! bitmap          Σ_j (n/64 words per bitset label, |post ℓ| scatters otherwise, n/64 per
-//!                 clause fill and AND) + n/64 enumerated words + M·dist(M/n)
+//!                 clause fill and AND) + n/64 enumerated words + M·dist(M/n) (an upper bound
+//!                 since A6b: built block by block in L1, empty blocks skip their remaining
+//!                 clauses)
 //! rowand          words(c*) + Σ_{j≥1} W·reach_j·(base(ρ) + hot_j·word(ρ))
 //!                 + Σ_{j≥1} Σ_{ℓ rare in c_j} probes(min(W·reach_j, P_j), |post ℓ|) + M·enum_bit
 //!                 + M·dist(M/n)
@@ -801,7 +803,8 @@ pub enum ExactPlan {
     DistanceFirst = 2,
     /// Galloping intersection of the clauses' postings, then distances.
     Gallop = 3,
-    /// Dense match bitmap (static bitsets for frequent labels), then distances.
+    /// Dense match bitmap (static bitsets for frequent labels), built and enumerated block by
+    /// block, then distances.
     Bitmap = 4,
     /// The words of `c*`'s union ANDed with the residual clauses' rows word by word (bitset
     /// words; galloping cursors in the postings of labels without a bitset), then distances.

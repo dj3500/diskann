@@ -27,7 +27,9 @@
 //!   inside the answer bound (heap not full, or distance ≤ the heap's K-th: ties are checked);
 //! - `gallop`: galloping intersection, then distances;
 //! - `bitmap`: dense match bitmap (static bitsets ORed word by word, rare labels scattered),
-//!   enumerated in id order, then distances;
+//!   built and enumerated in id order one L1-sized block at a time
+//!   ([`Materialized::build_bitmap`]; a block's remaining clauses are skipped once it is
+//!   empty), then distances;
 //! - `rowand`: the words holding members of `union(c*)`, each ANDed with the residual
 //!   clauses word by word (bitset words; galloping cursors in the postings of labels without
 //!   a bitset; [`Materialized::build_rowand`]), enumerated, then distances.
@@ -414,23 +416,8 @@ fn planned<T: Element, P: Eval>(
         }
         ExactPlan::Bitmap => {
             let t = tic(ctr);
-            mat.ensure_dense(n_data);
-            if cx.stat.n_points() == n_data {
-                mat.build_dense_static(cx.labels, cx.q, n_data, cx.stat);
-            } else {
-                mat.build_dense(cx.labels, cx.q, n_data);
-            }
-            let words = n_data.div_ceil(64);
-            let out = &mut mat.matches;
-            out.clear();
-            for (w, &x) in mat.dense[..words].iter().enumerate() {
-                let mut x = x;
-                while x != 0 {
-                    out.push(((w as u32) << 6) | x.trailing_zeros());
-                    x &= x - 1;
-                }
-            }
-            ctr.n_exact_cand += out.len() as u64;
+            let sb = (cx.stat.n_points() == n_data).then_some(cx.stat);
+            ctr.n_exact_cand += mat.build_bitmap(cx.labels, cx.q, n_data, sb);
             toc(t, &mut ctr.t_check_ns);
             let t = tic(ctr);
             distances(&mat.matches, vectors, query, answers, seeded, ctr);
