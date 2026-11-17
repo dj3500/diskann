@@ -422,6 +422,8 @@ pub struct Kernel {
     /// The post-filter loop's beam packs each entry into one `u64` (`PackedBeam`, A7): the same
     /// beam semantics, one array to search and move per insertion. Changes no answer.
     pub packed_beam: bool,
+    /// The tree route for tree-eligible queries (`off` by default).
+    pub tree_route: TreeRoute,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -450,6 +452,41 @@ impl fmt::Display for RowReads {
         f.write_str(match self {
             Self::Clause => "clause",
             Self::Reach => "reach",
+        })
+    }
+}
+
+/// The tree route: a query whose binding clause c\* has only labels whose starts are all
+/// auxiliary nodes (router-tree roots, `flab steiner`) — or no points — is *tree-eligible*
+/// and runs a tree search instead of the configured search: starts `label(c*)`, only
+/// auxiliary nodes expanded (`aux_only`), strict admission with predicate-first checks, a
+/// heap of the K best matches, the same list size. Other queries take the configured route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreeRoute {
+    Off,
+    /// Member checks on the label rows.
+    RowScan,
+    /// Member checks on a per-query dense match bitmap built with the static bitsets.
+    Bitmap,
+}
+
+impl TreeRoute {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "off" => Self::Off,
+            "row_scan" => Self::RowScan,
+            "bitmap" => Self::Bitmap,
+            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap)"),
+        })
+    }
+}
+
+impl fmt::Display for TreeRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::RowScan => "row_scan",
+            Self::Bitmap => "bitmap",
         })
     }
 }
@@ -487,6 +524,7 @@ impl Default for Kernel {
             row_reads: RowReads::Clause,
             row_prefetch: false,
             packed_beam: false,
+            tree_route: TreeRoute::Off,
         }
     }
 }
@@ -1001,6 +1039,7 @@ impl Kernel {
                     v => bail!("unknown packed_beam {v:?} (on, off)"),
                 }
             }
+            "tree_route" => self.tree_route = TreeRoute::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1207,7 +1246,33 @@ impl Kernel {
         if self.row_reads != RowReads::Clause {
             j["row_reads"] = json!(self.row_reads.to_string());
         }
+        if self.tree_route != TreeRoute::Off {
+            j["tree_route"] = json!(self.tree_route.to_string());
+        }
         j
+    }
+
+    /// The kernel of the tree route's search (`None` when the route is off).
+    pub fn tree_kernel(&self) -> Option<Kernel> {
+        let (predicate, materializer) = match self.tree_route {
+            TreeRoute::Off => return None,
+            TreeRoute::RowScan => (PredicateMode::RowScan, Materializer::None),
+            TreeRoute::Bitmap => (PredicateMode::Bitmap, Materializer::DenseStatic),
+        };
+        Some(Kernel {
+            starts: vec![StartSource::LabelSmallest],
+            start_admission: StartAdmission::Force,
+            admission: Admission::Strict,
+            laziness: Laziness::PredicateFirst,
+            collector: Collector::Heap,
+            expander: Expander::AuxOnly,
+            terminator: Terminator::Exhaust,
+            predicate,
+            materializer,
+            weights: self.weights,
+            phase_times: self.phase_times,
+            ..Kernel::default()
+        })
     }
 
     /// Whether efforts below `k` are not applicable (the collector returns at most `L`
