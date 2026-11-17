@@ -366,6 +366,13 @@ fn configs() -> Vec<(String, Kernel)> {
             ("materializer", "dense_static"),
             ("collector", "heap"),
         ],
+        &[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
+        ],
     ];
     for (i, edits) in overrides.iter().enumerate() {
         let mut k = Kernel::default();
@@ -527,6 +534,70 @@ fn static_bits_do_not_change_answers_or_counters() {
     .is_err());
     k.set("predicate", "static_bits(100)").unwrap();
     assert!(Plan::new(&k, &ix_high).is_ok());
+}
+
+#[test]
+fn nav_bitmaps_do_not_change_answers_or_counters() {
+    // `bitmap` + `dense_nav` (the navigation clauses materialized, the others on the row) gives
+    // the default evaluator's answers and counters, with or without static bitsets, also
+    // under clause projections (where `dense` / `dense_static` are not allowed).
+    let f = fixture(300, 17, true);
+    let ix_bits = f.index();
+    let ix_none = Index {
+        bitsets: None,
+        costs: None,
+        sketches: None,
+        ..f.index()
+    };
+    let edits: &[&[(&str, &str)]] = &[
+        &[],
+        &[("admission", "strict"), ("collector", "final_beam")],
+        &[
+            ("admission", "strict"),
+            ("expander", "two_hop(3)"),
+            ("start_admission", "force"),
+        ],
+        &[("admission", "projection(c*)"), ("collector", "heap")],
+        &[
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
+            ("terminator", "exhaust"),
+        ],
+        &[("admission", "projection(a)"), ("collector", "heap")],
+        &[
+            ("admission", "projection(a, c)"),
+            ("collector", "final_beam"),
+        ],
+        &[("collector", "heap"), ("laziness", "distance_first")],
+    ];
+    let mut checked = 0;
+    for e in edits {
+        let mut base = Kernel::default();
+        for (key, value) in e.iter() {
+            base.set(key, value).unwrap();
+        }
+        let mut k = base.clone();
+        k.set("predicate", "bitmap").unwrap();
+        k.set("materializer", "dense_nav").unwrap();
+        for ix in [&ix_bits, &ix_none] {
+            let pa = Plan::new(&base, ix).unwrap();
+            let pb = Plan::new(&k, ix).unwrap_or_else(|err| panic!("{e:?}: {err}"));
+            let mut st = Searcher::for_index(ix, &[&pa, &pb]);
+            for q in 0..f.preds.len() {
+                for l in [10, 30] {
+                    let (oa, mut ca) = search_ix(&f, ix, &mut st, &pa, q, l, 10);
+                    let (ob, mut cb) = search_ix(&f, ix, &mut st, &pb, q, l, 10);
+                    for c in [&mut ca, &mut cb] {
+                        [c.res_words, c.res_rows, c.c1_words, c.c1_rows] = [0; 4];
+                    }
+                    assert_eq!((oa, ca), (ob, cb), "{e:?} q={q} L={l}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "{checked}");
 }
 
 #[test]

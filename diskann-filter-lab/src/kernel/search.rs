@@ -24,8 +24,8 @@ use super::{
     },
     entry::{self, SampleIndex, StartPredicate},
     eval::{
-        ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
-        StaticBits,
+        ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, NavBitmap, PredOut, RowScan,
+        SparseList, StaticBits,
     },
     exact::{self, ExactEval},
     materialize::{Materialized, Materializer},
@@ -321,6 +321,8 @@ pub enum EvalMode {
     Dense,
     Sparse,
     StaticBits,
+    /// Bitmap of the navigation clauses (`dense_nav`), the row for the other clauses.
+    NavBitmap,
 }
 
 /// A kernel configuration resolved against an index (validated once per run).
@@ -377,6 +379,7 @@ impl Plan {
             (PredicateMode::Bitmap, Materializer::Dense | Materializer::DenseStatic) => {
                 EvalMode::Dense
             }
+            (PredicateMode::Bitmap, Materializer::DenseNav) => EvalMode::NavBitmap,
             (PredicateMode::Bitmap, _) => EvalMode::Sparse,
             (PredicateMode::StaticBits(_), _) => EvalMode::StaticBits,
         };
@@ -406,6 +409,12 @@ impl Plan {
             let b = ix.bitsets.ok_or_else(|| {
                 anyhow::anyhow!("the dense_static materializer needs static per-label bitsets")
             })?;
+            ensure!(
+                b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
+                "the static bitsets refer to another label store"
+            );
+        }
+        if let (Materializer::DenseNav, Some(b)) = (kernel.materializer, ix.bitsets) {
             ensure!(
                 b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
                 "the static bitsets refer to another label store"
@@ -518,7 +527,7 @@ impl Plan {
     pub fn needs_dense(&self) -> bool {
         matches!(
             self.kernel.materializer,
-            Materializer::Dense | Materializer::DenseStatic
+            Materializer::Dense | Materializer::DenseStatic | Materializer::DenseNav
         ) || (self.kernel.exact.is_planned() && self.kernel.exact_plans.contains(ExactPlan::Bitmap))
     }
 
@@ -1432,6 +1441,7 @@ fn dispatch<T: Element>(
         EvalMode::Dense => by_family!(DenseBitmap),
         EvalMode::Sparse => by_family!(SparseList),
         EvalMode::StaticBits => by_family!(StaticBits),
+        EvalMode::NavBitmap => by_family!(NavBitmap),
     }
 }
 
@@ -2265,6 +2275,9 @@ fn run<T: Element, P: Eval, S: Score>(
         }
         Materializer::Sparse => {
             mat.build_sparse(ix.labels, compiled, n_data as usize);
+        }
+        Materializer::DenseNav => {
+            mat.build_dense_nav(ix.labels, compiled, n_data as usize, ix.bitsets);
         }
         Materializer::None => {}
     }
