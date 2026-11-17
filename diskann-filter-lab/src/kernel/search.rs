@@ -1564,6 +1564,8 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     projected: bool,
     aux_g: f32,
     n_data: u32,
+    /// Expander `aux_only`: data points are never expanded.
+    aux_only: bool,
     lazy_ok: bool,
     // The beam, the visited set, the answers and the counters are held by value (moved out of
     // the `Searcher` for the query), so that the hot loop, which takes `&mut self`, knows that
@@ -2078,6 +2080,10 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                     None => break,
                 }
             }
+            if self.aux_only {
+                let n_data = self.n_data;
+                frontier.retain(|&n| n >= n_data);
+            }
             c.n_expand += frontier.len() as u64;
             if TWO_HOP {
                 rejected.clear();
@@ -2340,6 +2346,7 @@ fn run<T: Element, P: Eval, S: Score>(
         projected: compiled.is_projected(),
         aux_g: kernel.aux_g,
         n_data,
+        aux_only: kernel.expander == Expander::AuxOnly,
         lazy_ok: !adaptive.sampling(),
         beam,
         visited: std::mem::take(visited),

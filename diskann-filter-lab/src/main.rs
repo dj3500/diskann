@@ -75,6 +75,9 @@ enum Command {
     /// kernel's traversal models, missed-answer classes, oracle and per-component entries,
     /// work decomposition, block statistics; untimed).
     Diag(diskann_filter_lab::diag::DiagArgs),
+    /// Steiner augmentation of a graph: auxiliary router nodes with protected out-edges,
+    /// reached only from the start table (per-label trees or component connectors).
+    Steiner(diskann_filter_lab::build::steiner::SteinerArgs),
     /// Summarize a lab file (labels, predicates, ground truth, graph, starts) or a vector file.
     Info {
         path: PathBuf,
@@ -437,6 +440,7 @@ fn main() -> Result<()> {
         Command::Run(args) => run_experiment(&args),
         Command::Build(args) => diskann_filter_lab::build::cli::run(&args),
         Command::Diag(args) => diskann_filter_lab::diag::run(&args),
+        Command::Steiner(args) => diskann_filter_lab::build::steiner::run(&args),
         Command::Convert(c) => convert(c),
         Command::Gt(args) => match dtype(args.dtype, &args.base)? {
             DType::U8 => run_gt::<u8>(&args),
