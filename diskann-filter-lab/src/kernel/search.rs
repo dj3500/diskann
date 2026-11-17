@@ -672,6 +672,9 @@ pub struct Searcher {
     log: Vec<u64>,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
+    /// Start nodes appended to the configured starts of every graph search (untimed
+    /// diagnostics, e.g. oracle entries); empty in normal runs.
+    pub extra_starts: Vec<u32>,
 }
 
 impl Searcher {
@@ -705,6 +708,7 @@ impl Searcher {
             last_estimates: Estimates::default(),
             log: Vec::new(),
             trace: None,
+            extra_starts: Vec::new(),
         }
     }
 
@@ -722,6 +726,12 @@ impl Searcher {
     /// The final beam of the last graph search with `f32` keys (diagnostics).
     pub fn beam(&self) -> &Beam<u32> {
         &self.beam32
+    }
+
+    /// Whether the last search offered node `v` (diagnostics; second-hop candidates that
+    /// failed admission are not recorded).
+    pub fn visited(&self, v: u32) -> bool {
+        self.visited.contains(v)
     }
 
     /// Answers query `q` with list size `l`, writing `ids.len()` = K results (ids and true
@@ -1270,6 +1280,11 @@ impl Searcher {
             &mut self.pos,
             ctr,
         );
+        for &s in &self.extra_starts {
+            if (s as usize) < ix.graph.n_nodes() && !self.visited.test_and_set(s) {
+                self.starts.push(s);
+            }
+        }
     }
 }
 

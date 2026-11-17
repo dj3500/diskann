@@ -15,6 +15,7 @@ pub mod bitsets;
 pub mod build;
 pub mod calibrate;
 pub mod container;
+pub mod diag;
 pub mod diskann_io;
 pub mod graph;
 pub mod gt;
