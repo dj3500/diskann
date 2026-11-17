@@ -208,7 +208,7 @@ the clauses' postings), `bitmap` (a dense match bitmap built with the static bit
 `rowand` (batch A6: only the bitmap words that hold members of the smallest clause, ANDed
 clause by clause with the other clauses' bitset words, prefetched, and with the postings of
 their labels without a bitset through galloping cursors; no memory beyond one bitmap of
-scratch). The bitmap's enumeration is priced per empty word and per set bit (A6; older
+scratch). The bitmap's enumeration is priced per empty word, non-empty word and set bit (A6; older
 calibrations price every word as if 10 % of its bits were set, which made `bitmap` look 5 to
 20 times dearer than it is on selective queries), and `rowand` is a candidate only with those
 costs, so older calibrations reproduce the earlier choices.
@@ -224,7 +224,7 @@ only): memory-access costs as functions of the candidate density on random point
 mostly misses of the first clause) and on members of the calibration predicates' `union(c0)`
 checked like the exact path's candidates, separately for predicates whose residual clauses
 read rows and bitset-only ones (`pred_row_ns`, `pred_bits_ns`; used for `scan` and `df`);
-merge and bitmap costs (enumeration per empty word and per set bit: bitmaps with 0 to 1/16 of
+merge and bitmap costs (enumeration per empty word, non-empty word and set bit: bitmaps with 0 to 1/16 of
 their bits set); galloping steps by gap, measured with the gallop plan on label pairs
 whose posting lengths have that ratio (`gallop_gap_ns`: cache misses grow with the gap); graph-search costs per distance and per predicate (and per distance by list size up to
 L = 40,960: long beams cost more per distance), and the predicate evaluations of `heap_bound`
