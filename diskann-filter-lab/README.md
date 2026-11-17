@@ -158,7 +158,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
 | `postfilter` | `off`, `cost` (a graph-routed query of the cost or guarded crossover takes the post-filter route when its nominal cost is at most the configured graph search's; under `guarded` the route itself is not guarded), `always` (every graph-routed query; a control): see below |
-| `postfilter_starts` | starts of the post-filter route: `global` (the graph's global starts), `configured` (the `starts` role, e.g. per-label starts), `by_rate` (the configured starts for a narrow predicate, estimated match rate below 1/2; the global starts for a broad one) |
+| `postfilter_starts` | starts of the post-filter route: `global` (the graph's global starts), `configured` (the `starts` role, e.g. per-label starts), `by_rate` (the configured starts for a narrow predicate, estimated match rate below 1/2; the global starts for a broad one), `by_rate_late` (`by_rate`, and a broad predicate's search, once it ends, offers the configured starts to its list and continues from those it admits, i.e. those closer to the query than its last entry; counter `n_late`) |
 | `exact_checks` | what the planned exact path and the probe check on their points, all members of `union(c*)`: `residual` (default: the clauses after `c*`, with prefetches for them) or `full` (every clause with the graph search's prefetch policy, as in batch B6) |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
@@ -166,6 +166,8 @@ are navigated, never evaluated against the predicate and never returned.
 | `aux_g` | penalty of auxiliary nodes in graded keys (0) |
 | `row_prefetch` | `off` (default), `on`: prefetch the adjacency row of the closest unexpanded node (the next expansion, unless a closer node arrives first) while the current node is expanded; changes no answer or counter |
 | `packed_beam` | `off` (default), `on`: the post-filter loop (preset and route) keeps its beam in one array of `u64` entries (key, expanded flag, state, 28-bit node id) instead of a key array and a slot array: the same beam semantics, one array to search and move per insertion; changes no answer or counter; graphs with more than 2^28 nodes keep the ordinary beam |
+| `df_evals` | `estimate` (default), `lower`: the exact plan `df` counts its predicate evaluations at the lower confidence bound of the match count instead of the estimate (its answer bound saves checks only once `K` matches are found, so an over-estimated match count must not make it look cheap); exact estimates are unaffected |
+| `inline_rank` | `off` (default), `on`: under a cost or guarded crossover, an inline graph search with `posting_l` is planned (and priced) at a list size whose evaluated nodes reach the rank of the `K`-th match at the estimated match rate, as the post-filter route's list (`effort_curve` plans at `K / r` neighbours already) |
 
 Illegal combinations are rejected when the configuration is validated (for example `deferred`
 needs `all` / `distance` / `final_beam`; `match_aware` needs `heap`; `bitmap` needs a
@@ -299,7 +301,7 @@ below).
 
 Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n_out`, the
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
-`n_start`, the final list size, and for the planned exact path and the crossover the plan, the
+`n_start`, `n_late` (starts admitted after a post-filter search ended, `by_rate_late`), the final list size, and for the planned exact path and the crossover the plan, the
 probe's predicate evaluations, the estimated exact and nominal graph costs, the estimates of
 `A` and `M`, a guarded trial's fallback reason and its graph work (model ns). A trace mode records per-node events (offers with keys,
 predicate results and outcomes, expansions, answers), and a reference mode runs with a

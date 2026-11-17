@@ -210,6 +210,11 @@ pub enum PostfilterStarts {
     /// information about where they are, and the route is an unfiltered search, from the entry
     /// point the graph was built to be navigable from.
     ByRate,
+    /// `by_rate`, and a broad predicate's search, once it ends, offers the configured starts to
+    /// its list: a start closer to the query than the list's last entry (the search from the
+    /// global starts missed the query's neighbourhood) is admitted and the search continues
+    /// from it. A start the list does not admit costs one distance computation.
+    ByRateLate,
 }
 
 impl PostfilterStarts {
@@ -218,7 +223,10 @@ impl PostfilterStarts {
             "global" => Self::Global,
             "configured" => Self::Configured,
             "by_rate" => Self::ByRate,
-            _ => bail!("unknown postfilter_starts {s:?} (global, configured, by_rate)"),
+            "by_rate_late" => Self::ByRateLate,
+            _ => {
+                bail!("unknown postfilter_starts {s:?} (global, configured, by_rate, by_rate_late)")
+            }
         })
     }
 
@@ -227,8 +235,14 @@ impl PostfilterStarts {
         match self {
             Self::Global => false,
             Self::Configured => true,
-            Self::ByRate => rate < super::cost::BROAD_RATE,
+            Self::ByRate | Self::ByRateLate => rate < super::cost::BROAD_RATE,
         }
+    }
+
+    /// Whether a search from the global starts at estimated match rate `rate` offers the
+    /// configured starts once it ends.
+    pub fn late_at(self, rate: f64) -> bool {
+        self == Self::ByRateLate && !self.configured_at(rate)
     }
 }
 
@@ -238,6 +252,7 @@ impl fmt::Display for PostfilterStarts {
             Self::Global => "global",
             Self::Configured => "configured",
             Self::ByRate => "by_rate",
+            Self::ByRateLate => "by_rate_late",
         })
     }
 }
@@ -415,6 +430,14 @@ pub struct Kernel {
     /// The post-filter loop's beam packs each entry into one `u64` (`PackedBeam`, A7): the same
     /// beam semantics, one array to search and move per insertion. Changes no answer.
     pub packed_beam: bool,
+    /// The exact plan `df` counts its predicate evaluations at the lower confidence bound of the
+    /// match count (A7b): its answer bound saves checks only once `K` matches are found, so a
+    /// match count over-estimated past `K` must not make it look cheap. Off: the estimate.
+    pub df_lower: bool,
+    /// A cost crossover plans an inline graph search (`posting_l`) at a list size whose
+    /// evaluated nodes reach the rank of the `K`-th match at the estimated match rate, as the
+    /// post-filter route does (A7b); off: `L₀ × m(M̂ / n)` only.
+    pub inline_rank: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -480,6 +503,8 @@ impl Default for Kernel {
             row_reads: RowReads::Clause,
             row_prefetch: false,
             packed_beam: false,
+            df_lower: false,
+            inline_rank: false,
         }
     }
 }
@@ -988,6 +1013,20 @@ impl Kernel {
                     v => bail!("unknown packed_beam {v:?} (on, off)"),
                 }
             }
+            "df_evals" => {
+                self.df_lower = match value.trim() {
+                    "lower" => true,
+                    "estimate" => false,
+                    v => bail!("unknown df_evals {v:?} (estimate, lower)"),
+                }
+            }
+            "inline_rank" => {
+                self.inline_rank = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown inline_rank {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1181,6 +1220,12 @@ impl Kernel {
         }
         if self.packed_beam {
             j["packed_beam"] = json!("on");
+        }
+        if self.df_lower {
+            j["df_evals"] = json!("lower");
+        }
+        if self.inline_rank {
+            j["inline_rank"] = json!("on");
         }
         if self.row_reads != RowReads::Clause {
             j["row_reads"] = json!(self.row_reads.to_string());

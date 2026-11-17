@@ -109,76 +109,103 @@ impl Searcher {
             }
         }
         let nbrs = &mut self.nbrs;
+        let mut late = std::mem::take(&mut self.late);
         // Phase cycle counts of profiling builds (`profile::ENABLED`; constant-folded away
         // otherwise).
         let mut prof = [0u64; profile::SLOTS];
         let mut t = profile::now();
-        while let Some(n) = beam.pop() {
-            c.n_expand += 1;
-            if n >= n_data {
-                c.n_aux_expand += 1;
-            }
-            if self.row_prefetch {
-                // The next expansion's row (speculative: a closer neighbour of `n` may come first)
-                // loads while the distances of `n`'s neighbours are computed.
-                if let Some(next) = beam.peek_id() {
-                    graph.prefetch_row(next);
+        loop {
+            while let Some(n) = beam.pop() {
+                c.n_expand += 1;
+                if n >= n_data {
+                    c.n_aux_expand += 1;
                 }
-            }
-            nbrs.clear();
-            for &v in graph.neighbors(n) {
-                if !self.visited.test_and_set(v) {
-                    nbrs.push(v);
-                }
-            }
-            if profile::ENABLED {
-                let t1 = profile::now();
-                prof[profile::EXPAND] += t1 - t;
-                t = t1;
-            }
-            let len = nbrs.len();
-            c.n_dist += len as u64;
-            let la = LOOKAHEAD.min(len);
-            for &v in &nbrs[..la] {
-                diskann_vector::prefetch_hint_max::<4, _>(vectors.get(v));
-            }
-            for i in 0..len {
-                if i + la < len {
-                    diskann_vector::prefetch_hint_max::<4, _>(vectors.get(nbrs[i + la]));
-                }
-                let v = nbrs[i];
-                let d = T::squared_l2(qv, vectors.get(v));
-                let state = if v < n_data {
-                    if deferred {
-                        log.push(pack(d, v));
+                if self.row_prefetch {
+                    // The next expansion's row (speculative: a closer neighbour of `n` may come first)
+                    // loads while the distances of `n`'s neighbours are computed.
+                    if let Some(next) = beam.peek_id() {
+                        graph.prefetch_row(next);
                     }
-                    State::Unknown
-                } else {
-                    c.n_aux_dist += 1;
-                    State::Aux
-                };
-                let timed = profile::ENABLED && prof[profile::INSERTS] % profile::SAMPLE_EVERY == 0;
-                let t2 = if timed { profile::now() } else { 0 };
-                if let Inserted::At {
-                    evicted: Some(_), ..
-                } = beam.offer(fkey(d), v, state)
-                {
-                    c.n_evict += 1;
+                }
+                nbrs.clear();
+                for &v in graph.neighbors(n) {
+                    if !self.visited.test_and_set(v) {
+                        nbrs.push(v);
+                    }
                 }
                 if profile::ENABLED {
-                    if timed {
-                        prof[profile::INSERT_SAMPLED] += profile::now() - t2;
-                        prof[profile::SAMPLED] += 1;
+                    let t1 = profile::now();
+                    prof[profile::EXPAND] += t1 - t;
+                    t = t1;
+                }
+                let len = nbrs.len();
+                c.n_dist += len as u64;
+                let la = LOOKAHEAD.min(len);
+                for &v in &nbrs[..la] {
+                    diskann_vector::prefetch_hint_max::<4, _>(vectors.get(v));
+                }
+                for i in 0..len {
+                    if i + la < len {
+                        diskann_vector::prefetch_hint_max::<4, _>(vectors.get(nbrs[i + la]));
                     }
-                    prof[profile::INSERTS] += 1;
+                    let v = nbrs[i];
+                    let d = T::squared_l2(qv, vectors.get(v));
+                    let state = if v < n_data {
+                        if deferred {
+                            log.push(pack(d, v));
+                        }
+                        State::Unknown
+                    } else {
+                        c.n_aux_dist += 1;
+                        State::Aux
+                    };
+                    let timed =
+                        profile::ENABLED && prof[profile::INSERTS] % profile::SAMPLE_EVERY == 0;
+                    let t2 = if timed { profile::now() } else { 0 };
+                    if let Inserted::At {
+                        evicted: Some(_), ..
+                    } = beam.offer(fkey(d), v, state)
+                    {
+                        c.n_evict += 1;
+                    }
+                    if profile::ENABLED {
+                        if timed {
+                            prof[profile::INSERT_SAMPLED] += profile::now() - t2;
+                            prof[profile::SAMPLED] += 1;
+                        }
+                        prof[profile::INSERTS] += 1;
+                    }
+                }
+                if profile::ENABLED {
+                    let t1 = profile::now();
+                    prof[profile::NEIGHBOURS] += t1 - t;
+                    t = t1;
                 }
             }
-            if profile::ENABLED {
-                let t1 = profile::now();
-                prof[profile::NEIGHBOURS] += t1 - t;
-                t = t1;
+            // `by_rate_late`: the search ended; a configured start closer than the list's last
+            // entry means it missed the query's neighbourhood there: continue from it.
+            if late.is_empty() {
+                break;
             }
+            for &s in &late {
+                if s >= n_data || self.visited.test_and_set(s) {
+                    continue;
+                }
+                let d = T::squared_l2(qv, vectors.get(s));
+                c.n_dist += 1;
+                if deferred {
+                    log.push(pack(d, s));
+                }
+                if let Inserted::At { evicted, .. } = beam.offer(fkey(d), s, State::Unknown) {
+                    c.n_late += 1;
+                    if evicted.is_some() {
+                        c.n_evict += 1;
+                    }
+                }
+            }
+            late.clear();
         }
+        self.late = late;
         if profile::ENABLED {
             let t1 = profile::now();
             prof[profile::EXPAND] += t1 - t;

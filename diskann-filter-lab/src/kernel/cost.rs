@@ -1129,6 +1129,9 @@ pub struct PlanInputs<'a> {
     pub labels: &'a LabelStore,
     pub bitsets: Option<&'a LabelBitsets>,
     pub k: usize,
+    /// `df` counts its evaluations at the lower confidence bound of the match count
+    /// ([`Kernel::df_lower`](super::config::Kernel::df_lower)).
+    pub df_lower: bool,
 }
 
 /// Per-estimate terms shared by the plan costs of a query (computed once per
@@ -1137,6 +1140,9 @@ struct Ctx {
     n: f64,
     a: f64,
     m: f64,
+    /// The match count of `df`'s evaluations: `m`, or its lower confidence bound (`df_lower`,
+    /// estimates from a sample).
+    m_df: f64,
     k: f64,
     checks: bool,
     dist_m: f64,
@@ -1205,10 +1211,16 @@ impl PlanInputs<'_> {
         let n = e.n.max(1.0);
         let (a, m) = (e.a, e.m.min(e.a));
         let ra = a / n;
+        let m_df = if self.df_lower && !e.exact {
+            e.m_lo.clamp(0.0, m)
+        } else {
+            m
+        };
         Ctx {
             n,
             a,
             m,
+            m_df,
             k: self.k as f64,
             checks: self.q.n_clauses() > 1,
             dist_m: m * c.dist(m / n),
@@ -1252,6 +1264,8 @@ impl PlanInputs<'_> {
                 x.merge + pred + dist_m
             }
             ExactPlan::DistanceFirst => {
+                // The answer bound saves checks only once `K` matches are found.
+                let m = x.m_df;
                 let evals = if !x.checks {
                     0.0
                 } else if upper || m <= k {
@@ -1887,6 +1901,7 @@ mod tests {
             ..UnitCosts::default()
         };
         let pi = PlanInputs {
+            df_lower: false,
             q: &q,
             labels: &s,
             bitsets: Some(&bs),
@@ -2055,6 +2070,7 @@ mod tests {
                 q.split_static(&s, &bs, bs.theta(), false);
             }
             let pi = PlanInputs {
+                df_lower: false,
                 q: &q,
                 labels: &s,
                 bitsets: split.then_some(&bs),
@@ -2160,6 +2176,7 @@ mod tests {
             ..UnitCosts::default()
         };
         let pi = PlanInputs {
+            df_lower: false,
             q: &q,
             labels: &s,
             bitsets: None,
@@ -2198,6 +2215,66 @@ mod tests {
             PlanSet::parse("scan+df+gallop+bitmap+rowand").unwrap(),
             PlanSet::ALL
         );
+        q.clear_bits(&mut bits);
+    }
+
+    #[test]
+    fn df_lower_checks_every_candidate_below_k_matches() {
+        // `df_lower`: distance-first counts its evaluations at the lower confidence bound of the
+        // match count. With M̂ above K but its lower bound at or below K, every candidate may be
+        // checked (the answer bound needs K matches); exact estimates are unaffected.
+        let mut b = LabelStoreBuilder::new();
+        for i in 0..1000u32 {
+            let a = format!("a={}", i % 10);
+            let c = format!("c={}", i % 2);
+            b.push_point([("a", a.as_str()), ("c", c.as_str())])
+                .unwrap();
+        }
+        let s = b.finish().unwrap();
+        let mut pb = PredicateSetBuilder::new(&s);
+        pb.push(&[vec!["a=1", "a=2"], vec!["c=0"]]);
+        let preds = pb.finish();
+        let mut bits = vec![0u64; s.n_labels()];
+        let mut q = Compiled::new();
+        q.compile(&s, preds.get(0), Weights::Unit, None, &mut bits);
+        let c = UnitCosts::default();
+        let mut e = Estimates::from_bounds(&q, 1000);
+        (e.m, e.m_lo, e.m_hi) = (28.0, 5.0, 100.0);
+        let pi = PlanInputs {
+            q: &q,
+            labels: &s,
+            bitsets: None,
+            k: 10,
+            df_lower: false,
+        };
+        let lower = PlanInputs {
+            df_lower: true,
+            ..pi
+        };
+        let df =
+            |p: &PlanInputs, e: &Estimates| p.cost(&c, ExactPlan::DistanceFirst, e, false, false);
+        // At the estimate, distance-first saves checks; at the lower bound it checks every
+        // candidate, as with fewer than K matches.
+        let mut few = e.clone();
+        few.m = 5.0;
+        assert!(df(&pi, &e) < df(&pi, &few));
+        assert_eq!(df(&lower, &e), df(&pi, &few));
+        assert!(df(&lower, &e) > df(&pi, &e));
+        // Lower bound above K: savings at the lower bound, still fewer than at the estimate.
+        let mut many = e.clone();
+        (many.m, many.m_lo) = (80.0, 40.0);
+        assert!(df(&pi, &many) < df(&lower, &many));
+        assert!(df(&lower, &many) < df(&pi, &few));
+        // Exact estimates (the union enumerated) and the other plans: unchanged.
+        let mut exact = e.clone();
+        exact.exact = true;
+        assert_eq!(df(&lower, &exact), df(&pi, &exact));
+        for p in [ExactPlan::Scan, ExactPlan::Gallop, ExactPlan::Bitmap] {
+            assert_eq!(
+                lower.cost(&c, p, &e, false, false),
+                pi.cost(&c, p, &e, false, false)
+            );
+        }
         q.clear_bits(&mut bits);
     }
 }

@@ -144,6 +144,9 @@ pub struct Counters {
     pub n_match_seen: u64,
     /// Beam entries evicted by insertions.
     pub n_evict: u64,
+    /// Configured starts a post-filter search admitted to its list after it ended
+    /// (`postfilter_starts = by_rate_late`).
+    pub n_late: u64,
     /// Candidates examined by the exact path.
     pub n_exact_cand: u64,
     /// Answers returned.
@@ -224,12 +227,13 @@ impl Counters {
         self.n_two_hop += o.n_two_hop;
         self.n_match_seen += o.n_match_seen;
         self.n_evict += o.n_evict;
+        self.n_late += o.n_late;
         self.n_exact_cand += o.n_exact_cand;
         self.n_probe += o.n_probe;
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 37] = [
+    pub const NAMES: [&'static str; 38] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -267,10 +271,11 @@ impl Counters {
         "timing",
         "m_hi",
         "t_decide_ns",
+        "n_late",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 37] {
+    pub fn values(&self) -> [u64; 38] {
         [
             self.n_dist,
             self.n_pred,
@@ -309,6 +314,7 @@ impl Counters {
             u64::from(self.timing),
             self.m_hi,
             self.t_decide_ns,
+            self.n_late,
         ]
     }
 }
@@ -655,6 +661,8 @@ pub struct Searcher {
     mat: Materialized,
     answers: Answers,
     starts: Vec<u32>,
+    /// Starts a post-filter search offers once it ends (`by_rate_late`).
+    late: Vec<u32>,
     pilot: Vec<(u32, f32)>,
     pilot_d: Vec<f32>,
     sorted: Vec<f32>,
@@ -696,6 +704,7 @@ impl Searcher {
             mat: Materialized::new(n_data, dense),
             answers: Answers::new(),
             starts: Vec::new(),
+            late: Vec::new(),
             pilot: Vec::new(),
             pilot_d: Vec::new(),
             sorted: Vec::new(),
@@ -807,6 +816,7 @@ impl Searcher {
                     labels: ix.labels,
                     bitsets: exact_stat,
                     k,
+                    df_lower: kernel.df_lower,
                 }
                 .best(costs, kernel.exact_plans, &est, false, false);
                 record(&mut ctr, p, e, 0.0, &est);
@@ -860,6 +870,7 @@ impl Searcher {
                     q,
                     d.l,
                     d.postfilter_configured,
+                    d.postfilter_late,
                     exact_stat,
                     &mut ctr,
                     ids,
@@ -911,6 +922,7 @@ impl Searcher {
                             labels: ix.labels,
                             bitsets: exact_stat,
                             k,
+                            df_lower: kernel.df_lower,
                         }
                         .best(costs, kernel.exact_plans, &est, true, false);
                         ctr.plan = p as u64;
@@ -1018,6 +1030,7 @@ impl Searcher {
             labels: ix.labels,
             bitsets: exact_stat,
             k,
+            df_lower: kernel.df_lower,
         };
         // Obviously cheap exact queries: the exact path's upper cost is below the cheapest
         // graph search, which needs the probe first (its list size and estimates come from
@@ -1057,6 +1070,7 @@ impl Searcher {
                 l,
                 postfilter: false,
                 postfilter_configured: false,
+                postfilter_late: false,
             };
         }
         let est = self.estimates(plan, ix, exact_stat, ctr);
@@ -1065,6 +1079,7 @@ impl Searcher {
             labels: ix.labels,
             bitsets: exact_stat,
             k,
+            df_lower: kernel.df_lower,
         };
         let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
         let scale = match kernel.terminator {
@@ -1072,10 +1087,19 @@ impl Searcher {
             _ => 1.0,
         };
         let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
-        let l_plan = match kernel.terminator {
+        let mut l_plan = match kernel.terminator {
             Terminator::EffortCurve { cap } => effort_l(costs, l, k, rate, n, cap),
             _ => planned_l(l, &est, scale),
         };
+        // `inline_rank`: the inline search must evaluate as many nodes as the rank of the K-th
+        // match, as the post-filter route (`effort_curve` plans at `K / rate` neighbours already).
+        // Only with the exact path to compare against.
+        if kernel.inline_rank
+            && !graph_only
+            && matches!(kernel.terminator, Terminator::PostingL { .. })
+        {
+            l_plan = l_plan.max(rank_l(costs, k, rate, n));
+        }
         let mut g = costs.graph_cost(l_plan as f64, k, rate, kernel.laziness) + starts;
         // A search that, at the upper confidence bound of the match count, meets less than one
         // match is no alternative to the exact path, however cheap. Graph only has no exact
@@ -1110,6 +1134,7 @@ impl Searcher {
             l: l_run,
             postfilter,
             postfilter_configured: postfilter && kernel.postfilter_starts.configured_at(rate),
+            postfilter_late: postfilter && kernel.postfilter_starts.late_at(rate),
         }
     }
 
@@ -1128,6 +1153,7 @@ impl Searcher {
         q: &Query<'_, T>,
         l: usize,
         configured_starts: bool,
+        late_starts: bool,
         exact_stat: Option<&LabelBitsets>,
         ctr: &mut Counters,
         ids: &mut [u32],
@@ -1135,9 +1161,18 @@ impl Searcher {
     ) -> usize {
         ctr.route = Route::Postfilter;
         self.visited.clear();
+        self.late.clear();
         if configured_starts {
             self.select_starts(plan, ix, q, ctr);
         } else {
+            if late_starts {
+                // The configured starts other than the global ones, offered once the search ends.
+                self.select_starts(plan, ix, q, ctr);
+                let global = ix.global;
+                self.late
+                    .extend(self.starts.iter().copied().filter(|s| !global.contains(s)));
+                self.visited.clear();
+            }
             self.starts.clear();
             for &v in ix.global {
                 if !self.visited.test_and_set(v) {
@@ -1362,14 +1397,22 @@ fn postfilter_option(
     n: usize,
     starts: usize,
 ) -> (usize, f64) {
-    let rank = kth_match_rank(k, rate, Z);
-    if !rank.is_finite() {
+    if !kth_match_rank(k, rate, Z).is_finite() {
         return (l, f64::INFINITY);
     }
-    let l_need = costs.graph_l_for(rank).ceil().min(n as f64) as usize;
-    let l_pf = l_need.max(l).min(n.max(1));
+    let l_pf = rank_l(costs, k, rate, n).max(l).min(n.max(1));
     let starts = starts as f64 * costs.graph_dist_ns;
     (l_pf, costs.postfilter_cost(l_pf as f64, k, rate) + starts)
+}
+
+/// The list size at which a graph search evaluates as many nodes as the rank of the `K`-th match
+/// at match rate `rate` with `Z` standard deviations (at most `n`; `n` without matches).
+fn rank_l(costs: &UnitCosts, k: usize, rate: f64, n: usize) -> usize {
+    let rank = kth_match_rank(k, rate, Z);
+    if !rank.is_finite() {
+        return n.max(1);
+    }
+    (costs.graph_l_for(rank).ceil().min(n as f64) as usize).max(1)
 }
 
 /// Records the crossover's estimates in the counters.

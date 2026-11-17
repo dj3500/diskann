@@ -2043,3 +2043,244 @@ fn the_graph_crossover_never_takes_the_exact_path() {
         }
     }
 }
+
+#[test]
+fn by_rate_late_continues_from_closer_starts_and_never_loses() {
+    // `by_rate_late`: the search of a broad predicate starts from the global starts (as
+    // `by_rate`) and, once it ends, offers the configured starts. With none admitted (this
+    // connected fixture), the answers and expansions are `by_rate`'s; any admitted start makes
+    // it evaluate a superset of `by_rate`'s nodes, so its answers (the K nearest matches among
+    // the evaluated nodes) are at least as close.
+    use super::cost::UnitCosts;
+    let f = fixture(300, 47, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let plans: Vec<Plan> = ["by_rate_late", "by_rate"]
+        .into_iter()
+        .map(|s| Plan::new(&postfilter_route(s), &ix).unwrap())
+        .collect();
+    let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+    let mut broad = 0;
+    for q in 0..f.preds.len() {
+        for kk in [1, 10] {
+            for l in [1, 2, 20] {
+                let (out, ctr) = search_ix(&f, &ix, &mut st, &plans[0], q, l, kk);
+                let (want, wctr) = search_ix(&f, &ix, &mut st, &plans[1], q, l, kk);
+                assert_eq!(ctr.route, wctr.route, "q={q} K={kk} L={l}");
+                if ctr.route != Route::Postfilter {
+                    continue;
+                }
+                assert!(out.len() >= want.len(), "q={q} K={kk} L={l}");
+                for (i, (a, b)) in out.iter().zip(&want).enumerate() {
+                    assert!(a.0 <= b.0, "q={q} K={kk} L={l}: answer {i} {a:?} vs {b:?}");
+                }
+                if ctr.n_late == 0 {
+                    assert_eq!(ctr.n_expand, wctr.n_expand, "q={q} K={kk} L={l}");
+                    if ctr.fallback == 0 {
+                        assert_eq!(out, want, "q={q} K={kk} L={l}");
+                    }
+                }
+                if ctr.n_dist > wctr.n_dist {
+                    broad += 1;
+                }
+            }
+        }
+    }
+    assert!(broad > 0, "no broad predicate offered its starts");
+}
+
+fn postfilter_route(starts: &str) -> Kernel {
+    khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", "always"),
+        ("postfilter_starts", starts),
+    ])
+}
+
+#[test]
+fn by_rate_late_rescues_a_search_that_missed_the_query() {
+    // Two clusters without edges between them; the global start in the first. A query in the
+    // second: the search from the global start never leaves the first cluster; the configured
+    // (label) start in the second cluster is closer than its whole list, so `by_rate_late`
+    // continues from it and returns the second cluster's points. A query in the first cluster:
+    // no start admitted, the `by_rate` answers.
+    use super::cost::UnitCosts;
+    let (n, half) = (200usize, 100usize);
+    let mut rng = Lcg(5);
+    let data: Vec<u8> = (0..n * DIM)
+        .map(|i| {
+            let lo = if i / DIM < half { 0 } else { 24 };
+            lo + rng.below(8) as u8
+        })
+        .collect();
+    let base = Matrix::from_slice(&data, n, DIM);
+    let queries = Matrix::from_slice(&[[28u8; DIM], [4u8; DIM]].concat(), 2, DIM);
+    let mut graph = Graph::new(
+        n,
+        12,
+        AuxNodes::new(Vec::new(), &Matrix::<u8>::zeros(0, DIM)).unwrap(),
+    )
+    .unwrap();
+    for v in 0..n {
+        let range = if v < half { 0..half } else { half..n };
+        let mut cand: Vec<(f32, u32)> = range
+            .clone()
+            .filter(|&u| u != v)
+            .map(|u| (u8::squared_l2(base.row(v), base.row(u)), u as u32))
+            .collect();
+        cand.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut nbrs: Vec<u32> = cand.iter().take(8).map(|c| c.1).collect();
+        let next = (if v + 1 == range.end {
+            range.start
+        } else {
+            v + 1
+        }) as u32;
+        if !nbrs.contains(&next) {
+            nbrs.push(next);
+        }
+        graph.set_neighbors(v as u32, &nbrs).unwrap();
+    }
+    graph.set_starts(vec![0]).unwrap();
+    let mut b = LabelStoreBuilder::new();
+    for i in 0..n {
+        let c = format!("c={}", i % 2);
+        b.push_point([("x", "x=1"), ("c", c.as_str())]).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    let mut starts = Starts::new(&graph);
+    let x = labels.name_index()["x=1"];
+    starts.set_label_starts(&labels, &[(x, 150)]).unwrap();
+    let bitsets = LabelBitsets::build(&labels, 1);
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        graph: &graph,
+        vectors: graph.vectors(&base).unwrap(),
+        labels: &labels,
+        global: graph.starts(),
+        label_starts: Some(&starts),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 1.0,
+        bitsets: Some(&bitsets),
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+    };
+    let plans: Vec<Plan> = ["by_rate_late", "by_rate"]
+        .into_iter()
+        .map(|s| Plan::new(&postfilter_route(s), &ix).unwrap())
+        .collect();
+    let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+    let run = |st: &mut Searcher, p: &Plan, qi: usize| {
+        let mut ids = vec![0u32; 10];
+        let mut d = vec![0f32; 10];
+        let q = Query {
+            vector: queries.row(qi),
+            cnf: preds.get(qi),
+            view: None,
+        };
+        let ctr = st.search(p, &ix, &q, 10, &mut ids, &mut d, None);
+        (ids[..ctr.n_out as usize].to_vec(), ctr)
+    };
+    // The query in the second cluster.
+    let (late, lctr) = run(&mut st, &plans[0], 0);
+    let (plain, pctr) = run(&mut st, &plans[1], 0);
+    assert_eq!(
+        (lctr.route, pctr.route),
+        (Route::Postfilter, Route::Postfilter)
+    );
+    assert!(plain.iter().all(|&v| (v as usize) < half), "{plain:?}");
+    assert_eq!(late.len(), 10);
+    assert!(late.iter().all(|&v| (v as usize) >= half), "{late:?}");
+    assert!(lctr.n_late >= 1 && lctr.n_expand > pctr.n_expand);
+    // The query in the first cluster.
+    let (late, lctr) = run(&mut st, &plans[0], 1);
+    let (plain, _) = run(&mut st, &plans[1], 1);
+    assert_eq!(lctr.n_late, 0);
+    assert_eq!(late, plain);
+}
+
+#[test]
+fn inline_rank_plans_the_inline_search_at_the_kth_match_rank() {
+    // `inline_rank`: an inline graph search (`posting_l`) is planned at a list size whose
+    // evaluated nodes reach the K-th match's rank at the estimated match rate (as the post-filter
+    // route); without it, `L₀ × m(M̂ / n)` only. The exact path is priced out here, so every query
+    // takes the inline search.
+    use super::cost::{kth_match_rank, UnitCosts, Z};
+    let f = fixture(300, 47, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let route = |rank: &'static str| {
+        khpad(&[
+            ("exact", "planned"),
+            ("crossover", "cost"),
+            ("estimates", "sketch"),
+            ("terminator", "posting_l(4)"),
+            ("laziness", "heap_bound"),
+            ("inline_rank", rank),
+        ])
+    };
+    let plans: Vec<Plan> = ["on", "off"]
+        .into_iter()
+        .map(|s| Plan::new(&route(s), &ix).unwrap())
+        .collect();
+    let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+    let mut raised = 0;
+    for q in 0..f.preds.len() {
+        for kk in [1, 10] {
+            let (_, ctr) = search_ix(&f, &ix, &mut st, &plans[0], q, 4, kk);
+            let (_, off) = search_ix(&f, &ix, &mut st, &plans[1], q, 4, kk);
+            if ctr.route != Route::Graph || off.route != Route::Graph || ctr.m_hat == 0 {
+                continue;
+            }
+            let rate = ctr.m_hat as f64 / 300.0;
+            let need = costs
+                .graph_l_for(kth_match_rank(kk, rate, Z))
+                .ceil()
+                .min(300.0) as u64;
+            assert!(ctr.final_l + 1 >= need, "q={q} K={kk}");
+            assert!(ctr.final_l >= off.final_l, "q={q} K={kk}");
+            if ctr.final_l > off.final_l {
+                raised += 1;
+            }
+        }
+    }
+    assert!(raised > 0, "no list raised");
+}

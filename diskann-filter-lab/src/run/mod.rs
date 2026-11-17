@@ -778,6 +778,7 @@ fn counter_docs() -> Value {
         "n_aux_expand": "expansions of auxiliary nodes",
         "n_two_hop": "nodes inserted through the second hop",
         "n_evict": "beam entries evicted",
+        "n_late": "configured starts a post-filter search admitted after it ended (by_rate_late)",
         "n_exact_cand": "exact-path candidates",
         "n_start": "starts selected (deduplicated)",
         "final_L": "expandable beam size at the end (adaptive L, or the planned posting_l)",

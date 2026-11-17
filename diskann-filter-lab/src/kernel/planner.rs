@@ -282,6 +282,9 @@ pub struct Decision {
     pub postfilter: bool,
     /// The post-filter search starts from the configured starts (else the global ones).
     pub postfilter_configured: bool,
+    /// A post-filter search from the global starts offers the configured starts once it ends
+    /// (`postfilter_starts = by_rate_late`).
+    pub postfilter_late: bool,
 }
 
 #[cfg(test)]
