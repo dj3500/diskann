@@ -920,6 +920,72 @@ fn aux_only_expands_routers_only() {
 }
 
 #[test]
+fn the_tree_route_serves_tree_eligible_queries() {
+    // A router (id 5) over the members 0, 2 and 4 of `x=1` is that label's only start;
+    // `y=1` (members 1 and 3) starts at its member 1; the global start is point 0.
+    let rows: &[&[&str]] = &[&["x=1"], &["y=1"], &["x=1"], &["y=1"], &["x=1"]];
+    let (base, mut g, labels) = line(rows, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    g.set_starts(vec![0]).unwrap();
+    let id = |s: &str| labels.name_index()[s];
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(id("x=1"), 5), (id("y=1"), 1)])
+        .unwrap();
+    let ix = Index {
+        graph: &g,
+        vectors: g.vectors(&base).unwrap(),
+        labels: &labels,
+        global: &[0],
+        label_starts: Some(&st),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 0.5,
+        bitsets: None,
+        costs: None,
+        sketches: None,
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    pb.push(&[vec!["y=1"]]);
+    let preds = pb.finish();
+    for (route, edits) in [
+        (Route::Tree, &[("tree_route", "row_scan")][..]),
+        (Route::Graph, &[][..]),
+    ] {
+        let k = kernel(
+            &[
+                &[("starts", "label(c*)+global"), ("collector", "heap")][..],
+                edits,
+            ]
+            .concat(),
+        );
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
+        let mut run = |qi: usize, ids: &mut [u32], d: &mut [f32]| {
+            let q = Query {
+                vector: &[3.2f32],
+                cnf: preds.get(qi),
+                view: None,
+            };
+            s.search(&plan, &ix, &q, 4, ids, d, None)
+        };
+        let ctr = run(0, &mut ids, &mut d);
+        assert_eq!(ids, [4, 2, 0], "{route:?}");
+        assert_eq!(ctr.route, route);
+        if route == Route::Tree {
+            // Only the router is expanded; its members are checked, then measured.
+            assert_eq!((ctr.n_expand, ctr.n_aux_expand, ctr.n_dist), (1, 1, 4));
+        }
+        // `y=1` has a data-point start: not tree-eligible, the configured search runs.
+        let ctr = run(1, &mut ids[..2], &mut d[..2]);
+        assert_eq!(ids[..2], [3, 1]);
+        assert_eq!(ctr.route, Route::Graph);
+    }
+}
+
+#[test]
 fn many_clauses_use_mode_2() {
     let mut b = LabelStoreBuilder::new();
     let names: Vec<String> = (0..70).map(|i| format!("c{i}=1")).collect();
