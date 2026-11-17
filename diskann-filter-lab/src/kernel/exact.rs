@@ -32,7 +32,12 @@
 //!   empty), then distances;
 //! - `rowand`: the words holding members of `union(c*)`, each ANDed with the residual
 //!   clauses word by word (bitset words; galloping cursors in the postings of labels without
-//!   a bitset; [`Materialized::build_rowand`]), enumerated, then distances.
+//!   a bitset; [`Materialized::build_rowand`]), enumerated, then distances;
+//! - `pair`: the candidate lists of the query's clause pair from the combination postings
+//!   ([`crate::pairs::Cover`]: stored joint postings, and the smaller label posting of every
+//!   label pair not stored) merged into distinct candidates, checked on the clauses they are
+//!   not known to satisfy (the other clauses for joint postings only, every clause otherwise),
+//!   then distances.
 //!
 //! Every plan processes *every* candidate, so the answers are the exact top-K. With a
 //! *seeded* answer heap (the graph search's answers, after a fallback) the plans keep the
@@ -47,7 +52,7 @@ use super::{
     materialize::{merge_distinct, Materialized},
     search::{tic, toc, Counters, EvalMode},
 };
-use crate::{graph::NodeVectors, vectors::Element};
+use crate::{graph::NodeVectors, pairs::ListRef, vectors::Element};
 
 /// Exact-path role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -260,6 +265,39 @@ pub(crate) fn filter<P: Eval>(
     ctr.n_pred += n as u64;
 }
 
+/// The candidates of `cands` that satisfy the clauses of `mask` (see [`Eval::masked`]), into
+/// `out` (row offsets and rows prefetched ahead).
+#[inline]
+pub(crate) fn filter_masked<P: Eval>(
+    cx: &EvalCtx<'_>,
+    cands: &[u32],
+    mask: u64,
+    out: &mut Vec<u32>,
+    ctr: &mut Counters,
+) {
+    out.clear();
+    let n = cands.len();
+    for &v in &cands[..n.min(AHEAD_OFFSETS)] {
+        P::prefetch_offsets(cx, v);
+    }
+    for &v in &cands[..n.min(AHEAD_ROWS)] {
+        P::prefetch(cx, v);
+    }
+    for i in 0..n {
+        if i + AHEAD_OFFSETS < n {
+            P::prefetch_offsets(cx, cands[i + AHEAD_OFFSETS]);
+        }
+        if i + AHEAD_ROWS < n {
+            P::prefetch(cx, cands[i + AHEAD_ROWS]);
+        }
+        let v = cands[i];
+        if P::masked(cx, v, mask) {
+            out.push(v);
+        }
+    }
+    ctr.n_pred += n as u64;
+}
+
 /// Distance first: every candidate's distance; the predicate only inside the answer bound.
 #[inline]
 #[expect(
@@ -422,6 +460,50 @@ fn planned<T: Element, P: Eval>(
             let t = tic(ctr);
             distances(&mat.matches, vectors, query, answers, seeded, ctr);
             toc(t, &mut ctr.t_dist_ns);
+        }
+        ExactPlan::Pair => {
+            let (pairs, cover) = match cx.pairs {
+                Some((p, c)) if c.valid => (p, c),
+                _ => panic!("the pair plan needs the combination postings and a clause pair"),
+            };
+            let t = tic(ctr);
+            let lists = &cover.lists;
+            let list = |i: usize| -> &[u32] {
+                match lists[i] {
+                    ListRef::Pair(s, e) => pairs.list(s, e),
+                    ListRef::Label(l) => cx.labels.postings(l),
+                }
+            };
+            let single = (lists.len() == 1).then(|| list(0));
+            if single.is_none() {
+                mat.cands.clear();
+                let cands = &mut mat.cands;
+                merge_distinct(lists.len(), list, &mut mat.heap, &mut mat.pos, |p| {
+                    cands.push(p);
+                    true
+                });
+            }
+            let cands: &[u32] = single.unwrap_or(&mat.cands);
+            toc(t, &mut ctr.t_cand_ns);
+            ctr.n_exact_cand += cands.len() as u64;
+            let full = cx.q.full_mask();
+            let mask = if cover.exact {
+                full & !(1u64 << cover.i) & !(1u64 << cover.j)
+            } else {
+                full
+            };
+            if mask != 0 || !cx.q.uses_bits() {
+                let t = tic(ctr);
+                filter_masked::<P>(cx, cands, mask, &mut mat.matches, ctr);
+                toc(t, &mut ctr.t_check_ns);
+                let t = tic(ctr);
+                distances(&mat.matches, vectors, query, answers, seeded, ctr);
+                toc(t, &mut ctr.t_dist_ns);
+            } else {
+                let t = tic(ctr);
+                distances(cands, vectors, query, answers, seeded, ctr);
+                toc(t, &mut ctr.t_dist_ns);
+            }
         }
         ExactPlan::RowAnd => {
             let t = tic(ctr);

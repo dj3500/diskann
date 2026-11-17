@@ -23,6 +23,7 @@ pub mod jsonl;
 pub mod kernel;
 pub mod label_starts;
 pub mod labels;
+pub mod pairs;
 pub mod parallel;
 pub mod permute;
 pub mod predicate;

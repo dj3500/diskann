@@ -197,6 +197,7 @@ fn presets_reproduce_upstream_search() {
         bitsets: None,
         costs: None,
         sketches: None,
+        pairs: None,
     };
     let plan = |p: &str| Plan::new(&Preset::parse(p).unwrap().kernel(), &ix).unwrap();
     let postfilter = plan("postfilter");

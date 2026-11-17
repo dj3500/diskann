@@ -19,6 +19,7 @@ use diskann_filter_lab::{
     gt::{self, DiskannTruth, GroundTruth},
     jsonl, label_starts, labels,
     labels::LabelStore,
+    pairs::{Cover, PairIndex},
     predicate::{self, PredicateSet, PredicateSetBuilder},
     run,
     sketches::{self, LabelSketches},
@@ -63,6 +64,10 @@ enum Command {
     /// estimates of the cost crossover).
     #[command(subcommand)]
     Sketches(SketchesCommand),
+    /// Combination postings (`pairs.flab`: joint postings of selected label pairs within a
+    /// memory budget, for the exact path's `pair` plan).
+    #[command(subcommand)]
+    Pairs(PairsCommand),
     /// Measure the unit costs of the cost model on this machine and dataset (JSON).
     Calibrate(CalibrateArgs),
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
@@ -356,6 +361,29 @@ enum SketchesCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum PairsCommand {
+    /// Select and build the combination postings for each budget: writes `pairs-b<pct>.flab`
+    /// and `pairs-b<pct>.json` (sizes, build time, and the coverage of the `--report` queries).
+    Build {
+        /// The label store.
+        #[arg(long)]
+        labels: PathBuf,
+        /// Budgets as fractions of the label postings' bytes (comma-separated list).
+        #[arg(short, long, value_delimiter = ',', required = true)]
+        budget: Vec<f64>,
+        #[arg(short, long, default_value_t = 4)]
+        threads: usize,
+        /// Output directory (created if needed).
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Predicate files whose coverage is reported (queries with a covered clause pair and
+        /// their candidates against the smallest clause bound).
+        #[arg(long, value_delimiter = ',')]
+        report: Vec<PathBuf>,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum OrderArg {
     /// Unchanged ids (a copy in the lab's formats).
@@ -500,6 +528,7 @@ fn main() -> Result<()> {
         }
         Command::Bitsets(c) => bitsets_command(c),
         Command::Sketches(c) => sketches_command(c),
+        Command::Pairs(c) => pairs_command(c),
         Command::Calibrate(a) => {
             let opts = calibrate::Options {
                 reps: a.reps,
@@ -1365,6 +1394,121 @@ fn bitsets_command(c: BitsetsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn pairs_command(c: PairsCommand) -> Result<()> {
+    match c {
+        PairsCommand::Build {
+            labels,
+            budget,
+            threads,
+            out_dir,
+            report,
+        } => {
+            let store = LabelStore::read(&labels)?;
+            std::fs::create_dir_all(&out_dir)?;
+            let postings = 4 * store.n_entries() as u64;
+            let preds = report
+                .iter()
+                .map(|p| {
+                    let ps = PredicateSet::read(p)?;
+                    ps.check_dictionary(&store)?;
+                    Ok((p.clone(), ps))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for f in budget {
+                ensure!(f > 0.0, "budgets must be positive");
+                let t = Instant::now();
+                let (ix, stats) = PairIndex::build(&store, (f * postings as f64) as u64, threads);
+                let build_s = secs(t);
+                let tag = format!("{}", (f * 1000.0).round() as u64);
+                let out = out_dir.join(format!("pairs-b{tag}.flab"));
+                ix.write(&out)?;
+                ensure!(
+                    PairIndex::read(&out)? == ix,
+                    "{} does not read back identically",
+                    out.display()
+                );
+                ix.check_sample(&store, 97)?;
+                let mut cov = Vec::new();
+                for (path, ps) in &preds {
+                    cov.push(pair_coverage(&ix, &store, ps, path));
+                }
+                let report = json!({
+                    "labels": labels,
+                    "n_points": store.n_points(),
+                    "n_labels": store.n_labels(),
+                    "budget_fraction": f,
+                    "stats": stats,
+                    "build_s": build_s,
+                    "threads": threads,
+                    "coverage": cov,
+                    "output": out,
+                });
+                std::fs::write(
+                    out_dir.join(format!("pairs-b{tag}.json")),
+                    serde_json::to_string_pretty(&report)? + "\n",
+                )?;
+                println!(
+                    "budget {f}: T {} ({} big labels, matrix {:.1} MiB), {} co-occurring big pairs, {} stored ({} entries), {:.1} MiB = {:.1} % of the postings; {build_s:.1} s -> {}",
+                    stats.t_big,
+                    stats.n_big,
+                    stats.matrix_bytes as f64 / (1u64 << 20) as f64,
+                    stats.cooc_pairs,
+                    stats.stored_pairs,
+                    stats.stored_entries,
+                    stats.bytes as f64 / (1u64 << 20) as f64,
+                    100.0 * stats.bytes as f64 / postings.max(1) as f64,
+                    out.display()
+                );
+                for c in &cov {
+                    println!("  {c}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Coverage of a predicate set by combination postings: queries with at least two clauses, and
+/// among them those whose best clause pair has fewer candidates than the smallest clause bound
+/// (by ×2 and ×10), with exact covers, and the median ratio bound / candidates.
+fn pair_coverage(ix: &PairIndex, store: &LabelStore, ps: &PredicateSet, path: &Path) -> Value {
+    let mut cov = Cover::default();
+    let (mut multi, mut exact, mut x2, mut x10) = (0usize, 0usize, 0usize, 0usize);
+    let mut ratios = Vec::new();
+    for q in 0..ps.len() {
+        let cnf = ps.get(q);
+        if cnf.n_clauses() < 2 || cnf.is_unsatisfiable() {
+            continue;
+        }
+        multi += 1;
+        let bound = (0..cnf.n_clauses())
+            .map(|i| cnf.clause(i).iter().map(|&l| store.posting_len(l) as u64).sum::<u64>())
+            .min()
+            .unwrap_or(0);
+        if ix.cover(cnf.n_clauses(), |i| cnf.clause(i), |l| store.posting_len(l), &mut cov) {
+            exact += usize::from(cov.exact);
+            let r = bound as f64 / (cov.entries.max(1)) as f64;
+            x2 += usize::from(r >= 2.0);
+            x10 += usize::from(r >= 10.0);
+            ratios.push(r);
+        } else {
+            ratios.push(1.0);
+        }
+    }
+    ratios.sort_unstable_by(f64::total_cmp);
+    let q = |f: f64| ratios.get(((ratios.len() as f64 - 1.0) * f) as usize).copied().unwrap_or(1.0);
+    json!({
+        "predicates": path,
+        "multi_clause": multi,
+        "exact_covers": exact,
+        "saves_x2": x2,
+        "saves_x10": x10,
+        "ratio_p50": q(0.5),
+        "ratio_p90": q(0.9),
+        "ratio_p99": q(0.99),
+    })
 }
 
 fn sketches_command(c: SketchesCommand) -> Result<()> {
