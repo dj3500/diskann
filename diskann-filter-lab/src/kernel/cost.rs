@@ -1586,6 +1586,86 @@ mod tests {
         assert!(c.validate().is_err());
     }
 
+    /// Planning time with and without `rowand` (`cargo test --release -- --ignored --nocapture
+    /// planning_time`): a 4-clause query with labels with and without a bitset.
+    #[test]
+    #[ignore = "timing, run by hand"]
+    fn planning_time() {
+        let mut b = LabelStoreBuilder::new();
+        for i in 0..100_000u32 {
+            let a = format!("a={}", i % 7);
+            let c = format!("c={}", (i / 7) % 50);
+            let d = format!("d={}", (i / 350) % 400);
+            b.push_point([("a", a.as_str()), ("c", c.as_str()), ("d", d.as_str())])
+                .unwrap();
+        }
+        let s = b.finish().unwrap();
+        let mut pb = PredicateSetBuilder::new(&s);
+        pb.push(&[
+            vec!["d=1", "d=2"],
+            vec!["a=1", "a=2", "c=7"],
+            vec!["c=3", "c=4", "d=9", "d=10"],
+            vec!["a=3", "d=11", "d=12", "d=13"],
+        ]);
+        let preds = pb.finish();
+        let mut bits = vec![0u64; s.n_labels()];
+        let mut q = Compiled::new();
+        q.compile(&s, preds.get(0), Weights::Unit, None, &mut bits);
+        let bs = LabelBitsets::build(&s, 100_000u64.div_ceil(64));
+        q.split_static(&s, &bs, bs.theta(), false);
+        let e = Estimates::from_bounds(&q, 100_000);
+        let n = 6;
+        let c = UnitCosts {
+            enum_word_ns: 0.35,
+            enum_bit_ns: 0.1,
+            enum_nz_ns: 13.0,
+            check_base_ns: vec![12.0; n],
+            check_word_ns: vec![3.0; n],
+            check_prefetch_ns: vec![40.0; n],
+            check_row_ns: vec![60.0; n],
+            gallop_gap: vec![1.0, 16.0, 256.0, 4096.0],
+            gallop_gap_ns: vec![10.0, 12.0, 30.0, 70.0],
+            ..UnitCosts::default()
+        };
+        let pi = PlanInputs {
+            q: &q,
+            labels: &s,
+            bitsets: Some(&bs),
+            k: 10,
+        };
+        let four = PlanSet::parse("scan+df+gallop+bitmap").unwrap();
+        for (name, set) in [
+            ("4 plans", four),
+            ("5 plans", PlanSet::ALL),
+            ("4 plans", four),
+        ] {
+            let t = std::time::Instant::now();
+            let mut acc = 0.0;
+            for _ in 0..200_000 {
+                acc +=
+                    std::hint::black_box(pi.best(&c, set, std::hint::black_box(&e), false, false))
+                        .1;
+            }
+            let ns = t.elapsed().as_nanos() as f64 / 200_000.0;
+            println!("{name}: {ns:.0} ns per best() ({acc:.0})");
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..200_000 {
+            std::hint::black_box(pi.cost(
+                &c,
+                ExactPlan::RowAnd,
+                std::hint::black_box(&e),
+                false,
+                false,
+            ));
+        }
+        println!(
+            "rowand cost: {:.0} ns",
+            t.elapsed().as_nanos() as f64 / 200_000.0
+        );
+        q.clear_bits(&mut bits);
+    }
+
     #[test]
     fn plan_costs_follow_the_estimates() {
         let mut b = LabelStoreBuilder::new();
