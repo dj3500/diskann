@@ -204,14 +204,21 @@ exact path, a cost model (`kernel::cost`) chooses the cheapest of five plans fro
 sizes, the estimated union of the smallest clause `A` and match count `M`, and calibrated unit
 costs: `scan` (candidates of the smallest clause, predicate first), `df` (distances first; the
 predicate only within the answer heap's K-th distance), `gallop` (galloping intersection of
-the clauses' postings), `bitmap` (a dense match bitmap built with the static bitsets) and
+the clauses' postings), `bitmap` (a dense match bitmap built with the static bitsets, one
+L1-sized block of 1,024 words at a time, enumerated per block; a block skips its remaining
+clauses once it is empty; batch A6b: full-width scratch bitmaps, 10 MB of written lines per
+query at 40M, slowed the next queries) and
 `rowand` (batch A6: only the bitmap words that hold members of the smallest clause, ANDed
 clause by clause with the other clauses' bitset words, prefetched, and with the postings of
 their labels without a bitset through galloping cursors; no memory beyond one bitmap of
 scratch). The bitmap's enumeration is priced per empty word, non-empty word and set bit (A6; older
 calibrations price every word as if 10 % of its bits were set, which made `bitmap` look 5 to
 20 times dearer than it is on selective queries), and `rowand` is a candidate only with those
-costs, so older calibrations reproduce the earlier choices.
+costs, so older calibrations reproduce the earlier choices. The planner (`PlanInputs::best`)
+computes the per-query terms once for all plans, interpolates with cached grid logarithms
+(`UnitCosts::prepare`) and skips `df` / `gallop` when a cheap lower bound already loses: the
+same costs and choices, ≈ 0.39 µs per call for a 4-clause query with five plans (0.87 µs with
+four plans before A6b; ignored test `planning_time`).
 Candidate rows and vectors are prefetched in a software pipeline, and checks use the static
 bitsets when the run has them. Every candidate of `scan` and `df` (and every point of the probe
 below) is a member of `union(c*)`, so with `exact_checks = "residual"` only the residual
