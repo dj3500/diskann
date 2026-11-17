@@ -22,7 +22,7 @@
 //!                 S_j = A·survival_j, probes(s, p) = gallop·s·(1 + log2(1 + p/s))
 //! bitmap          Σ_j (n/64 words per bitset label, |post ℓ| scatters otherwise, n/64 per
 //!                 clause fill and AND) + n/64 enumerated words + M·dist(M/n)
-//! rowand          words(c*) + W·(base(ρ) + Σ_{j≥1} reach_j·hot_j·word(ρ))
+//! rowand          words(c*) + Σ_{j≥1} W·reach_j·(base(ρ) + hot_j·word(ρ))
 //!                 + Σ_{j≥1} Σ_{ℓ rare in c_j} probes(min(W·reach_j, P_j), |post ℓ|) + M·enum_bit
 //!                 + M·dist(M/n)
 //! ```
@@ -38,10 +38,11 @@
 //! residual clauses (`hot_j` bitset words per word reached, priced like a member check's words
 //! with the shape-resolved curves; labels without a bitset by galloping cursors over their
 //! postings, moved only when a word reaches the clause's next entry: at most
-//! `min(W·reach_j, P_j)` times) and stops at the first clause that clears it (`reach_j`: the
-//! chance that a word of `A/W` members survives clauses `1..j`); it is a candidate only with
-//! the A6 enumeration costs. The candidates checked by `scan` and `distance_first` are members of
-//! `union(c*)`: `pred` is the cost of checking a member (the residual clauses). Calibrations
+//! `min(W·reach_j, P_j)` times, priced as labels of the clause's mean posting length) and
+//! stops at the first clause that clears it (`reach_j`: the chance that a word of `A/W`
+//! members survives clauses `1..j`); it is a candidate only with the A6 enumeration costs.
+//! The candidates checked by `scan` and `distance_first` are members of `union(c*)`: `pred`
+//! is the cost of checking a member (the residual clauses). Calibrations
 //! with the shape-resolved curves (batch A1b) price it from the query's residual clauses:
 //! `base(ρ) + words·word(ρ) + prefetch·pf(ρ) + reads·row(ρ)`, with the bitset words probed and
 //! the row reads expected from the clauses' labels and the survival estimates
@@ -1160,8 +1161,8 @@ impl PlanInputs<'_> {
         } else {
             (c.pred_member(false, rho), 0.0)
         };
-        cost += w * base;
-        // `reach`: the fraction of the visited words that reach clause `j`.
+        // `reach`: the fraction of the visited words that reach clause `j` (one pass over the
+        // surviving words per residual clause).
         let (mut reach, mut prev) = (1.0, 1.0);
         for j in 1..nc {
             let cur = if upper {
@@ -1187,15 +1188,15 @@ impl PlanInputs<'_> {
                 s * (1.0 - p) + s.min(1.0) * p
             };
             let at = w * reach;
-            cost += at * reads * probe;
+            cost += at * (base + reads * probe);
             // The cursors of the labels without a bitset move at most once per entry or word
-            // reached.
-            let events = at.min(posts(j));
-            if events >= 1.0 {
-                for &l in rare(j) {
-                    let len = self.labels.posting_len(l) as f64;
-                    cost += c.gallop(len / events) * events * (1.0 + (1.0 + len / events).log2());
-                }
+            // reached; priced as `r` labels of the clause's mean length (an upper bound of the
+            // per-label sum: the steps are concave in the length; one evaluation per clause).
+            let (r, pj) = (rare(j).len() as f64, posts(j));
+            let events = at.min(pj);
+            if r > 0.0 && events >= 1.0 {
+                let gap = pj / (r * events);
+                cost += r * c.gallop(gap) * events * (1.0 + (1.0 + gap).log2());
             }
             reach *= if upper { 1.0 } else { p };
             prev = cur;

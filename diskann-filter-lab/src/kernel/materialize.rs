@@ -297,11 +297,9 @@ impl Materialized {
             let (hs, rs) = (hot(j), rare(j));
             cursors.clear();
             cursors.resize(rs.len(), 0);
-            let mut next = rs
-                .iter()
-                .filter_map(|&l| labels.postings(l).first().map(|&p| p >> 6))
-                .min()
-                .unwrap_or(u32::MAX);
+            // Lower bound of the next word holding an entry of `rs` (0: not known before the
+            // first word that needs them).
+            let mut next = 0u32;
             let ahead = &hs[..hs.len().min(RW_PREFETCH)];
             let mut kept = 0;
             for i in 0..len {
