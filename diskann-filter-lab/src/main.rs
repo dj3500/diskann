@@ -75,6 +75,10 @@ enum Command {
     /// permuted copies of the base, labels, ground truth and sketches (links to the query
     /// files) and of the graph and its start table.
     Permute(PermuteArgs),
+    /// Navigation diagnostics of graph-only search (reachability of the answers under the
+    /// kernel's traversal models, missed-answer classes, oracle and per-component entries,
+    /// work decomposition, block statistics; untimed).
+    Diag(diskann_filter_lab::diag::DiagArgs),
     /// Summarize a lab file (labels, predicates, ground truth, graph, starts) or a vector file.
     Info {
         path: PathBuf,
@@ -484,6 +488,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Run(args) => run_experiment(&args),
         Command::Build(args) => diskann_filter_lab::build::cli::run(&args),
+        Command::Diag(args) => diskann_filter_lab::diag::run(&args),
         Command::Convert(c) => convert(c),
         Command::Gt(args) => match dtype(args.dtype, &args.base)? {
             DType::U8 => run_gt::<u8>(&args),
