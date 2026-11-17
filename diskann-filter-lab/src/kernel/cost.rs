@@ -1151,12 +1151,13 @@ struct Ctx {
 /// cost by more than the rounding of either evaluation.
 const SKIP_MARGIN: f64 = 1e-9;
 
-/// Order in which [`PlanInputs::best`] evaluates the plans.
+/// Order in which [`PlanInputs::best`] evaluates the plans: the cheap evaluations first, so
+/// that the per-clause sums of `rowand` and `gallop` stop early against their cost.
 const EVAL_ORDER: [ExactPlan; 5] = [
     ExactPlan::Scan,
+    ExactPlan::DistanceFirst,
     ExactPlan::Bitmap,
     ExactPlan::RowAnd,
-    ExactPlan::DistanceFirst,
     ExactPlan::Gallop,
 ];
 
@@ -1189,7 +1190,15 @@ impl PlanInputs<'_> {
         seeded: bool,
         upper: bool,
     ) -> f64 {
-        self.cost_in(c, plan, e, seeded, upper, &self.ctx(c, e, upper))
+        self.cost_in(
+            c,
+            plan,
+            e,
+            seeded,
+            upper,
+            &self.ctx(c, e, upper),
+            f64::INFINITY,
+        )
     }
 
     fn ctx(&self, c: &UnitCosts, e: &Estimates, upper: bool) -> Ctx {
@@ -1217,6 +1226,11 @@ impl PlanInputs<'_> {
         }
     }
 
+    /// [`Self::cost`] with the per-estimate terms `x`. `bound`: the sums of `gallop` and
+    /// `rowand` (non-negative terms, so their partial sums only grow) stop at the first clause
+    /// where the cost so far exceeds it, returning that partial cost (only compared with
+    /// `bound` by the caller; `f64::INFINITY`: the full cost).
+    #[expect(clippy::too_many_arguments, reason = "the plan cost's inputs")]
     fn cost_in(
         &self,
         c: &UnitCosts,
@@ -1225,6 +1239,7 @@ impl PlanInputs<'_> {
         seeded: bool,
         upper: bool,
         x: &Ctx,
+        bound: f64,
     ) -> f64 {
         let (n, a, m, k, dist_m) = (x.n, x.a, x.m, x.k, x.dist_m);
         match plan {
@@ -1263,6 +1278,9 @@ impl PlanInputs<'_> {
                             cost += c.gallop(p / s) * s * (1.0 + (1.0 + p / s).log2());
                         }
                     }
+                    if cost + dist_m > bound {
+                        return cost + dist_m;
+                    }
                     s = a * e.survival.get(j - 1).copied().unwrap_or(1.0);
                 }
                 cost + dist_m
@@ -1296,7 +1314,8 @@ impl PlanInputs<'_> {
                 if !c.has_enum_bits() {
                     return f64::INFINITY;
                 }
-                self.row_and(c, e, upper, x) + c.enumerate(0.0, m) + dist_m
+                let tail = c.enumerate(0.0, m);
+                self.row_and(c, e, upper, x, |cost| cost + tail + dist_m > bound) + tail + dist_m
             }
         }
     }
@@ -1328,7 +1347,16 @@ impl PlanInputs<'_> {
     }
 
     /// Cost of `rowand` before its enumeration and distances (see the module documentation).
-    fn row_and(&self, c: &UnitCosts, e: &Estimates, upper: bool, x: &Ctx) -> f64 {
+    /// `exceeds`: stop after the first clause whose cost so far it accepts (that partial cost
+    /// is returned).
+    fn row_and(
+        &self,
+        c: &UnitCosts,
+        e: &Estimates,
+        upper: bool,
+        x: &Ctx,
+        exceeds: impl Fn(f64) -> bool,
+    ) -> f64 {
         let q = self.q;
         let n = e.n.max(1.0);
         let words = (n / 64.0).ceil();
@@ -1432,6 +1460,9 @@ impl PlanInputs<'_> {
             }
             reach *= if upper { 1.0 } else { p };
             prev = cur;
+            if exceeds(cost) {
+                return cost;
+            }
         }
         cost
     }
@@ -1462,7 +1493,12 @@ impl PlanInputs<'_> {
             {
                 continue;
             }
-            let v = self.cost_in(c, p, e, seeded, upper, &x);
+            let bound = if c.prepared.bounds {
+                best.1
+            } else {
+                f64::INFINITY
+            };
+            let v = self.cost_in(c, p, e, seeded, upper, &x, bound);
             if v < best.1 || (v == best.1 && (p as u8) < (best.0 as u8)) {
                 best = (p, v);
             }
@@ -1810,11 +1846,26 @@ mod tests {
             vec!["c=3", "c=4", "d=9", "d=10"],
             vec!["a=3", "d=11", "d=12", "d=13"],
         ]);
+        // Eight clauses on a tiny union (the synthetic sets' cheapest cells).
+        pb.push(&[
+            vec!["d=5"],
+            vec!["a=1", "a=2"],
+            vec!["c=3", "d=40"],
+            vec!["a=4", "c=9", "d=41"],
+            vec!["c=11", "c=12"],
+            vec!["d=42", "d=43", "a=5"],
+            vec!["c=20", "d=44"],
+            vec!["a=6", "c=21", "c=22", "d=45"],
+        ]);
         let preds = pb.finish();
         let mut bits = vec![0u64; s.n_labels()];
+        let bs = LabelBitsets::build(&s, 100_000u64.div_ceil(64));
+        let mut q8 = Compiled::new();
+        q8.compile(&s, preds.get(1), Weights::Unit, None, &mut bits);
+        q8.split_static(&s, &bs, bs.theta(), false);
+        q8.clear_bits(&mut bits);
         let mut q = Compiled::new();
         q.compile(&s, preds.get(0), Weights::Unit, None, &mut bits);
-        let bs = LabelBitsets::build(&s, 100_000u64.div_ceil(64));
         q.split_static(&s, &bs, bs.theta(), false);
         let e = Estimates::from_bounds(&q, 100_000);
         let n = 6;
@@ -1878,6 +1929,29 @@ mod tests {
                 "{cname}, rowand cost: {:.0} ns",
                 t.elapsed().as_nanos() as f64 / 200_000.0
             );
+            let pi8 = PlanInputs { q: &q8, ..pi };
+            let e8 = Estimates::from_bounds(&q8, 100_000);
+            let up8 = Estimates::upper(&q8, 100_000);
+            for (name, set) in [("4 plans", four), ("5 plans", PlanSet::ALL)] {
+                for (est, upper, ename) in [(&e8, false, "bounds"), (&up8, true, "upper")] {
+                    let t = std::time::Instant::now();
+                    let mut acc = 0.0;
+                    for _ in 0..200_000 {
+                        acc += std::hint::black_box(pi8.best(
+                            costs,
+                            set,
+                            std::hint::black_box(est),
+                            false,
+                            upper,
+                        ))
+                        .1;
+                    }
+                    let ns = t.elapsed().as_nanos() as f64 / 200_000.0;
+                    println!(
+                        "{cname}, 8 clauses, {name}, {ename}: {ns:.0} ns per best() ({acc:.0})"
+                    );
+                }
+            }
         }
         q.clear_bits(&mut bits);
     }
@@ -1900,20 +1974,32 @@ mod tests {
             let a = format!("a={}", i % 7);
             let c = format!("c={}", (i / 7) % 50);
             let d = format!("d={}", (i / 350) % 400);
-            b.push_point([("a", a.as_str()), ("c", c.as_str()), ("d", d.as_str())])
-                .unwrap();
+            let e = format!("e={}", (i * 7919) % 2000);
+            let f = format!("f={}", i % 3);
+            b.push_point([
+                ("a", a.as_str()),
+                ("c", c.as_str()),
+                ("d", d.as_str()),
+                ("e", e.as_str()),
+                ("f", f.as_str()),
+            ])
+            .unwrap();
         }
         let s = b.finish().unwrap();
         let bs = LabelBitsets::build(&s, u64::from(n).div_ceil(64));
+        // Frequent, mid and rare labels (tiny unions with many clauses: `rowand`'s sum stops
+        // early).
         let names: Vec<String> = (0..7)
             .map(|v| format!("a={v}"))
             .chain((0..50).map(|v| format!("c={v}")))
             .chain((0..50).map(|v| format!("d={v}")))
+            .chain((0..60).map(|v| format!("e={v}")))
+            .chain((0..3).map(|v| format!("f={v}")))
             .collect();
         let mut pb = PredicateSetBuilder::new(&s);
         let n_queries = 60;
         for _ in 0..n_queries {
-            let clauses: Vec<Vec<&str>> = (0..1 + next() % 4)
+            let clauses: Vec<Vec<&str>> = (0..1 + next() % 8)
                 .map(|_| {
                     (0..1 + next() % 4)
                         .map(|_| names[(next() % names.len() as u64) as usize].as_str())
