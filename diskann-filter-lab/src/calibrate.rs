@@ -19,8 +19,8 @@
 //! - **Postings**: the k-way merge with deduplication of real posting lists (ns per entry and
 //!   binary level), galloping intersection of the calibration predicates (ns per modelled
 //!   probe), bitmap word operations, scatters and enumeration (per word of a bitmap with
-//!   10 % of its bits set; batch A6: per empty word and per set bit, least squares over
-//!   bitmaps with 0 to 1/16 of their bits set).
+//!   10 % of its bits set; batch A6: per empty word, per non-empty word and per set bit,
+//!   least squares over bitmaps with 0 to 1/16 of their bits set).
 //! - **Probe**: ns per sampled point of a sketch probe (every clause evaluated on random points,
 //!   prefetched like the probe).
 //! - **Member checks by residual shape** (`check_base_ns`, `check_word_ns`,
@@ -386,10 +386,9 @@ pub fn calibrate<T: Element>(
     }
     let enum_ns = median(&mut ev);
     // Batch A6: the same loop on bitmaps with 0, 1/1024, 1/128 and 1/16 of their bits set (a
-    // match bitmap is mostly empty words): ns per empty word (no bit set), and per set bit the
-    // least-squares slope through it of the sparse bitmaps (at most one bit per word: each
-    // set bit then costs a mispredicted branch; the 1/16 bitmap is recorded, not fitted).
-    // Medians of at least 11 repetitions.
+    // match bitmap is mostly empty words): ns per empty word (no bit set), then least squares of
+    // the rest of ns per word on the non-empty words (their loop exit mispredicts) and the set
+    // bits per word. Medians of at least 11 repetitions.
     let mut enum_fit = Vec::new();
     for inv in [0u64, 1024, 128, 16] {
         let bitmap: Vec<u64> = (0..words)
@@ -406,6 +405,7 @@ pub fn calibrate<T: Element>(
             })
             .collect();
         let per_word = bitmap.iter().map(|w| w.count_ones() as f64).sum::<f64>() / words as f64;
+        let nonempty = bitmap.iter().filter(|&&w| w != 0).count() as f64 / words as f64;
         let mut tv = Vec::new();
         for _ in 0..opts.reps.max(11) {
             mat.matches.clear();
@@ -421,23 +421,38 @@ pub fn calibrate<T: Element>(
             std::hint::black_box(&mat.matches);
             tv.push(t.elapsed().as_nanos() as f64 / words as f64);
         }
-        enum_fit.push((per_word, median(&mut tv)));
+        enum_fit.push((per_word, nonempty, median(&mut tv)));
     }
-    let enum_word_ns = enum_fit[0].1;
-    let enum_bit_ns = {
-        let sparse = enum_fit[1..].iter().filter(|&&(x, _)| x > 0.0 && x <= 1.0);
-        let (sxy, sxx) = sparse.fold((0.0, 0.0), |(a, b), &(x, y)| {
-            (a + x * (y - enum_word_ns), b + x * x)
-        });
-        if sxx > 0.0 {
-            (sxy / sxx).max(0.01)
+    let enum_word_ns = enum_fit[0].2;
+    let (enum_nz_ns, enum_bit_ns) = {
+        // y - enum_word = nz·a + bits·b over the non-empty bitmaps (2×2 normal equations).
+        let (mut s11, mut s12, mut s22, mut t1, mut t2) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(b, z, y) in &enum_fit[1..] {
+            let r = y - enum_word_ns;
+            s11 += z * z;
+            s12 += z * b;
+            s22 += b * b;
+            t1 += z * r;
+            t2 += b * r;
+        }
+        let det = s11 * s22 - s12 * s12;
+        let (a, b) = if det.abs() > 1e-12 {
+            ((t1 * s22 - t2 * s12) / det, (s11 * t2 - s12 * t1) / det)
         } else {
-            0.01
+            (0.0, if s22 > 0.0 { t2 / s22 } else { 0.0 })
+        };
+        if a < 0.0 {
+            (0.0, (t2 / s22.max(1e-12)).max(0.01))
+        } else if b < 0.01 {
+            ((t1 - 0.01 * s12) / s11.max(1e-12), 0.01)
+        } else {
+            (a, b)
         }
     };
     details.insert(
         "enum_fit".into(),
-        json!({"bits_per_word_ns": enum_fit, "enum_word_ns": enum_word_ns, "enum_bit_ns": enum_bit_ns}),
+        json!({"bits_nonempty_ns_per_word": enum_fit, "enum_word_ns": enum_word_ns,
+               "enum_nz_ns": enum_nz_ns, "enum_bit_ns": enum_bit_ns}),
     );
 
     // Probe: every clause on random points, prefetched like the probe (128 points per query).
@@ -747,6 +762,7 @@ pub fn calibrate<T: Element>(
         enum_ns,
         enum_word_ns,
         enum_bit_ns,
+        enum_nz_ns,
         probe_ns,
         sketch_ns: merge_ns,
         graph_dist_ns,

@@ -28,8 +28,8 @@
 //! ```
 //!
 //! with `merge(c*) = P*·merge·log2 k` for a clause of `k ≥ 2` labels (a single posting list is
-//! read in place). The bitmap's enumeration costs `n/64·enum_word + M·enum_bit` when those are
-//! calibrated (batch A6; older calibrations: `n/64·enum`, measured on a bitmap with 10 % of its
+//! read in place). The bitmap's enumeration costs `n/64·enum_word + nz·enum_nz + M·enum_bit`
+//! (`nz` = the words holding the `M` matches) when those are calibrated (batch A6; older calibrations: `n/64·enum`, measured on a bitmap with 10 % of its
 //! bits set, which prices every query as if its bitmap were that dense); A6 calibrations also
 //! price a later clause of one bitset label as one AND pass, as built. `rowand` (A6: the AND
 //! of the clauses' rows, word by word) visits the `W = n/64·(1 − e^{−64A/n})` words holding
@@ -92,12 +92,15 @@ pub struct UnitCosts {
     pub scatter_ns: f64,
     /// Per bitmap word enumerated (a bitmap with 10 % of its bits set: about 6.4 per word).
     pub enum_ns: f64,
-    /// Per bitmap word enumerated without set bits, and per set bit enumerated (batch A6; 0
-    /// in older calibrations: then `enum_ns` per word, and no `rowand` plan).
+    /// Per bitmap word enumerated without set bits, per set bit enumerated, and per word with
+    /// set bits (its loop exit mispredicts; batch A6; 0 in older calibrations: then `enum_ns`
+    /// per word, and no `rowand` plan; `enum_nz_ns` 0: the set bits carry it).
     #[serde(default)]
     pub enum_word_ns: f64,
     #[serde(default)]
     pub enum_bit_ns: f64,
+    #[serde(default)]
+    pub enum_nz_ns: f64,
     /// Per sampled point of a sketch probe (row read and every clause, batch-prefetched).
     pub probe_ns: f64,
     /// Per sketch entry merged by a probe.
@@ -203,6 +206,7 @@ impl Default for UnitCosts {
             enum_ns: 0.8,
             enum_word_ns: 0.0,
             enum_bit_ns: 0.0,
+            enum_nz_ns: 0.0,
             probe_ns: 120.0,
             sketch_ns: 6.0,
             graph_dist_ns: 60.0,
@@ -358,7 +362,12 @@ impl UnitCosts {
                 .chain(&self.check_word_ns)
                 .chain(&self.check_prefetch_ns)
                 .chain(&self.check_row_ns)
-                .chain(&[self.query_ns, self.enum_word_ns, self.enum_bit_ns])
+                .chain(&[
+                    self.query_ns,
+                    self.enum_word_ns,
+                    self.enum_bit_ns,
+                    self.enum_nz_ns,
+                ])
                 .all(|x| x.is_finite() && *x >= 0.0),
             "unit costs must be finite and non-negative"
         );
@@ -418,14 +427,19 @@ impl UnitCosts {
         self.enum_bit_ns > 0.0
     }
 
-    /// Cost of enumerating a bitmap of `words` words holding `bits` set bits (older
-    /// calibrations: `enum_ns` per word, whatever the bits).
+    /// Cost of enumerating a bitmap of `words` words holding `bits` set bits at random
+    /// positions (`words` 0: words that each hold some of the bits, at most one per bit;
+    /// older calibrations: `enum_ns` per word, whatever the bits).
     pub fn enumerate(&self, words: f64, bits: f64) -> f64 {
-        if self.has_enum_bits() {
-            words * self.enum_word_ns + bits * self.enum_bit_ns
-        } else {
-            words * self.enum_ns
+        if !self.has_enum_bits() {
+            return words * self.enum_ns;
         }
+        let nonempty = if words > 0.0 {
+            words * -(-bits / words).exp_m1()
+        } else {
+            bits
+        };
+        words * self.enum_word_ns + nonempty * self.enum_nz_ns + bits * self.enum_bit_ns
     }
 
     /// Cost of checking one member of `union(c*)` with the expected work `w` at density
