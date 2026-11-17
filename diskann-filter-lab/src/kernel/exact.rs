@@ -125,7 +125,7 @@ pub fn run<T: Element>(
                 scan::<T, ClauseSearch>(cx, vectors, query, mat, answers, ctr)
             }
             EvalMode::StaticBits => scan::<T, StaticBits>(cx, vectors, query, mat, answers, ctr),
-            EvalMode::RowScan | EvalMode::Dense | EvalMode::Sparse => {
+            EvalMode::RowScan | EvalMode::Dense | EvalMode::Sparse | EvalMode::NavBitmap => {
                 scan::<T, RowScan>(cx, vectors, query, mat, answers, ctr);
             }
         },
