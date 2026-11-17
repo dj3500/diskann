@@ -454,6 +454,7 @@ impl Plan {
             c.validate()?;
             let mut c = c.clone();
             c.reads_at_reach = kernel.row_reads == RowReads::Reach;
+            c.prepare();
             Some(c)
         } else {
             None

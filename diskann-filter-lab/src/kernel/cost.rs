@@ -74,6 +74,44 @@ use serde::{Deserialize, Serialize};
 use super::{config::Laziness, eval::Compiled};
 use crate::{bitsets::LabelBitsets, labels::LabelStore};
 
+/// Planner caches of [`UnitCosts`], filled by [`UnitCosts::prepare`]: the logarithms of the
+/// calibrated grids (empty until then: taken per call, with the same values), the cheapest
+/// galloping step, and whether every unit cost is non-negative (the lower bounds that let
+/// [`PlanInputs::best`] skip plans hold). Not serialized; ignored by comparisons.
+#[derive(Debug, Clone, Default)]
+pub struct Prepared {
+    ln_density: Vec<f64>,
+    ln_gallop_gap: Vec<f64>,
+    gallop_min: f64,
+    bounds: bool,
+}
+
+impl PartialEq for Prepared {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// `(ln g[i − 1], ln g[i])`, from `cache` when it covers `g`.
+#[inline]
+fn ln_pair(cache: &[f64], g: &[f64], i: usize) -> (f64, f64) {
+    if cache.len() == g.len() {
+        (cache[i - 1], cache[i])
+    } else {
+        (g[i - 1].ln(), g[i].ln())
+    }
+}
+
+/// Position of a density on the calibrated grid: below it, at or above its last point
+/// (index), or between points `i − 1` and `i` at log-linear weight `t` (one interpolation
+/// for every curve at that density).
+#[derive(Debug, Clone, Copy)]
+enum Pos {
+    Lo,
+    Hi(usize),
+    At(usize, f64),
+}
+
 /// Unit costs in nanoseconds (see the module documentation).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnitCosts {
@@ -190,6 +228,9 @@ pub struct UnitCosts {
     pub effort_k: Vec<f64>,
     #[serde(default)]
     pub effort_l: Vec<Vec<f64>>,
+    /// Planner caches ([`Self::prepare`]).
+    #[serde(skip)]
+    pub prepared: Prepared,
 }
 
 impl Default for UnitCosts {
@@ -236,6 +277,7 @@ impl Default for UnitCosts {
             effort_r: Vec::new(),
             effort_k: Vec::new(),
             effort_l: Vec::new(),
+            prepared: Prepared::default(),
         }
     }
 }
@@ -375,20 +417,80 @@ impl UnitCosts {
         Ok(())
     }
 
-    /// Log-linear interpolation of a density curve (clamped at the ends).
-    fn curve(&self, v: &[f64], rho: f64) -> f64 {
+    /// Fills the planner caches ([`Prepared`]): the plan costs and choices are those computed
+    /// without them, at a fraction of the work.
+    pub fn prepare(&mut self) {
+        let ln = |v: &[f64]| v.iter().map(|x| x.ln()).collect();
+        let gallop_min = if self.gallop_gap.is_empty() {
+            self.gallop_ns
+        } else {
+            self.gallop_gap_ns
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min)
+        };
+        let curves = [
+            &self.dist_ns,
+            &self.pred_ns,
+            &self.pred_row_ns,
+            &self.pred_bits_ns,
+            &self.check_base_ns,
+            &self.check_word_ns,
+            &self.check_prefetch_ns,
+            &self.check_row_ns,
+            &self.gallop_gap_ns,
+        ];
+        let scalars = [
+            self.word_ns,
+            self.scatter_ns,
+            self.merge_ns,
+            self.enum_ns,
+            self.enum_word_ns,
+            self.enum_nz_ns,
+            self.enum_bit_ns,
+            self.gallop_ns,
+        ];
+        let bounds = curves
+            .iter()
+            .flat_map(|v| v.iter())
+            .chain(scalars.iter())
+            .all(|&x| x >= 0.0 && x.is_finite());
+        self.prepared = Prepared {
+            ln_density: ln(&self.density),
+            ln_gallop_gap: ln(&self.gallop_gap),
+            gallop_min,
+            bounds,
+        };
+    }
+
+    /// Position of density `rho` on the grid (clamped at the ends).
+    fn pos(&self, rho: f64) -> Pos {
         let d = &self.density;
         if rho <= d[0] {
-            return v[0];
+            return Pos::Lo;
         }
         let last = d.len() - 1;
         if rho >= d[last] {
-            return v[last];
+            return Pos::Hi(last);
         }
         let i = d.partition_point(|&x| x <= rho);
-        let (x0, x1) = (d[i - 1].ln(), d[i].ln());
-        let t = (rho.ln() - x0) / (x1 - x0);
-        v[i - 1] + t * (v[i] - v[i - 1])
+        let (x0, x1) = ln_pair(&self.prepared.ln_density, d, i);
+        Pos::At(i, (rho.ln() - x0) / (x1 - x0))
+    }
+
+    /// The density curve `v` at position `p`.
+    #[inline]
+    fn at(v: &[f64], p: Pos) -> f64 {
+        match p {
+            Pos::Lo => v[0],
+            Pos::Hi(last) => v[last],
+            Pos::At(i, t) => v[i - 1] + t * (v[i] - v[i - 1]),
+        }
+    }
+
+    /// Log-linear interpolation of a density curve (clamped at the ends).
+    fn curve(&self, v: &[f64], rho: f64) -> f64 {
+        Self::at(v, self.pos(rho))
     }
 
     /// Cost of one distance computation over id-ordered candidates of density `rho`.
@@ -404,16 +506,20 @@ impl UnitCosts {
     /// Cost of checking one member of `union(c*)` at density `rho`, for a query whose
     /// residual clauses read rows (`rows`) or are bitset-only; `pred` without the curves.
     pub fn pred_member(&self, rows: bool, rho: f64) -> f64 {
+        self.pred_member_at(rows, self.pos(rho))
+    }
+
+    fn pred_member_at(&self, rows: bool, p: Pos) -> f64 {
         if self.pred_row_ns.is_empty() {
-            return self.pred(rho);
+            return Self::at(&self.pred_ns, p);
         }
-        self.curve(
+        Self::at(
             if rows {
                 &self.pred_row_ns
             } else {
                 &self.pred_bits_ns
             },
-            rho,
+            p,
         )
     }
 
@@ -446,18 +552,22 @@ impl UnitCosts {
     /// Cost of checking one member of `union(c*)` with the expected work `w` at density
     /// `rho`: the shape-resolved curves, else `pred_member` of `w`'s class.
     pub fn member(&self, w: &MemberWork, rho: f64) -> f64 {
+        self.member_at(w, self.pos(rho))
+    }
+
+    fn member_at(&self, w: &MemberWork, p: Pos) -> f64 {
         if !self.has_shape() {
-            return self.pred_member(w.class_rows, rho);
+            return self.pred_member_at(w.class_rows, p);
         }
         let prefetch = if self.check_prefetch_ns.is_empty() {
             0.0
         } else {
-            w.prefetch * self.curve(&self.check_prefetch_ns, rho)
+            w.prefetch * Self::at(&self.check_prefetch_ns, p)
         };
-        self.curve(&self.check_base_ns, rho)
-            + w.words * self.curve(&self.check_word_ns, rho)
+        Self::at(&self.check_base_ns, p)
+            + w.words * Self::at(&self.check_word_ns, p)
             + prefetch
-            + w.rows * self.curve(&self.check_row_ns, rho)
+            + w.rows * Self::at(&self.check_row_ns, p)
     }
 
     /// Cost of one sampled point of a sketch probe (every residual clause evaluated, work
@@ -473,25 +583,6 @@ impl UnitCosts {
     /// Cost of one galloping step at the largest calibrated gap (miss-bound steps).
     pub fn gallop_cold(&self) -> f64 {
         self.gallop_gap_ns.last().copied().unwrap_or(self.gallop_ns)
-    }
-
-    /// [`Self::curve`] of two curves at the same density (one interpolation).
-    fn curve2(&self, a: &[f64], b: &[f64], rho: f64) -> (f64, f64) {
-        let d = &self.density;
-        if rho <= d[0] {
-            return (a[0], b[0]);
-        }
-        let last = d.len() - 1;
-        if rho >= d[last] {
-            return (a[last], b[last]);
-        }
-        let i = d.partition_point(|&x| x <= rho);
-        let (x0, x1) = (d[i - 1].ln(), d[i].ln());
-        let t = (rho.ln() - x0) / (x1 - x0);
-        (
-            a[i - 1] + t * (a[i] - a[i - 1]),
-            b[i - 1] + t * (b[i] - b[i - 1]),
-        )
     }
 
     /// Cost of one modelled galloping step at gap `gap` (posting entries per galloped
@@ -510,7 +601,8 @@ impl UnitCosts {
             return v[last];
         }
         let i = g.partition_point(|&x| x <= gap);
-        let t = (gap.ln() - g[i - 1].ln()) / (g[i].ln() - g[i - 1].ln());
+        let (x0, x1) = ln_pair(&self.prepared.ln_gallop_gap, g, i);
+        let t = (gap.ln() - x0) / (x1 - x0);
         v[i - 1] + t * (v[i] - v[i - 1])
     }
 
@@ -1036,6 +1128,35 @@ pub struct PlanInputs<'a> {
     pub k: usize,
 }
 
+/// Per-estimate terms shared by the plan costs of a query (computed once per
+/// [`PlanInputs::best`]).
+struct Ctx {
+    n: f64,
+    a: f64,
+    m: f64,
+    k: f64,
+    checks: bool,
+    dist_m: f64,
+    work: MemberWork,
+    merge: f64,
+    /// `a / n` and its position on the density grid.
+    ra: f64,
+    pa: Pos,
+}
+
+/// Relative margin of the plan skips: a plan is skipped when its lower bound exceeds the best
+/// cost by more than the rounding of either evaluation.
+const SKIP_MARGIN: f64 = 1e-9;
+
+/// Order in which [`PlanInputs::best`] evaluates the plans.
+const EVAL_ORDER: [ExactPlan; 5] = [
+    ExactPlan::Scan,
+    ExactPlan::Bitmap,
+    ExactPlan::RowAnd,
+    ExactPlan::DistanceFirst,
+    ExactPlan::Gallop,
+];
+
 impl PlanInputs<'_> {
     /// Cost of merging `c*`'s postings into distinct candidates.
     fn merge(&self, c: &UnitCosts) -> f64 {
@@ -1065,30 +1186,55 @@ impl PlanInputs<'_> {
         seeded: bool,
         upper: bool,
     ) -> f64 {
+        self.cost_in(c, plan, e, seeded, upper, &self.ctx(c, e, upper))
+    }
+
+    fn ctx(&self, c: &UnitCosts, e: &Estimates, upper: bool) -> Ctx {
         let n = e.n.max(1.0);
         let (a, m) = (e.a, e.m.min(e.a));
-        let checks = self.q.n_clauses() > 1;
-        let k = self.k as f64;
-        let dist_m = m * c.dist(m / n);
-        let work = MemberWork::of(
-            self.q,
-            self.bitsets.is_some(),
-            &e.survival,
-            false,
-            upper,
-            c.reads_at_reach,
-        );
+        let ra = a / n;
+        Ctx {
+            n,
+            a,
+            m,
+            k: self.k as f64,
+            checks: self.q.n_clauses() > 1,
+            dist_m: m * c.dist(m / n),
+            work: MemberWork::of(
+                self.q,
+                self.bitsets.is_some(),
+                &e.survival,
+                false,
+                upper,
+                c.reads_at_reach,
+            ),
+            merge: self.merge(c),
+            ra,
+            pa: c.pos(ra),
+        }
+    }
+
+    fn cost_in(
+        &self,
+        c: &UnitCosts,
+        plan: ExactPlan,
+        e: &Estimates,
+        seeded: bool,
+        upper: bool,
+        x: &Ctx,
+    ) -> f64 {
+        let (n, a, m, k, dist_m) = (x.n, x.a, x.m, x.k, x.dist_m);
         match plan {
             ExactPlan::Scan => {
-                let pred = if checks {
-                    a * c.member(&work, a / n)
+                let pred = if x.checks {
+                    a * c.member_at(&x.work, x.pa)
                 } else {
                     0.0
                 };
-                self.merge(c) + pred + dist_m
+                x.merge + pred + dist_m
             }
             ExactPlan::DistanceFirst => {
-                let evals = if !checks {
+                let evals = if !x.checks {
                     0.0
                 } else if upper || m <= k {
                     a
@@ -1097,10 +1243,15 @@ impl PlanInputs<'_> {
                 } else {
                     (k * a / m * (1.0 + (m / k).ln())).min(a)
                 };
-                self.merge(c) + a * c.dist(a / n) + evals * c.member(&work, evals / n)
+                let pe = if evals.to_bits() == a.to_bits() {
+                    x.pa
+                } else {
+                    c.pos(evals / n)
+                };
+                x.merge + a * UnitCosts::at(&c.dist_ns, x.pa) + evals * c.member_at(&x.work, pe)
             }
             ExactPlan::Gallop => {
-                let mut cost = self.merge(c) + a * c.word_ns;
+                let mut cost = x.merge + a * c.word_ns;
                 let mut s = a;
                 for j in 1..self.q.n_clauses() {
                     for &l in self.q.clause(j) {
@@ -1142,13 +1293,39 @@ impl PlanInputs<'_> {
                 if !c.has_enum_bits() {
                     return f64::INFINITY;
                 }
-                self.row_and(c, e, upper) + c.enumerate(0.0, m) + dist_m
+                self.row_and(c, e, upper, x) + c.enumerate(0.0, m) + dist_m
             }
         }
     }
 
+    /// A lower bound of the cost of `plan` that is cheaper to evaluate (`None`: none), valid
+    /// with non-negative unit costs: distance-first without its predicate evaluations;
+    /// galloping at its cheapest step, with `1 + log2(1 + g) ≥ 1 + min(g, 1)` for the search
+    /// depth (no logarithms).
+    fn lower(&self, c: &UnitCosts, plan: ExactPlan, e: &Estimates, x: &Ctx) -> Option<f64> {
+        match plan {
+            ExactPlan::DistanceFirst => Some(x.merge + x.a * UnitCosts::at(&c.dist_ns, x.pa)),
+            ExactPlan::Gallop => {
+                let g = c.prepared.gallop_min;
+                let mut cost = x.merge + x.a * c.word_ns;
+                let mut s = x.a;
+                for j in 1..self.q.n_clauses() {
+                    if s >= 1.0 {
+                        for &l in self.q.clause(j) {
+                            let p = self.labels.posting_len(l) as f64;
+                            cost += g * (s + p.min(s));
+                        }
+                    }
+                    s = x.a * e.survival.get(j - 1).copied().unwrap_or(1.0);
+                }
+                Some(cost + x.dist_m)
+            }
+            _ => None,
+        }
+    }
+
     /// Cost of `rowand` before its enumeration and distances (see the module documentation).
-    fn row_and(&self, c: &UnitCosts, e: &Estimates, upper: bool) -> f64 {
+    fn row_and(&self, c: &UnitCosts, e: &Estimates, upper: bool, x: &Ctx) -> f64 {
         let q = self.q;
         let n = e.n.max(1.0);
         let words = (n / 64.0).ceil();
@@ -1192,10 +1369,18 @@ impl PlanInputs<'_> {
         }
         let per_word = a / w;
         let rho = (a / n).clamp(0.0, 1.0);
-        let (base, probe) = if c.has_shape() {
-            c.curve2(&c.check_base_ns, &c.check_word_ns, rho)
+        let pos = if rho.to_bits() == x.ra.to_bits() {
+            x.pa
         } else {
-            (c.pred_member(false, rho), 0.0)
+            c.pos(rho)
+        };
+        let (base, probe) = if c.has_shape() {
+            (
+                UnitCosts::at(&c.check_base_ns, pos),
+                UnitCosts::at(&c.check_word_ns, pos),
+            )
+        } else {
+            (c.pred_member_at(false, pos), 0.0)
         };
         // `reach`: the fraction of the visited words that reach clause `j` (one pass over the
         // surviving words per residual clause).
@@ -1257,11 +1442,26 @@ impl PlanInputs<'_> {
         seeded: bool,
         upper: bool,
     ) -> (ExactPlan, f64) {
+        let x = self.ctx(c, e, upper);
         let mut best = (ExactPlan::Scan, f64::INFINITY);
-        for p in plans.plans() {
-            let x = self.cost(c, p, e, seeded, upper);
-            if x < best.1 {
-                best = (p, x);
+        // The plans with a lower bound come last (the bound then meets the cheapest of the
+        // others); ties go to the earlier plan of `ExactPlan::ALL`, as in that order.
+        for p in EVAL_ORDER {
+            if !plans.contains(p) {
+                continue;
+            }
+            // A plan whose lower bound already loses is skipped (same choice and cost).
+            if c.prepared.bounds
+                && best.1.is_finite()
+                && self
+                    .lower(c, p, e, &x)
+                    .is_some_and(|lb| lb > best.1 * (1.0 + SKIP_MARGIN))
+            {
+                continue;
+            }
+            let v = self.cost_in(c, p, e, seeded, upper, &x);
+            if v < best.1 || (v == best.1 && (p as u8) < (best.0 as u8)) {
+                best = (p, v);
             }
         }
         best
@@ -1633,37 +1833,208 @@ mod tests {
             bitsets: Some(&bs),
             k: 10,
         };
+        let mut prepared = c.clone();
+        prepared.prepare();
         let four = PlanSet::parse("scan+df+gallop+bitmap").unwrap();
-        for (name, set) in [
-            ("4 plans", four),
-            ("5 plans", PlanSet::ALL),
-            ("4 plans", four),
-        ] {
-            let t = std::time::Instant::now();
-            let mut acc = 0.0;
-            for _ in 0..200_000 {
-                acc +=
-                    std::hint::black_box(pi.best(&c, set, std::hint::black_box(&e), false, false))
+        let up = Estimates::upper(&q, 100_000);
+        for (costs, cname) in [(&c, "unprepared"), (&prepared, "prepared")] {
+            for (name, set) in [
+                ("4 plans", four),
+                ("5 plans", PlanSet::ALL),
+                ("4 plans", four),
+                ("5 plans", PlanSet::ALL),
+            ] {
+                for (est, upper, ename) in [(&e, false, "bounds"), (&up, true, "upper")] {
+                    let t = std::time::Instant::now();
+                    let mut acc = 0.0;
+                    for _ in 0..200_000 {
+                        acc += std::hint::black_box(pi.best(
+                            costs,
+                            set,
+                            std::hint::black_box(est),
+                            false,
+                            upper,
+                        ))
                         .1;
+                    }
+                    let ns = t.elapsed().as_nanos() as f64 / 200_000.0;
+                    println!("{cname}, {name}, {ename}: {ns:.0} ns per best() ({acc:.0})");
+                }
             }
-            let ns = t.elapsed().as_nanos() as f64 / 200_000.0;
-            println!("{name}: {ns:.0} ns per best() ({acc:.0})");
+            let t = std::time::Instant::now();
+            for _ in 0..200_000 {
+                std::hint::black_box(pi.cost(
+                    costs,
+                    ExactPlan::RowAnd,
+                    std::hint::black_box(&e),
+                    false,
+                    false,
+                ));
+            }
+            println!(
+                "{cname}, rowand cost: {:.0} ns",
+                t.elapsed().as_nanos() as f64 / 200_000.0
+            );
         }
-        let t = std::time::Instant::now();
-        for _ in 0..200_000 {
-            std::hint::black_box(pi.cost(
-                &c,
-                ExactPlan::RowAnd,
-                std::hint::black_box(&e),
-                false,
-                false,
-            ));
-        }
-        println!(
-            "rowand cost: {:.0} ns",
-            t.elapsed().as_nanos() as f64 / 200_000.0
-        );
         q.clear_bits(&mut bits);
+    }
+
+    /// The planner caches and plan skips ([`UnitCosts::prepare`]) leave every plan cost and
+    /// every choice of [`PlanInputs::best`] bit-identical, over random queries, estimates and
+    /// unit costs.
+    #[test]
+    fn prepared_planner_is_bit_identical() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let n = 20_000u32;
+        let mut b = LabelStoreBuilder::new();
+        for i in 0..n {
+            let a = format!("a={}", i % 7);
+            let c = format!("c={}", (i / 7) % 50);
+            let d = format!("d={}", (i / 350) % 400);
+            b.push_point([("a", a.as_str()), ("c", c.as_str()), ("d", d.as_str())])
+                .unwrap();
+        }
+        let s = b.finish().unwrap();
+        let bs = LabelBitsets::build(&s, u64::from(n).div_ceil(64));
+        let names: Vec<String> = (0..7)
+            .map(|v| format!("a={v}"))
+            .chain((0..50).map(|v| format!("c={v}")))
+            .chain((0..50).map(|v| format!("d={v}")))
+            .collect();
+        let mut pb = PredicateSetBuilder::new(&s);
+        let n_queries = 60;
+        for _ in 0..n_queries {
+            let clauses: Vec<Vec<&str>> = (0..1 + next() % 4)
+                .map(|_| {
+                    (0..1 + next() % 4)
+                        .map(|_| names[(next() % names.len() as u64) as usize].as_str())
+                        .collect()
+                })
+                .collect();
+            pb.push(&clauses);
+        }
+        let preds = pb.finish();
+        let mut bits = vec![0u64; s.n_labels()];
+        let grid = [1e-4, 1e-3, 1e-2, 0.1, 0.3, 1.0];
+        let mut unit = |lo: f64, hi: f64| lo + (hi - lo) * (next() % 1_000_000) as f64 / 1e6;
+        let mut skipped = 0usize;
+        let mut decisions = 0usize;
+        for t in 0..400 {
+            let mut c = UnitCosts {
+                word_ns: unit(0.1, 1.0),
+                scatter_ns: unit(0.5, 5.0),
+                merge_ns: unit(0.5, 5.0),
+                gallop_ns: unit(5.0, 50.0),
+                dist_ns: grid.iter().map(|_| unit(20.0, 200.0)).collect(),
+                ..UnitCosts::default()
+            };
+            if t % 2 == 0 {
+                c.enum_word_ns = unit(0.1, 1.0);
+                c.enum_bit_ns = unit(0.05, 2.0);
+                c.enum_nz_ns = unit(1.0, 20.0);
+            }
+            if t % 3 != 0 {
+                c.check_base_ns = grid.iter().map(|_| unit(2.0, 30.0)).collect();
+                c.check_word_ns = grid.iter().map(|_| unit(1.0, 10.0)).collect();
+                c.check_prefetch_ns = grid.iter().map(|_| unit(0.0, 60.0)).collect();
+                c.check_row_ns = grid.iter().map(|_| unit(10.0, 100.0)).collect();
+            }
+            if t % 5 != 0 {
+                c.gallop_gap = vec![1.0, 16.0, 256.0, 4096.0];
+                c.gallop_gap_ns = (0..4).map(|_| unit(5.0, 80.0)).collect();
+            }
+            let mut p = c.clone();
+            p.prepare();
+            assert!(p.prepared.bounds);
+            let qi = t % n_queries;
+            let mut q = Compiled::new();
+            q.compile(&s, preds.get(qi), Weights::Unit, None, &mut bits);
+            assert!(!q.is_empty());
+            let split = t % 4 != 1;
+            if split {
+                q.split_static(&s, &bs, bs.theta(), false);
+            }
+            let pi = PlanInputs {
+                q: &q,
+                labels: &s,
+                bitsets: split.then_some(&bs),
+                k: if t % 2 == 0 { 10 } else { 100 },
+            };
+            let bounds = Estimates::from_bounds(&q, n as usize);
+            let mut est = bounds.clone();
+            est.a = (bounds.a * unit(0.0, 1.0)).floor();
+            est.m = est.a * unit(0.0, 1.0);
+            let mut sv = 1.0;
+            for x in &mut est.survival {
+                sv *= unit(0.0, 1.0);
+                *x = sv;
+            }
+            let up = Estimates::upper(&q, n as usize);
+            for (e, upper) in [(&bounds, false), (&est, false), (&up, true)] {
+                for seeded in [false, true] {
+                    let mut want = (ExactPlan::Scan, f64::INFINITY);
+                    for plan in ExactPlan::ALL {
+                        let x = pi.cost(&c, plan, e, seeded, upper);
+                        assert_eq!(
+                            x.to_bits(),
+                            pi.cost(&p, plan, e, seeded, upper).to_bits(),
+                            "{plan:?}"
+                        );
+                        let ctx = pi.ctx(&p, e, upper);
+                        if let Some(lb) = pi.lower(&p, plan, e, &ctx) {
+                            assert!(lb <= x * (1.0 + 1e-12), "{plan:?}: {lb} > {x}");
+                            if lb > want.1 * (1.0 + SKIP_MARGIN) {
+                                skipped += 1;
+                            }
+                        }
+                        if x < want.1 {
+                            want = (plan, x);
+                        }
+                    }
+                    for set in [
+                        PlanSet::ALL,
+                        PlanSet::parse("scan+df+gallop+bitmap").unwrap(),
+                    ] {
+                        let reference =
+                            set.plans()
+                                .fold((ExactPlan::Scan, f64::INFINITY), |b, plan| {
+                                    let x = pi.cost(&c, plan, e, seeded, upper);
+                                    if x < b.1 {
+                                        (plan, x)
+                                    } else {
+                                        b
+                                    }
+                                });
+                        for costs in [&c, &p] {
+                            let got = pi.best(costs, set, e, seeded, upper);
+                            assert_eq!(
+                                (got.0, got.1.to_bits()),
+                                (reference.0, reference.1.to_bits())
+                            );
+                        }
+                    }
+                    assert_eq!(want.0, pi.best(&p, PlanSet::ALL, e, seeded, upper).0);
+                    if !c.has_enum_bits() {
+                        // Only infinite costs: the first plan of the initial choice stays.
+                        let only = PlanSet::parse("rowand").unwrap();
+                        let got = pi.best(&p, only, e, seeded, upper);
+                        assert_eq!((got.0, got.1), (ExactPlan::Scan, f64::INFINITY));
+                    }
+                    decisions += 1;
+                }
+            }
+            q.clear_bits(&mut bits);
+        }
+        assert!(
+            decisions > 0 && skipped > 0,
+            "{skipped} skips in {decisions} choices"
+        );
     }
 
     #[test]
