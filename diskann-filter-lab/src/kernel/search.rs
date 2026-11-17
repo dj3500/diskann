@@ -511,12 +511,15 @@ impl Plan {
         })
     }
 
-    /// Whether the plan may build dense bitmaps (materializers or the exact `bitmap` plan).
+    /// Whether the plan may build dense bitmaps (materializers or the exact `bitmap` and
+    /// `rowand` plans).
     pub fn needs_dense(&self) -> bool {
         matches!(
             self.kernel.materializer,
             Materializer::Dense | Materializer::DenseStatic
-        ) || (self.kernel.exact.is_planned() && self.kernel.exact_plans.contains(ExactPlan::Bitmap))
+        ) || (self.kernel.exact.is_planned()
+            && (self.kernel.exact_plans.contains(ExactPlan::Bitmap)
+                || self.kernel.exact_plans.contains(ExactPlan::RowAnd)))
     }
 
     /// The same plan without its hand-specialized fast path (every query runs the

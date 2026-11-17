@@ -27,7 +27,10 @@
 //!   inside the answer bound (heap not full, or distance ≤ the heap's K-th: ties are checked);
 //! - `gallop`: galloping intersection, then distances;
 //! - `bitmap`: dense match bitmap (static bitsets ORed word by word, rare labels scattered),
-//!   enumerated in id order, then distances.
+//!   enumerated in id order, then distances;
+//! - `rowand`: the words holding members of `union(c*)`, each ANDed with the residual
+//!   clauses word by word (bitset words; galloping cursors in the postings of labels without
+//!   a bitset; [`Materialized::build_rowand`]), enumerated, then distances.
 //!
 //! Every plan processes *every* candidate, so the answers are the exact top-K. With a
 //! *seeded* answer heap (the graph search's answers, after a fallback) the plans keep the
@@ -428,6 +431,17 @@ fn planned<T: Element, P: Eval>(
                 }
             }
             ctr.n_exact_cand += out.len() as u64;
+            toc(t, &mut ctr.t_check_ns);
+            let t = tic(ctr);
+            distances(&mat.matches, vectors, query, answers, seeded, ctr);
+            toc(t, &mut ctr.t_dist_ns);
+        }
+        ExactPlan::RowAnd => {
+            let t = tic(ctr);
+            mat.ensure_dense(n_data);
+            // The query was split against the static bitsets iff the evaluator reads them.
+            let split = P::NAME == StaticBits::NAME && cx.stat.n_points() == n_data;
+            ctr.n_exact_cand += mat.build_rowand(cx.labels, cx.q, n_data, split.then_some(cx.stat));
             toc(t, &mut ctr.t_check_ns);
             let t = tic(ctr);
             distances(&mat.matches, vectors, query, answers, seeded, ctr);

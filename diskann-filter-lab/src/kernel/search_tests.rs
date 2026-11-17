@@ -949,7 +949,12 @@ fn khpad(edits: &[(&str, &str)]) -> Kernel {
 fn planned_exact_plans_are_exact() {
     use super::cost::{ExactPlan, UnitCosts};
     let f = fixture(300, 5, false);
-    let costs = UnitCosts::default();
+    // With the A6 enumeration costs (`rowand` is a candidate).
+    let costs = UnitCosts {
+        enum_word_ns: 0.3,
+        enum_bit_ns: 2.0,
+        ..UnitCosts::default()
+    };
     let sketches = crate::sketches::LabelSketches::build(&f.labels, 16, 3, 1);
     for with_bits in [false, true] {
         let ix = Index {
@@ -958,7 +963,15 @@ fn planned_exact_plans_are_exact() {
             sketches: Some(&sketches),
             ..f.index()
         };
-        for plans in ["scan", "df", "gallop", "bitmap", "scan+df+gallop+bitmap"] {
+        for plans in [
+            "scan",
+            "df",
+            "gallop",
+            "bitmap",
+            "rowand",
+            "scan+df+gallop+bitmap",
+            "scan+df+gallop+bitmap+rowand",
+        ] {
             for estimates in ["bounds", "sketch"] {
                 let k = kernel(&[
                     ("exact", "planned(18446744073709551615)"),

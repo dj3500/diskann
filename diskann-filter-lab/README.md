@@ -148,7 +148,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
-| `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap` (default) or any subset |
+| `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap+rowand` (default) or any subset (`rowand` needs a calibration with the A6 enumeration costs) |
 | `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector), `graph` (graph only, track G: the estimates set the list size and the post-filter route, the exact path is never taken; the hopeless gate does not apply) |
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
@@ -200,11 +200,18 @@ predicate check per evaluator, row length and access pattern; per-query material
 exact paths per candidate; distances).
 
 **Exact path v2** (`exact = "planned(T)"`, module `kernel::exact`): for a query routed to the
-exact path, a cost model (`kernel::cost`) chooses the cheapest of four plans from the posting
+exact path, a cost model (`kernel::cost`) chooses the cheapest of five plans from the posting
 sizes, the estimated union of the smallest clause `A` and match count `M`, and calibrated unit
 costs: `scan` (candidates of the smallest clause, predicate first), `df` (distances first; the
 predicate only within the answer heap's K-th distance), `gallop` (galloping intersection of
-the clauses' postings) and `bitmap` (a dense match bitmap built with the static bitsets).
+the clauses' postings), `bitmap` (a dense match bitmap built with the static bitsets) and
+`rowand` (batch A6: only the bitmap words that hold members of the smallest clause, ANDed
+clause by clause with the other clauses' bitset words, prefetched, and with the postings of
+their labels without a bitset through galloping cursors; no memory beyond one bitmap of
+scratch). The bitmap's enumeration is priced per empty word and per set bit (A6; older
+calibrations price every word as if 10 % of its bits were set, which made `bitmap` look 5 to
+20 times dearer than it is on selective queries), and `rowand` is a candidate only with those
+costs, so older calibrations reproduce the earlier choices.
 Candidate rows and vectors are prefetched in a software pipeline, and checks use the static
 bitsets when the run has them. Every candidate of `scan` and `df` (and every point of the probe
 below) is a member of `union(c*)`, so with `exact_checks = "residual"` only the residual
@@ -217,7 +224,8 @@ only): memory-access costs as functions of the candidate density on random point
 mostly misses of the first clause) and on members of the calibration predicates' `union(c0)`
 checked like the exact path's candidates, separately for predicates whose residual clauses
 read rows and bitset-only ones (`pred_row_ns`, `pred_bits_ns`; used for `scan` and `df`);
-merge and bitmap costs; galloping steps by gap, measured with the gallop plan on label pairs
+merge and bitmap costs (enumeration per empty word and per set bit: bitmaps with 0 to 1/16 of
+their bits set); galloping steps by gap, measured with the gallop plan on label pairs
 whose posting lengths have that ratio (`gallop_gap_ns`: cache misses grow with the gap); graph-search costs per distance and per predicate (and per distance by list size up to
 L = 40,960: long beams cost more per distance), and the predicate evaluations of `heap_bound`
 and `distance_first` searches (below). With a graph it also measures the effort curve of

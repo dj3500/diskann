@@ -18,7 +18,9 @@
 //!   repetition keeps sparse candidates out of the caches).
 //! - **Postings**: the k-way merge with deduplication of real posting lists (ns per entry and
 //!   binary level), galloping intersection of the calibration predicates (ns per modelled
-//!   probe), bitmap word operations, scatters and enumeration.
+//!   probe), bitmap word operations, scatters and enumeration (per word of a bitmap with
+//!   10 % of its bits set; batch A6: per empty word and per set bit, least squares over
+//!   bitmaps with 0 to 1/16 of their bits set).
 //! - **Probe**: ns per sampled point of a sketch probe (every clause evaluated on random points,
 //!   prefetched like the probe).
 //! - **Member checks by residual shape** (`check_base_ns`, `check_word_ns`,
@@ -383,6 +385,60 @@ pub fn calibrate<T: Element>(
         ev.push(t.elapsed().as_nanos() as f64 / words as f64);
     }
     let enum_ns = median(&mut ev);
+    // Batch A6: the same loop on bitmaps with 0, 1/1024, 1/128 and 1/16 of their bits set (a
+    // match bitmap is mostly empty words): ns per empty word (no bit set), and per set bit the
+    // least-squares slope through it of the sparse bitmaps (at most one bit per word: each
+    // set bit then costs a mispredicted branch; the 1/16 bitmap is recorded, not fitted).
+    // Medians of at least 11 repetitions.
+    let mut enum_fit = Vec::new();
+    for inv in [0u64, 1024, 128, 16] {
+        let bitmap: Vec<u64> = (0..words)
+            .map(|_| {
+                let mut w = 0u64;
+                if inv > 0 {
+                    for b in 0..64 {
+                        if rng.below(inv as usize) == 0 {
+                            w |= 1 << b;
+                        }
+                    }
+                }
+                std::hint::black_box(w)
+            })
+            .collect();
+        let per_word = bitmap.iter().map(|w| w.count_ones() as f64).sum::<f64>() / words as f64;
+        let mut tv = Vec::new();
+        for _ in 0..opts.reps.max(11) {
+            mat.matches.clear();
+            let b = std::hint::black_box(&bitmap[..]);
+            let t = Instant::now();
+            for (w, &x) in b.iter().enumerate() {
+                let mut x = x;
+                while x != 0 {
+                    mat.matches.push(((w as u32) << 6) | x.trailing_zeros());
+                    x &= x - 1;
+                }
+            }
+            std::hint::black_box(&mat.matches);
+            tv.push(t.elapsed().as_nanos() as f64 / words as f64);
+        }
+        enum_fit.push((per_word, median(&mut tv)));
+    }
+    let enum_word_ns = enum_fit[0].1;
+    let enum_bit_ns = {
+        let sparse = enum_fit[1..].iter().filter(|&&(x, _)| x > 0.0 && x <= 1.0);
+        let (sxy, sxx) = sparse.fold((0.0, 0.0), |(a, b), &(x, y)| {
+            (a + x * (y - enum_word_ns), b + x * x)
+        });
+        if sxx > 0.0 {
+            (sxy / sxx).max(0.01)
+        } else {
+            0.01
+        }
+    };
+    details.insert(
+        "enum_fit".into(),
+        json!({"bits_per_word_ns": enum_fit, "enum_word_ns": enum_word_ns, "enum_bit_ns": enum_bit_ns}),
+    );
 
     // Probe: every clause on random points, prefetched like the probe (128 points per query).
     let mut pv = Vec::new();
@@ -689,6 +745,8 @@ pub fn calibrate<T: Element>(
         word_ns,
         scatter_ns,
         enum_ns,
+        enum_word_ns,
+        enum_bit_ns,
         probe_ns,
         sketch_ns: merge_ns,
         graph_dist_ns,

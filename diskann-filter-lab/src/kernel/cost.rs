@@ -22,10 +22,25 @@
 //!                 S_j = A·survival_j, probes(s, p) = gallop·s·(1 + log2(1 + p/s))
 //! bitmap          Σ_j (n/64 words per bitset label, |post ℓ| scatters otherwise, n/64 per
 //!                 clause fill and AND) + n/64 enumerated words + M·dist(M/n)
+//! rowand          words(c*) + W·(base(ρ) + Σ_{j≥1} reach_j·hot_j·word(ρ))
+//!                 + Σ_{j≥1} Σ_{ℓ rare in c_j} probes(min(W·reach_j, P_j), |post ℓ|) + M·enum_bit
+//!                 + M·dist(M/n)
 //! ```
 //!
 //! with `merge(c*) = P*·merge·log2 k` for a clause of `k ≥ 2` labels (a single posting list is
-//! read in place). The candidates checked by `scan` and `distance_first` are members of
+//! read in place). The bitmap's enumeration costs `n/64·enum_word + M·enum_bit` when those are
+//! calibrated (batch A6; older calibrations: `n/64·enum`, measured on a bitmap with 10 % of its
+//! bits set, which prices every query as if its bitmap were that dense); A6 calibrations also
+//! price a later clause of one bitset label as one AND pass, as built. `rowand` (A6: the AND
+//! of the clauses' rows, word by word) visits the `W = n/64·(1 − e^{−64A/n})` words holding
+//! members of `union(c*)` (`words(c*)`: `P*` scatters or reads of `c*`'s postings, or the
+//! `n/64` words of its bitset rows streamed when it has frequent labels), ANDs each with the
+//! residual clauses (`hot_j` bitset words per word reached, priced like a member check's words
+//! with the shape-resolved curves; labels without a bitset by galloping cursors over their
+//! postings, moved only when a word reaches the clause's next entry: at most
+//! `min(W·reach_j, P_j)` times) and stops at the first clause that clears it (`reach_j`: the
+//! chance that a word of `A/W` members survives clauses `1..j`); it is a candidate only with
+//! the A6 enumeration costs. The candidates checked by `scan` and `distance_first` are members of
 //! `union(c*)`: `pred` is the cost of checking a member (the residual clauses). Calibrations
 //! with the shape-resolved curves (batch A1b) price it from the query's residual clauses:
 //! `base(ρ) + words·word(ρ) + prefetch·pf(ρ) + reads·row(ρ)`, with the bitset words probed and
@@ -74,8 +89,14 @@ pub struct UnitCosts {
     pub word_ns: f64,
     /// Per posting entry scattered into a bitmap.
     pub scatter_ns: f64,
-    /// Per bitmap word enumerated.
+    /// Per bitmap word enumerated (a bitmap with 10 % of its bits set: about 6.4 per word).
     pub enum_ns: f64,
+    /// Per bitmap word enumerated without set bits, and per set bit enumerated (batch A6; 0
+    /// in older calibrations: then `enum_ns` per word, and no `rowand` plan).
+    #[serde(default)]
+    pub enum_word_ns: f64,
+    #[serde(default)]
+    pub enum_bit_ns: f64,
     /// Per sampled point of a sketch probe (row read and every clause, batch-prefetched).
     pub probe_ns: f64,
     /// Per sketch entry merged by a probe.
@@ -179,6 +200,8 @@ impl Default for UnitCosts {
             word_ns: 0.6,
             scatter_ns: 2.0,
             enum_ns: 0.8,
+            enum_word_ns: 0.0,
+            enum_bit_ns: 0.0,
             probe_ns: 120.0,
             sketch_ns: 6.0,
             graph_dist_ns: 60.0,
@@ -334,7 +357,7 @@ impl UnitCosts {
                 .chain(&self.check_word_ns)
                 .chain(&self.check_prefetch_ns)
                 .chain(&self.check_row_ns)
-                .chain(&[self.query_ns])
+                .chain(&[self.query_ns, self.enum_word_ns, self.enum_bit_ns])
                 .all(|x| x.is_finite() && *x >= 0.0),
             "unit costs must be finite and non-negative"
         );
@@ -386,6 +409,22 @@ impl UnitCosts {
     /// Whether the shape-resolved check curves are calibrated.
     pub fn has_shape(&self) -> bool {
         !self.check_base_ns.is_empty()
+    }
+
+    /// Whether the A6 enumeration costs (per empty word, per set bit) are calibrated: the
+    /// bitmap's enumeration is then priced by its set bits, and `rowand` is a candidate plan.
+    pub fn has_enum_bits(&self) -> bool {
+        self.enum_bit_ns > 0.0
+    }
+
+    /// Cost of enumerating a bitmap of `words` words holding `bits` set bits (older
+    /// calibrations: `enum_ns` per word, whatever the bits).
+    pub fn enumerate(&self, words: f64, bits: f64) -> f64 {
+        if self.has_enum_bits() {
+            words * self.enum_word_ns + bits * self.enum_bit_ns
+        } else {
+            words * self.enum_ns
+        }
     }
 
     /// Cost of checking one member of `union(c*)` with the expected work `w` at density
@@ -632,10 +671,19 @@ pub enum ExactPlan {
     Gallop = 3,
     /// Dense match bitmap (static bitsets for frequent labels), then distances.
     Bitmap = 4,
+    /// The words of `c*`'s union ANDed with the residual clauses' rows word by word (bitset
+    /// words; galloping cursors in the postings of labels without a bitset), then distances.
+    RowAnd = 5,
 }
 
 impl ExactPlan {
-    pub const ALL: [Self; 4] = [Self::Scan, Self::DistanceFirst, Self::Gallop, Self::Bitmap];
+    pub const ALL: [Self; 5] = [
+        Self::Scan,
+        Self::DistanceFirst,
+        Self::Gallop,
+        Self::Bitmap,
+        Self::RowAnd,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -643,6 +691,7 @@ impl ExactPlan {
             Self::DistanceFirst => "df",
             Self::Gallop => "gallop",
             Self::Bitmap => "bitmap",
+            Self::RowAnd => "rowand",
         }
     }
 
@@ -652,7 +701,8 @@ impl ExactPlan {
             "df" | "distance_first" => Self::DistanceFirst,
             "gallop" => Self::Gallop,
             "bitmap" => Self::Bitmap,
-            _ => anyhow::bail!("unknown exact plan {s:?} (scan, df, gallop, bitmap)"),
+            "rowand" => Self::RowAnd,
+            _ => anyhow::bail!("unknown exact plan {s:?} (scan, df, gallop, bitmap, rowand)"),
         })
     }
 }
@@ -662,7 +712,7 @@ impl ExactPlan {
 pub struct PlanSet(u8);
 
 impl PlanSet {
-    pub const ALL: Self = Self(0b1111);
+    pub const ALL: Self = Self(0b1_1111);
 
     pub fn contains(self, p: ExactPlan) -> bool {
         self.0 & (1 << (p as u8 - 1)) != 0
@@ -672,7 +722,7 @@ impl PlanSet {
         self.0 == 0
     }
 
-    /// Parses `scan+df+gallop+bitmap` (any non-empty subset).
+    /// Parses `scan+df+gallop+bitmap+rowand` (any non-empty subset).
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         let mut m = 0u8;
         for p in s.split('+') {
@@ -1025,8 +1075,19 @@ impl PlanInputs<'_> {
             }
             ExactPlan::Bitmap => {
                 let words = (n / 64.0).ceil();
-                let mut cost = words * (c.enum_ns + c.word_ns);
+                let mut cost = c.enumerate(words, m) + words * c.word_ns;
                 for j in 0..self.q.n_clauses() {
+                    // A6 calibrations: a later clause of one bitset label is ANDed in directly
+                    // (one pass, as built).
+                    let clause = self.q.clause(j);
+                    if j > 0
+                        && c.has_enum_bits()
+                        && clause.len() == 1
+                        && self.bitsets.and_then(|b| b.slot(clause[0])).is_some()
+                    {
+                        cost += words * c.word_ns;
+                        continue;
+                    }
                     cost += if j == 0 { 1.0 } else { 2.0 } * words * c.word_ns;
                     for &l in self.q.clause(j) {
                         cost += match self.bitsets.and_then(|b| b.slot(l)) {
@@ -1037,7 +1098,109 @@ impl PlanInputs<'_> {
                 }
                 cost + dist_m
             }
+            ExactPlan::RowAnd => {
+                if !c.has_enum_bits() {
+                    return f64::INFINITY;
+                }
+                self.row_and(c, e, upper) + c.enumerate(0.0, m) + dist_m
+            }
         }
+    }
+
+    /// Cost of `rowand` before its enumeration and distances (see the module documentation).
+    fn row_and(&self, c: &UnitCosts, e: &Estimates, upper: bool) -> f64 {
+        let q = self.q;
+        let n = e.n.max(1.0);
+        let words = (n / 64.0).ceil();
+        let nc = q.n_clauses();
+        if nc == 0 {
+            return words * c.word_ns;
+        }
+        let split = self.bitsets.is_some();
+        let hot = |j: usize| if split { q.static_slots(j).len() } else { 0 };
+        let rare = |j: usize| if split { q.row_labels(j) } else { q.clause(j) };
+        let posts = |j: usize| -> f64 {
+            rare(j)
+                .iter()
+                .map(|&l| self.labels.posting_len(l) as f64)
+                .sum()
+        };
+        let u0 = q.upper_bound(0) as f64;
+        let a = if upper { u0 } else { e.a.min(u0) }.max(0.0);
+        // Words of c*: its rare postings read in place (one list) or scattered, and its
+        // bitset rows streamed (every word).
+        let (h0, p0) = (hot(0) as f64, posts(0));
+        let mut cost = if h0 > 0.0 {
+            let r0 = if p0 > 0.0 { 1.0 } else { 0.0 };
+            words * ((h0 + r0) * c.word_ns + c.enumerate(1.0, 0.0)) + p0 * c.scatter_ns
+        } else {
+            let lists = rare(0)
+                .iter()
+                .filter(|&&l| self.labels.posting_len(l) > 0)
+                .count();
+            let summary = if lists > 1 {
+                (words / 64.0).ceil() * c.word_ns
+            } else {
+                0.0
+            };
+            p0 * c.scatter_ns + summary
+        };
+        // Distinct words of `a` members spread over the data points.
+        let w = (words * -(-a / words).exp_m1()).min(a);
+        if w < 1e-9 {
+            return cost;
+        }
+        let per_word = a / w;
+        let rho = (a / n).clamp(0.0, 1.0);
+        let (base, probe) = if c.has_shape() {
+            (
+                c.curve(&c.check_base_ns, rho),
+                c.curve(&c.check_word_ns, rho),
+            )
+        } else {
+            (c.pred_member(false, rho), 0.0)
+        };
+        cost += w * base;
+        // `reach`: the fraction of the visited words that reach clause `j`.
+        let (mut reach, mut prev) = (1.0, 1.0);
+        for j in 1..nc {
+            let cur = if upper {
+                1.0
+            } else {
+                let s = e
+                    .survival
+                    .get(j - 1)
+                    .copied()
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                1.0 - (1.0 - s).powf(per_word)
+            };
+            let p = if prev > 0.0 {
+                (cur / prev).min(1.0)
+            } else {
+                0.0
+            };
+            let s = hot(j) as f64;
+            let reads = if upper {
+                s
+            } else {
+                s * (1.0 - p) + s.min(1.0) * p
+            };
+            let at = w * reach;
+            cost += at * reads * probe;
+            // The cursors of the labels without a bitset move at most once per entry or word
+            // reached.
+            let events = at.min(posts(j));
+            if events >= 1.0 {
+                for &l in rare(j) {
+                    let len = self.labels.posting_len(l) as f64;
+                    cost += c.gallop(len / events) * events * (1.0 + (1.0 + len / events).log2());
+                }
+            }
+            reach *= if upper { 1.0 } else { p };
+            prev = cur;
+        }
+        cost
     }
 
     /// The cheapest plan of `plans` and its cost.
@@ -1400,7 +1563,12 @@ mod tests {
         assert_eq!(e.m, 100.0);
         let up = Estimates::upper(&q, 1000);
         assert_eq!((up.m, up.survival.clone()), (200.0, vec![1.0]));
-        let c = UnitCosts::default();
+        let old = UnitCosts::default();
+        let c = UnitCosts {
+            enum_word_ns: 0.3,
+            enum_bit_ns: 2.0,
+            ..UnitCosts::default()
+        };
         let pi = PlanInputs {
             q: &q,
             labels: &s,
@@ -1412,6 +1580,21 @@ mod tests {
             assert!(x.is_finite() && x > 0.0, "{p:?}");
             assert!(pi.cost(&c, p, &up, false, true) >= x, "{p:?}: upper bound");
         }
+        // Without the A6 enumeration costs: no `rowand`, the bitmap enumerates at `enum_ns`
+        // per word whatever its matches.
+        assert_eq!(
+            pi.cost(&old, ExactPlan::RowAnd, &e, false, false),
+            f64::INFINITY
+        );
+        let words = (1000.0f64 / 64.0).ceil();
+        assert!(
+            (pi.cost(&old, ExactPlan::Bitmap, &e, false, false)
+                - pi.cost(&c, ExactPlan::Bitmap, &e, false, false)
+                - words * (old.enum_ns - c.enum_word_ns)
+                + e.m * c.enum_bit_ns)
+                .abs()
+                < 1e-6
+        );
         // Distance-first evaluates fewer predicates once seeded.
         assert!(
             pi.cost(&c, ExactPlan::DistanceFirst, &e, true, false)
@@ -1422,7 +1605,7 @@ mod tests {
         assert!(best <= pi.best(&c, only_scan, &e, false, false).1);
         assert_eq!(only_scan.to_string(), "scan");
         assert_eq!(
-            PlanSet::parse("scan+df+gallop+bitmap").unwrap(),
+            PlanSet::parse("scan+df+gallop+bitmap+rowand").unwrap(),
             PlanSet::ALL
         );
         q.clear_bits(&mut bits);
