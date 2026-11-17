@@ -16,8 +16,8 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{
-        Crossover, EstimateSource, ExactChecks, PostfilterRoute, PostfilterStarts, RowReads,
-        StartAdmission, StartSource, Terminator,
+        Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
+        StartSource, Terminator,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -841,7 +841,17 @@ impl Searcher {
                 self.answers.finish(ids, dists)
             } else if d.postfilter {
                 let t = tic(&ctr);
-                let n = self.postfilter(plan, ix, q, d.l, exact_stat, &mut ctr, ids, dists);
+                let n = self.postfilter(
+                    plan,
+                    ix,
+                    q,
+                    d.l,
+                    d.postfilter_configured,
+                    exact_stat,
+                    &mut ctr,
+                    ids,
+                    dists,
+                );
                 toc(t, &mut ctr.t_graph_ns);
                 n
             } else {
@@ -977,12 +987,18 @@ impl Searcher {
             _ => l,
         };
         let mut g0 = costs.graph_cost(l0 as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
-        let pf_starts = match kernel.postfilter_starts {
-            PostfilterStarts::Global => ix.global.len(),
-            PostfilterStarts::Configured => start_count(kernel, ix, &self.compiled),
+        let (configured_starts, global_starts) =
+            (start_count(kernel, ix, &self.compiled), ix.global.len());
+        let pf_starts = |rate: f64| {
+            if kernel.postfilter_starts.configured_at(rate) {
+                configured_starts
+            } else {
+                global_starts
+            }
         };
         if kernel.postfilter != PostfilterRoute::Off {
-            g0 = g0.min(postfilter_option(costs, l0, k, bounds.m / bounds.n, n, pf_starts).1);
+            let rate = bounds.m / bounds.n;
+            g0 = g0.min(postfilter_option(costs, l0, k, rate, n, pf_starts(rate)).1);
         }
         let pi = PlanInputs {
             q: &self.compiled,
@@ -1027,6 +1043,7 @@ impl Searcher {
                 est_graph: g0,
                 l,
                 postfilter: false,
+                postfilter_configured: false,
             };
         }
         let est = self.estimates(plan, ix, exact_stat, ctr);
@@ -1064,7 +1081,7 @@ impl Searcher {
         // The post-filter alternative at a list size that holds the K nearest matches.
         let mut postfilter = false;
         if kernel.postfilter != PostfilterRoute::Off {
-            let (l_pf, g_pf) = postfilter_option(costs, l_run, k, rate, n, pf_starts);
+            let (l_pf, g_pf) = postfilter_option(costs, l_run, k, rate, n, pf_starts(rate));
             if g_pf.is_finite()
                 && (kernel.postfilter == PostfilterRoute::Always || hopeless || g_pf <= g)
             {
@@ -1079,11 +1096,12 @@ impl Searcher {
             est_graph: g,
             l: l_run,
             postfilter,
+            postfilter_configured: postfilter && kernel.postfilter_starts.configured_at(rate),
         }
     }
 
     /// The post-filter route: an unfiltered search with list size `l` from the graph's global
-    /// starts; the answers of a `heap(K)` collector over the evaluated nodes, found by
+    /// starts (the configured ones with `configured_starts`); the answers of a `heap(K)` collector over the evaluated nodes, found by
     /// checking them in distance order until `K` matches (with the static bitsets when the
     /// index has them).
     #[expect(
@@ -1096,6 +1114,7 @@ impl Searcher {
         ix: &Index<'_, T>,
         q: &Query<'_, T>,
         l: usize,
+        configured_starts: bool,
         exact_stat: Option<&LabelBitsets>,
         ctr: &mut Counters,
         ids: &mut [u32],
@@ -1103,17 +1122,14 @@ impl Searcher {
     ) -> usize {
         ctr.route = Route::Postfilter;
         self.visited.clear();
-        match plan.kernel.postfilter_starts {
-            PostfilterStarts::Global => {
-                self.starts.clear();
-                for &v in ix.global {
-                    if !self.visited.test_and_set(v) {
-                        self.starts.push(v);
-                    }
+        if configured_starts {
+            self.select_starts(plan, ix, q, ctr);
+        } else {
+            self.starts.clear();
+            for &v in ix.global {
+                if !self.visited.test_and_set(v) {
+                    self.starts.push(v);
                 }
-            }
-            PostfilterStarts::Configured => {
-                self.select_starts(plan, ix, q, ctr);
             }
         }
         ctr.n_start = self.starts.len() as u64;

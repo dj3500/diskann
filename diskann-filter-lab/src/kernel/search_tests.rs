@@ -372,6 +372,79 @@ fn configs() -> Vec<(String, Kernel)> {
     out
 }
 
+/// A relabeled index (an isomorphic id layout, `crate::permute`) answers with the same points:
+/// for every configuration the same answer distances and, below the K-th distance (where ties
+/// are broken by id), the same points; the configurations without id-dependent rules expand
+/// the same nodes.
+#[test]
+fn permuted_layouts_return_the_same_answers() {
+    use crate::permute::{permute_rows, Permutation};
+    for aux in [false, true] {
+        let f = fixture(300, 41 + u64::from(aux), aux);
+        let n = f.base.nrows();
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let mut rng = Lcg(5);
+        for i in (1..n).rev() {
+            order.swap(i, rng.below(i as u32 + 1) as usize);
+        }
+        let p = Permutation::from_order(order).unwrap();
+        let labels = f.labels.clone().permute(&p, 3).unwrap();
+        let starts = f.starts.permuted(&p).unwrap();
+        let g = Fixture {
+            base: permute_rows(&f.base, &p),
+            queries: f.queries.clone(),
+            graph: f.graph.permuted(&p).unwrap(),
+            preds: f.preds.clone(),
+            sample: SampleIndex::build(&starts, &labels).unwrap(),
+            bitsets: LabelBitsets::build(&labels, 1),
+            starts,
+            labels,
+        };
+        for v in 0..n as u32 {
+            assert_eq!(g.labels.row(p.new_id(v)), f.labels.row(v));
+        }
+        let (ia, ib) = (f.index(), g.index());
+        for (name, kernel) in configs() {
+            let pa = Plan::new(&kernel, &ia).unwrap();
+            let pb = Plan::new(&kernel, &ib).unwrap();
+            let mut sa = Searcher::for_index(&ia, &[&pa]);
+            let mut sb = Searcher::for_index(&ib, &[&pb]);
+            let same_nodes = ["postfilter", "upstream-inline", "cp"].contains(&name.as_str());
+            for q in 0..f.preds.len() {
+                for l in [10, 40] {
+                    let (ra, ca) = search(&f, &mut sa, &pa, q, l, 10, None);
+                    let (rb, cb) = search(&g, &mut sb, &pb, q, l, 10, None);
+                    let what = format!("{name} aux={aux} q={q} L={l}");
+                    let (da, db): (Vec<f32>, Vec<f32>) = (
+                        ra.iter().map(|x| x.0).collect(),
+                        rb.iter().map(|x| x.0).collect(),
+                    );
+                    assert_eq!(da, db, "{what}: answer distances");
+                    if let Some(&kth) = da.last() {
+                        let below = |r: &[(f32, u32)], map: bool| {
+                            let mut ids: Vec<u32> = r
+                                .iter()
+                                .filter(|x| x.0 < kth)
+                                .map(|x| if map { p.new_id(x.1) } else { x.1 })
+                                .collect();
+                            ids.sort_unstable();
+                            ids
+                        };
+                        assert_eq!(below(&ra, true), below(&rb, false), "{what}: answers");
+                    }
+                    if same_nodes {
+                        assert_eq!(
+                            (ca.n_dist, ca.n_expand, ca.n_pred),
+                            (cb.n_dist, cb.n_expand, cb.n_pred),
+                            "{what}: counters"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn every_configuration_returns_valid_answers() {
     for aux in [false, true] {
@@ -1759,6 +1832,66 @@ fn the_postfilter_route_with_the_configured_starts_keeps_the_heap_answers() {
         routed > 0 && fewer > 0,
         "routed {routed}, fewer checks {fewer}"
     );
+}
+
+#[test]
+fn by_rate_starts_are_the_global_ones_for_broad_predicates() {
+    // `postfilter_starts = by_rate`: the route of a broad predicate (estimated match rate at
+    // least 1/2) is the `global` route, that of a narrow one the `configured` route.
+    let f = fixture(300, 47, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts {
+        graph_alpha: 2.0,
+        graph_beta: 10.0,
+        pred_ns: vec![1e9; 6],
+        dist_ns: vec![1e9; 6],
+        ..super::cost::UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..f.index()
+    };
+    let route = |starts: &'static str| {
+        khpad(&[
+            ("exact", "planned"),
+            ("crossover", "cost"),
+            ("estimates", "sketch"),
+            ("terminator", "posting_l(4)"),
+            ("laziness", "heap_bound"),
+            ("postfilter", "always"),
+            ("postfilter_starts", starts),
+        ])
+    };
+    let plans: Vec<Plan> = ["by_rate", "global", "configured"]
+        .into_iter()
+        .map(|s| Plan::new(&route(s), &ix).unwrap())
+        .collect();
+    let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+    let (mut broad, mut narrow) = (0, 0);
+    for q in 0..f.preds.len() {
+        for kk in [1, 10] {
+            let (out, ctr) = search_ix(&f, &ix, &mut st, &plans[0], q, 20, kk);
+            if ctr.route != Route::Postfilter {
+                continue;
+            }
+            let is_broad = ctr.m_hat as f64 / 300.0 >= super::cost::BROAD_RATE;
+            let want = &plans[if is_broad { 1 } else { 2 }];
+            let (wout, wctr) = search_ix(&f, &ix, &mut st, want, q, 20, kk);
+            assert_eq!(out, wout, "q={q} K={kk} broad={is_broad}");
+            assert_eq!(
+                (ctr.n_dist, ctr.n_start, ctr.final_l),
+                (wctr.n_dist, wctr.n_start, wctr.final_l),
+                "q={q} K={kk} broad={is_broad}"
+            );
+            if is_broad {
+                broad += 1;
+            } else {
+                narrow += 1;
+            }
+        }
+    }
+    assert!(broad > 0 && narrow > 0, "broad {broad}, narrow {narrow}");
 }
 
 #[test]

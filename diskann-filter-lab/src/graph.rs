@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use crate::{
     container,
     labels::LabelStore,
+    permute::Permutation,
     predicate::Cnf,
     vectors::{DType, Element, Matrix},
 };
@@ -371,6 +372,26 @@ impl Graph {
         }
         self.starts = starts;
         Ok(())
+    }
+
+    /// The graph under the new ids of `p` (rows keep their neighbor order; auxiliary nodes
+    /// keep their ids).
+    pub fn permuted(&self, p: &Permutation) -> Result<Self> {
+        ensure!(
+            p.len() == self.n_data(),
+            "the permutation covers {} points, the graph has {} data points",
+            p.len(),
+            self.n_data()
+        );
+        let mut g = Self::new(self.n_data(), self.r_max, self.aux.clone())?;
+        let mut row = Vec::with_capacity(self.r_max);
+        for new in 0..self.n_nodes() as u32 {
+            row.clear();
+            row.extend(self.neighbors(p.old_id(new)).iter().map(|&v| p.new_id(v)));
+            g.set_neighbors(new, &row)?;
+        }
+        g.set_starts(self.starts.iter().map(|&s| p.new_id(s)).collect())?;
+        Ok(g)
     }
 
     /// Degrees and adjacency rows for bulk filling. The caller must restore the invariants

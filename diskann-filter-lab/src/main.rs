@@ -71,6 +71,10 @@ enum Command {
     /// Build a graph with the lab's parallel Vamana builder (optionally recording candidate
     /// pools), or replay recorded pools with a pruning rule.
     Build(diskann_filter_lab::build::cli::BuildArgs),
+    /// Relabel the data points (an isomorphic id layout, e.g. a k-means tree order): writes
+    /// permuted copies of the base, labels, ground truth and sketches (links to the query
+    /// files) and of the graph and its start table.
+    Permute(PermuteArgs),
     /// Summarize a lab file (labels, predicates, ground truth, graph, starts) or a vector file.
     Info {
         path: PathBuf,
@@ -352,6 +356,54 @@ enum SketchesCommand {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum OrderArg {
+    /// Unchanged ids (a copy in the lab's formats).
+    Identity,
+    /// Breadth-first from the graph's first start.
+    Bfs,
+    /// k-means tree (`--fanout` clusters per split, leaves of at most `--leaf` points).
+    Kmeans,
+}
+
+#[derive(Args)]
+struct PermuteArgs {
+    /// Dataset directory (base vectors, `labels.flab`, query files, ground truth `*.fgt`).
+    #[arg(long)]
+    dataset: PathBuf,
+    /// The graph: a directory with `graph.flab`, a `graph.flab`, or a DiskANN index prefix.
+    #[arg(long)]
+    graph: PathBuf,
+    /// Start table of the graph (default: the graph's `starts.flab`, if any).
+    #[arg(long)]
+    starts_sidecar: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    order: OrderArg,
+    /// Clusters per split of the k-means tree.
+    #[arg(long, default_value_t = 64)]
+    fanout: usize,
+    /// Most points of a k-means tree leaf.
+    #[arg(long, default_value_t = 256)]
+    leaf: usize,
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    /// Sketch sizes to build over the permuted labels (`sketches-b<b>.flab`); the priorities
+    /// are functions of the new ids.
+    #[arg(short = 'b', long, value_delimiter = ',')]
+    sketches: Vec<usize>,
+    /// Seed of the sketch priorities.
+    #[arg(long, default_value_t = 0)]
+    sketch_seed: u64,
+    #[arg(short, long, default_value_t = 4)]
+    threads: usize,
+    /// Output dataset directory.
+    #[arg(long)]
+    out_dataset: PathBuf,
+    /// Output graph directory (`graph.flab`, `starts.flab`).
+    #[arg(long)]
+    out_graph: PathBuf,
+}
+
 #[derive(Args)]
 struct CalibrateArgs {
     /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
@@ -492,8 +544,157 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Permute(args) => match DType::from_path(&run::data::base_file(&args.dataset)?)? {
+            DType::U8 => permute::<u8>(&args),
+            DType::F32 => permute::<f32>(&args),
+        },
         Command::Info { path, dtype: d } => info(&path, d),
     }
+}
+
+/// Fractions of the edges `u → v` between data points with `|new(u) − new(v)| < 2^s` for each
+/// `s` of `shifts` (the share of neighbors whose vectors, rows and visited bits lie close to
+/// the expanded node's).
+fn edge_spans(g: &Graph, p: &diskann_filter_lab::permute::Permutation, shifts: &[u32]) -> Vec<f64> {
+    let n = g.n_data() as u32;
+    let mut hits = vec![0u64; shifts.len()];
+    let mut edges = 0u64;
+    for u in 0..n {
+        let nu = i64::from(p.new_id(u));
+        for &v in g.neighbors(u) {
+            if v < n {
+                edges += 1;
+                let span = (nu - i64::from(p.new_id(v))).unsigned_abs();
+                for (h, &s) in hits.iter_mut().zip(shifts) {
+                    *h += u64::from(span < (1u64 << s));
+                }
+            }
+        }
+    }
+    hits.iter()
+        .map(|&h| h as f64 / edges.max(1) as f64)
+        .collect()
+}
+
+fn permute<T: Element>(a: &PermuteArgs) -> Result<()> {
+    use diskann_filter_lab::permute::{permute_rows, Order, Permutation};
+    let t0 = Instant::now();
+    let src = std::fs::canonicalize(&a.dataset)?;
+    std::fs::create_dir_all(&a.out_dataset)?;
+    std::fs::create_dir_all(&a.out_graph)?;
+    ensure!(
+        std::fs::canonicalize(&a.out_dataset)? != src,
+        "the output dataset directory is the input"
+    );
+    let base_file = run::data::base_file(&a.dataset)?;
+    let base = Matrix::<T>::read_bin(&base_file)?;
+    let lg = run::data::load_graph(&a.graph, a.starts_sidecar.as_deref(), T::DTYPE)?;
+    let order = match a.order {
+        OrderArg::Identity => Order::Identity,
+        OrderArg::Bfs => Order::Bfs,
+        OrderArg::Kmeans => Order::Kmeans {
+            fanout: a.fanout,
+            leaf: a.leaf,
+            seed: a.seed,
+        },
+    };
+    let t = Instant::now();
+    let p = order.permutation(&lg.graph, &base, a.threads)?;
+    let order_s = secs(t);
+    let shifts = [6u32, 9, 12, 15];
+    let identity = Permutation::identity(p.len());
+    let spans_before = edge_spans(&lg.graph, &identity, &shifts);
+    let spans_after = edge_spans(&lg.graph, &p, &shifts);
+    println!(
+        "order {} of {} points in {order_s:.1} s; edges with |Δid| < 2^{shifts:?}: {spans_before:.3?} -> {spans_after:.3?}",
+        order.name(),
+        p.len()
+    );
+
+    let base_name = base_file
+        .file_name()
+        .context("base file name")?
+        .to_string_lossy()
+        .into_owned();
+    permute_rows(&base, &p).write_bin(&a.out_dataset.join(&base_name))?;
+    drop(base);
+    lg.graph
+        .permuted(&p)?
+        .write(&a.out_graph.join("graph.flab"))?;
+    if let Some(s) = &lg.starts {
+        s.permuted(&p)?.write(&a.out_graph.join("starts.flab"))?;
+    }
+    drop(lg);
+
+    let store = LabelStore::read(&a.dataset.join("labels.flab"))?.permute(&p, a.threads)?;
+    store.write(&a.out_dataset.join("labels.flab"))?;
+    let mut sketch_files = Vec::new();
+    for &b in &a.sketches {
+        let out = a.out_dataset.join(format!("sketches-b{b}.flab"));
+        LabelSketches::build(&store, b, a.sketch_seed, a.threads).write(&out)?;
+        sketch_files.push(out);
+    }
+    drop(store);
+
+    let (mut truths, mut links) = (Vec::new(), Vec::new());
+    let mut names: Vec<String> = std::fs::read_dir(&a.dataset)?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    for name in &names {
+        let from = a.dataset.join(name);
+        if name.ends_with(".fgt") {
+            let gt = GroundTruth::read(&from)?.permuted(&p)?;
+            gt.write(&a.out_dataset.join(name))?;
+            let bin = name.trim_end_matches(".fgt").to_owned() + ".bin";
+            if names.contains(&bin) {
+                gt.write_diskann(&a.out_dataset.join(&bin))?;
+            }
+            truths.push(name.clone());
+        } else if name.starts_with('q')
+            && [".u8bin", ".fbin", ".fpred", ".txt", ".meta.tsv"]
+                .iter()
+                .any(|x| name.ends_with(x))
+        {
+            let to = a.out_dataset.join(name);
+            if to.symlink_metadata().is_ok() {
+                std::fs::remove_file(&to)?;
+            }
+            std::os::unix::fs::symlink(std::fs::canonicalize(&from)?, &to)?;
+            links.push(name.clone());
+        }
+    }
+    let map: &[u8] = bytemuck::cast_slice(p.new_of_old());
+    std::fs::write(a.out_dataset.join("new_of_old.u32"), map)?;
+    let report = json!({
+        "tool": "flab permute",
+        "dataset": src,
+        "graph": a.graph,
+        "starts_sidecar": a.starts_sidecar,
+        "order": order.name(),
+        "seed": a.seed,
+        "n_points": p.len(),
+        "order_s": order_s,
+        "edge_span_shifts": shifts,
+        "edge_spans_before": spans_before,
+        "edge_spans_after": spans_after,
+        "ground_truth": truths,
+        "links": links,
+        "sketches": sketch_files,
+        "sketch_seed": a.sketch_seed,
+        "out_graph": a.out_graph,
+        "new_of_old": "new_of_old.u32 (u32 little-endian: the new id of every old id)",
+        "elapsed_s": secs(t0),
+    });
+    let text = serde_json::to_string_pretty(&report)? + "\n";
+    std::fs::write(a.out_dataset.join("permutation.json"), &text)?;
+    std::fs::write(a.out_graph.join("permutation.json"), &text)?;
+    println!(
+        "permuted in {:.1} s -> {}",
+        secs(t0),
+        a.out_dataset.display()
+    );
+    Ok(())
 }
 
 fn secs(since: Instant) -> f64 {

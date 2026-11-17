@@ -24,6 +24,7 @@ pub mod kernel;
 pub mod label_starts;
 pub mod labels;
 pub mod parallel;
+pub mod permute;
 pub mod predicate;
 pub mod run;
 pub mod sketches;

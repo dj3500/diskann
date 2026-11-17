@@ -22,6 +22,8 @@
 //! reps = 3
 //! mode = "timed"                   # timed | trace | reference
 //! seed = 1                         # order of the configurations per (rep, effort)
+//! hot = false                      # profiling: repeat each search untimed right before its
+//!                                  # timed run (the time with a cached working set)
 //! runs_dir = "<dir>"               # run directories are created here
 //! ledger = "<file>"                # one JSON line per run
 //! bitsets_sidecar = "<bitsets.flab>" # optional static bitsets of `static_bits(θ)` configs
@@ -98,6 +100,7 @@ struct RawExperiment {
     runs_dir: Option<PathBuf>,
     ledger: Option<PathBuf>,
     warmup: Option<bool>,
+    hot: Option<bool>,
     tag: Option<String>,
     trace_rows: Option<Vec<usize>>,
     trace_sample: Option<usize>,
@@ -162,6 +165,9 @@ pub struct Experiment {
     pub runs_dir: Option<PathBuf>,
     pub ledger: Option<PathBuf>,
     pub warmup: bool,
+    /// Profiling: each timed search runs right after an untimed search of the same row and
+    /// effort, so that it finds its working set in the caches (the time without cold misses).
+    pub hot: bool,
     pub tag: Option<String>,
     pub trace_rows: Option<Vec<usize>>,
     pub trace_sample: usize,
@@ -363,6 +369,7 @@ impl Experiment {
             runs_dir: e.runs_dir.map(|p| resolve(dir, &p)),
             ledger: e.ledger.map(|p| resolve(dir, &p)),
             warmup: e.warmup.unwrap_or(true),
+            hot: e.hot.unwrap_or(false),
             tag: e.tag,
             trace_rows: e.trace_rows,
             trace_sample: e.trace_sample.unwrap_or(10),

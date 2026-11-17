@@ -204,6 +204,12 @@ pub enum PostfilterStarts {
     Global,
     /// The configured `starts` of the kernel (e.g. per-label starts of `c*`).
     Configured,
+    /// The configured starts for a narrow predicate (estimated match rate below
+    /// [`BROAD_RATE`](super::cost::BROAD_RATE), where the planner also enlarges the list), the
+    /// global starts for a broad one: its matches are everywhere, so per-label starts carry no
+    /// information about where they are, and the route is an unfiltered search, from the entry
+    /// point the graph was built to be navigable from.
+    ByRate,
 }
 
 impl PostfilterStarts {
@@ -211,8 +217,18 @@ impl PostfilterStarts {
         Ok(match s.trim() {
             "global" => Self::Global,
             "configured" => Self::Configured,
-            _ => bail!("unknown postfilter_starts {s:?} (global, configured)"),
+            "by_rate" => Self::ByRate,
+            _ => bail!("unknown postfilter_starts {s:?} (global, configured, by_rate)"),
         })
+    }
+
+    /// Whether the route starts from the configured starts at estimated match rate `rate`.
+    pub fn configured_at(self, rate: f64) -> bool {
+        match self {
+            Self::Global => false,
+            Self::Configured => true,
+            Self::ByRate => rate < super::cost::BROAD_RATE,
+        }
     }
 }
 
@@ -221,6 +237,7 @@ impl fmt::Display for PostfilterStarts {
         f.write_str(match self {
             Self::Global => "global",
             Self::Configured => "configured",
+            Self::ByRate => "by_rate",
         })
     }
 }

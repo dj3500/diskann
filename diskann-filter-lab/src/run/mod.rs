@@ -664,6 +664,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "interleaving": "per K: for each repetition and effort, the configurations in a seeded shuffled order (re-shuffled per (rep, effort)); queries in panel order",
                 "warmup": exp.warmup && exp.mode == Mode::Timed,
                 "warmup_effort": "the median applicable effort, whole panel, untimed",
+                "hot": exp.hot && exp.mode == Mode::Timed,
                 "prefault": "every page of the base, labels, postings, queries and graph rows read before timing; scratch written at allocation",
             });
             let mut run = serde_json::Map::new();
@@ -865,6 +866,7 @@ fn run_k<T: Element>(
         })
         .collect();
     let (mut tmp_ids, mut tmp_d) = (vec![0u32; k], vec![0f32; k]);
+    let (mut hot_ids, mut hot_d) = (vec![0u32; k], vec![0f32; k]);
 
     match exp.mode {
         Mode::Timed => {
@@ -915,6 +917,9 @@ fn run_k<T: Element>(
                             } else {
                                 (&mut tmp_ids, &mut tmp_d)
                             };
+                            if exp.hot {
+                                st.search(plan, ix, q, l, &mut hot_ids, &mut hot_d, None);
+                            }
                             let cpu0 = sys::thread_cpu_ns();
                             let wall0 = Instant::now();
                             let ctr = st.search(plan, ix, q, l, ids, dists, None);

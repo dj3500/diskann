@@ -89,6 +89,11 @@ flab sketches stats --labels labels.flab -b 64,128,256
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
 
+# An isomorphic id layout: permuted copies of a dataset (base, labels, ground truth, sketches;
+# links to the query files) and of its graph and start table (see below)
+flab permute --dataset <dir> --graph <graph> --order kmeans -b 128 -t 4 \
+        --out-dataset <dir2> --out-graph <graph2>
+
 # Graph construction: the lab's parallel Vamana builder, recording the candidate pools, and
 # prune replay of the pools with another pruning rule (see below)
 flab build --dataset <dir> --prune 'alpha(64, 1.2)' --l-build 100 -t 3 \
@@ -153,12 +158,13 @@ are navigated, never evaluated against the predicate and never returned.
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
 | `postfilter` | `off`, `cost` (a graph-routed query of the cost or guarded crossover takes the post-filter route when its nominal cost is at most the configured graph search's; under `guarded` the route itself is not guarded), `always` (every graph-routed query; a control): see below |
-| `postfilter_starts` | starts of the post-filter route: `global` (the graph's global starts), `configured` (the `starts` role, e.g. per-label starts) |
+| `postfilter_starts` | starts of the post-filter route: `global` (the graph's global starts), `configured` (the `starts` role, e.g. per-label starts), `by_rate` (the configured starts for a narrow predicate, estimated match rate below 1/2; the global starts for a broad one) |
 | `exact_checks` | what the planned exact path and the probe check on their points, all members of `union(c*)`: `residual` (default: the clauses after `c*`, with prefetches for them) or `full` (every clause with the graph search's prefetch policy, as in batch B6) |
 | `weights` | `unit`, `surprisal` (clause weights of the graded scorers) |
 | `beam_width` | `W` (1) |
 | `padding` | `upstream` (beam capacity `L + #starts`, answers from the first `L` entries), `cxx` (capacity `max(L, #starts)`, C++ OR-filtered search), `exact` (capacity `L`, C++ multi-filter search) |
 | `aux_g` | penalty of auxiliary nodes in graded keys (0) |
+| `row_prefetch` | `off` (default), `on`: prefetch the adjacency row of the closest unexpanded node (the next expansion, unless a closer node arrives first) while the current node is expanded; changes no answer or counter |
 
 Illegal combinations are rejected when the configuration is validated (for example `deferred`
 needs `all` / `distance` / `final_beam`; `match_aware` needs `heap`; `bitmap` needs a
@@ -256,8 +262,10 @@ seeded with the graph's answers (route `fallback`). Costs are model costs of the
 so trials are deterministic.
 
 **Post-filter route** (`postfilter = "cost"`, route `postfilter`): an unfiltered search from
-the graph's global starts (or the configured starts, `postfilter_starts = "configured"`) with
-no predicate checks during the traversal; at the end the
+the graph's global starts (or the configured starts, `postfilter_starts = "configured"`; or
+those for a narrow predicate only, `"by_rate"`: a broad predicate's per-label starts say
+nothing about where its matches are, and best-first search from them can settle in a local
+minimum that the graph's own entry point avoids) with no predicate checks during the traversal; at the end the
 evaluated nodes are checked in distance order until `K` matches are found. Its answers are
 those of a `heap(K)` collector over the same traversal (the `K` nearest evaluated matches by
 (distance, id)): the final beam holds the nearest evaluated nodes, so it is checked first and
@@ -311,6 +319,8 @@ seed = 0                         # configuration order per (repetition, effort)
 runs_dir = "/path/to/runs"
 ledger = "/path/to/ledger.jsonl"
 # warmup = true
+# hot = false                    # profiling: each timed search right after an untimed search of
+#                                # the same row and effort (its working set cached)
 # fast_paths = true              # false: no hand-specialized preset loops
 # trace_rows = [0, 5]            # trace mode (or every trace_sample-th row)
 # reference_factor = 20.0        # reference mode: budget = max(factor × n_dist, reference_min)
@@ -340,6 +350,23 @@ Repetitions must return identical results. Outputs per run directory: `run.json`
 squared-L2 distances; rows in panel order), `perquery.tsv` (`effort rep row wall_ns cpu_ns`,
 then the counters), `panel.tsv` (the rows used), `trace/` (trace mode); one ledger line per
 run, failures included.
+
+Large arrays (base vectors, label store, graph rows, the visited bitset) are allocated
+2 MiB-aligned and advised for transparent huge pages (`madvise(MADV_HUGEPAGE)`; with the
+system's THP mode `madvise` or `always`), which removes most TLB misses of a search over a
+large index; `FLAB_HUGEPAGES=off` keeps base pages (`run.json` records whether the advice was
+given and the process's huge-page memory).
+
+**Id layouts** (`flab permute`): relabels the data points by an order, `bfs` (breadth-first
+from the graph's first start) or `kmeans` (a k-means tree: `--fanout` clusters per split,
+centers trained on a sample, recursively down to leaves of at most `--leaf` points; sibling
+clusters in nearest-neighbour chain order), so that points close in space get close ids. It
+writes the permuted base, `labels.flab` (rows reordered, postings mapped), every `*.fgt` (and
+the DiskANN ground truth next to it), sketches rebuilt for `-b` (their priorities are functions
+of the new ids), links to the query files, `new_of_old.u32` and `permutation.json` (with the
+share of graph edges whose ends lie within 2^6 … 2^15 ids before and after), and the permuted
+`graph.flab` and `starts.flab`. Rows keep their neighbour order, so searches expand the same
+nodes in the same order; answers tied at the K-th distance may differ (ties are broken by id).
 
 ## Importing DiskANN indices
 
