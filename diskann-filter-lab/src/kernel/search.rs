@@ -107,6 +107,8 @@ pub enum Route {
     Fallback,
     /// A post-filter search (global starts, no checks during the traversal).
     Postfilter,
+    /// The tree route's search over router trees (`tree_route`).
+    Tree,
 }
 
 impl Route {
@@ -117,6 +119,7 @@ impl Route {
             Self::Empty => "empty",
             Self::Fallback => "fallback",
             Self::Postfilter => "postfilter",
+            Self::Tree => "tree",
         }
     }
 }
@@ -351,6 +354,8 @@ pub struct Plan {
     costs: Option<UnitCosts>,
     /// Evaluator of the planned exact path and of the probe.
     exact_eval: ExactEval,
+    /// The tree route's plan (`tree_route`).
+    tree: Option<Box<Plan>>,
 }
 
 impl Plan {
@@ -534,6 +539,10 @@ impl Plan {
             fast,
             costs,
             exact_eval,
+            tree: kernel
+                .tree_kernel()
+                .map(|k| Plan::new(&k, ix).map(Box::new))
+                .transpose()?,
         })
     }
 
@@ -546,6 +555,7 @@ impl Plan {
         ) || (self.kernel.exact.is_planned()
             && (self.kernel.exact_plans.contains(ExactPlan::Bitmap)
                 || self.kernel.exact_plans.contains(ExactPlan::RowAnd)))
+            || self.tree.as_ref().is_some_and(|t| t.needs_dense())
     }
 
     /// The same plan without its hand-specialized fast path (every query runs the
@@ -790,6 +800,13 @@ impl Searcher {
         reference: Option<u64>,
     ) -> Counters {
         assert_eq!(ids.len(), dists.len());
+        if let Some(tp) = plan.tree.as_deref() {
+            if self.tree_eligible(tp, ix, q) {
+                let mut ctr = self.search(tp, ix, q, l, ids, dists, reference);
+                ctr.route = Route::Tree;
+                return ctr;
+            }
+        }
         let k = ids.len();
         let kernel = &plan.kernel;
         self.row_prefetch = kernel.row_prefetch;
@@ -1172,6 +1189,36 @@ impl Searcher {
             postfilter_late: postfilter && kernel.postfilter_starts.late_at(rate),
             postfilter_both: postfilter && kernel.postfilter_starts.both_at(rate),
         }
+    }
+
+    /// Whether query `q` is tree-eligible: every label of its binding clause (the first clause
+    /// of the query compiled by the tree plan, the one `label(c*)` starts from) has points
+    /// only if its per-label starts are all auxiliary nodes (the roots of its router trees).
+    fn tree_eligible<T: Element>(
+        &mut self,
+        tp: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+    ) -> bool {
+        let Some(t) = ix
+            .label_starts
+            .filter(|_| !ix.label_view && q.view.is_none())
+        else {
+            return false;
+        };
+        self.compiled
+            .compile(ix.labels, q.cnf, tp.kernel.weights, None, &mut self.bits);
+        if self.compiled.is_empty() || self.compiled.n_clauses() == 0 {
+            return false;
+        }
+        let n = ix.graph.n_data() as u32;
+        self.compiled.clause(0).iter().all(|&l| {
+            ix.labels.posting_len(l) == 0
+                || ((l as usize) < t.n_labels() && {
+                    let s = t.label_starts(l);
+                    !s.is_empty() && s.iter().all(|&v| v >= n)
+                })
+        })
     }
 
     /// The post-filter route: an unfiltered search with list size `l` from the graph's global

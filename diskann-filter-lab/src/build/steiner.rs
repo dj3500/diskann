@@ -601,7 +601,7 @@ mod tests {
                 "a=2"
             };
             let c = if i < 3 { "b=1" } else { "b=2" };
-            b.push_point([("a", a), ("b", c)].into_iter()).unwrap();
+            b.push_point([("a", a), ("b", c)]).unwrap();
         }
         let labels = b.finish().unwrap();
         let id = |s: &str| labels.name_index()[s];
