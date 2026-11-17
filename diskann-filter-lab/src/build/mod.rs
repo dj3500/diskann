@@ -27,6 +27,7 @@ pub mod cli;
 pub mod pools;
 pub mod prune;
 pub mod replay;
+pub mod steiner;
 pub mod stitch;
 
 mod adjacency;

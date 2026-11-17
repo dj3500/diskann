@@ -308,7 +308,7 @@ pub fn rp_leaves<T: Element>(
 /// Strongly connected components of the subgraph of `graph` induced by `nodes`
 /// (`local[v]` = the position of `v` in `nodes`, `u32::MAX` outside): the component of every
 /// listed node and the number of components (iterative Tarjan).
-fn scc(graph: &Graph, nodes: &[u32], local: &[u32]) -> (Vec<u32>, usize) {
+pub(crate) fn scc(graph: &Graph, nodes: &[u32], local: &[u32]) -> (Vec<u32>, usize) {
     const NONE: u32 = u32::MAX;
     let n = nodes.len();
     let mut index = vec![NONE; n];

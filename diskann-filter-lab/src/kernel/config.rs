@@ -126,6 +126,9 @@ pub enum Expander {
     /// `cap` (default: half the graph's row width, i.e. upstream's `max_degree_with_slack / 2`
     /// for upstream-built graphs), expand their matching neighbours.
     TwoHop(Option<usize>),
+    /// Only auxiliary nodes (routers) are expanded; data points are evaluated and collected
+    /// but never expanded (a search over router trees: their leaves' members are scanned).
+    AuxOnly,
 }
 
 /// Terminator role.
@@ -753,7 +756,8 @@ impl Expander {
             ("one_hop", []) => Self::OneHop,
             ("two_hop", []) => Self::TwoHop(None),
             ("two_hop", [c]) => Self::TwoHop(Some(num(c, "two-hop cap")?)),
-            _ => bail!("unknown expander {s:?} (one_hop, two_hop, two_hop(cap))"),
+            ("aux_only", []) => Self::AuxOnly,
+            _ => bail!("unknown expander {s:?} (one_hop, two_hop, two_hop(cap), aux_only)"),
         })
     }
 }
@@ -764,6 +768,7 @@ impl fmt::Display for Expander {
             Self::OneHop => write!(f, "one_hop"),
             Self::TwoHop(None) => write!(f, "two_hop"),
             Self::TwoHop(Some(c)) => write!(f, "two_hop({c})"),
+            Self::AuxOnly => write!(f, "aux_only"),
         }
     }
 }
@@ -1061,6 +1066,10 @@ impl Kernel {
         if let Expander::TwoHop(Some(c)) = self.expander {
             ensure!(c >= 1, "two_hop(cap) needs cap >= 1");
         }
+        ensure!(
+            !(self.expander == Expander::AuxOnly && self.scorer.needs_pilot()),
+            "aux_only cannot use a pilot scorer (the pilot expands the global start)"
+        );
         let two_hop = matches!(self.expander, Expander::TwoHop(_));
         match self.laziness {
             Laziness::Deferred => {
