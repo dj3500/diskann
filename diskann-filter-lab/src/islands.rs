@@ -17,9 +17,13 @@
 //! - `island(s)`: the same route's cost on an island of `s` points at match rate 1,
 //! - gain `g(s) = min(exact(s), base(s)) − island(s)`.
 //!
-//! Labels with `g > 0` and at least [`MIN_SIZE`] members are taken by decreasing
-//! `g(s) / bytes(s)` while the budget lasts, `bytes(s) = s · (8 + 3R)` (its rows at the
-//! expected mean degree `0.75 R`).
+//! Labels with `g > 0` and at least [`MIN_SIZE`] members are taken by decreasing key while the
+//! budget lasts, `bytes(s) = s · (8 + 3R)` (its rows at the expected mean degree `0.75 R`). The
+//! key is the expected saving per byte under a [`Prior`] on which labels queries search in:
+//! `g(s) / bytes(s)` when every label is equally likely (`label`), `g(s)` when a label is as
+//! likely as it is frequent (`data`: `(s/n) · g(s) / bytes(s) ∝ g(s)`). Under `label` small
+//! labels win (a large budget fills with many of them); at 40M the labels that diluted queries
+//! search in can be too large to enter.
 //!
 //! Build: the lab's Vamana builder ([`crate::build::build`], label-blind α-RobustPrune) over each
 //! selected label's member vectors, one island per thread. Local ids are positions in the
@@ -122,13 +126,59 @@ pub fn gains(labels: &LabelStore, c: &UnitCosts, k: usize, r: usize) -> Vec<Gain
         .collect()
 }
 
-/// The labels to build within `budget_bytes`: positive gains by decreasing gain per byte (in
-/// label-id order).
+/// Which labels queries are assumed to search in (the selection's ranking; see the module
+/// documentation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Prior {
+    /// Every label equally likely: rank by gain per byte.
+    #[default]
+    Label,
+    /// A label as likely as it is frequent: rank by gain.
+    Data,
+}
+
+impl Prior {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Data => "data",
+        }
+    }
+
+    fn key(self, g: &Gain) -> f64 {
+        match self {
+            Self::Label => g.gain_ns / g.bytes as f64,
+            Self::Data => g.gain_ns,
+        }
+    }
+}
+
+impl std::str::FromStr for Prior {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "label" => Ok(Self::Label),
+            "data" => Ok(Self::Data),
+            _ => anyhow::bail!("unknown island prior {s:?} (label, data)"),
+        }
+    }
+}
+
+/// The labels to build within `budget_bytes` under the `label` prior (in label-id order).
 pub fn select(gains: &[Gain], budget_bytes: u64) -> Vec<u32> {
+    select_with(gains, budget_bytes, Prior::Label)
+}
+
+/// The labels to build within `budget_bytes`: positive gains by decreasing key of `prior`
+/// (in label-id order).
+pub fn select_with(gains: &[Gain], budget_bytes: u64, prior: Prior) -> Vec<u32> {
     let mut order: Vec<&Gain> = gains.iter().filter(|g| g.gain_ns > 0.0).collect();
     order.sort_by(|a, b| {
-        (b.gain_ns / b.bytes as f64)
-            .total_cmp(&(a.gain_ns / a.bytes as f64))
+        prior
+            .key(b)
+            .total_cmp(&prior.key(a))
             .then(a.label.cmp(&b.label))
     });
     let mut used = 0u64;
@@ -619,5 +669,17 @@ mod tests {
         assert_eq!(select(&gains, island_bytes(300, 32)), vec![0, 3]);
         assert_eq!(select(&gains, u64::MAX), vec![0, 1, 3]);
         assert!(select(&gains, 10).is_empty());
+        // The data prior ranks by gain: 3 > 0 = 1 (ties by label id); with room for 1,200
+        // members it takes 3 and then 0 (1 no longer fits).
+        assert_eq!(
+            select_with(&gains, island_bytes(1200, 32), Prior::Data),
+            vec![0, 3]
+        );
+        let big = [g(0, 100, 1000.0), g(1, 1000, 5000.0)];
+        assert_eq!(select(&big, island_bytes(1000, 32)), vec![0]);
+        assert_eq!(
+            select_with(&big, island_bytes(1000, 32), Prior::Data),
+            vec![1]
+        );
     }
 }

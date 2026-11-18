@@ -425,6 +425,11 @@ enum IslandsCommand {
         /// Output directory (created if needed).
         #[arg(long)]
         out_dir: PathBuf,
+        /// Which labels queries are assumed to search in: `label` (every label equally likely;
+        /// rank by gain per byte) or `data` (as likely as frequent; rank by gain). Files
+        /// `islands-<prior>-b*` for `data`.
+        #[arg(long, default_value = "label")]
+        prior: islands::Prior,
     },
 }
 
@@ -1458,7 +1463,12 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         alpha,
         threads,
         out_dir,
+        prior,
     } = c;
+    let stem = match prior {
+        islands::Prior::Label => "islands".to_owned(),
+        p => format!("islands-{}", p.as_str()),
+    };
     let store = LabelStore::read(&dataset.join("labels.flab"))?;
     let base = Matrix::<T>::read_bin(&run::data::base_file(&dataset)?)?;
     let costs = run::read_costs(&calibration)?;
@@ -1475,7 +1485,12 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
     let unit = 256 * store.n_points() as u64;
     let sels: Vec<(f64, Vec<u32>)> = budget
         .iter()
-        .map(|&f| (f, islands::select(&gains, (f * unit as f64) as u64)))
+        .map(|&f| {
+            (
+                f,
+                islands::select_with(&gains, (f * unit as f64) as u64, prior),
+            )
+        })
         .collect();
     let mut all: Vec<u32> = sels.iter().flat_map(|(_, s)| s.iter().copied()).collect();
     all.sort_unstable();
@@ -1501,7 +1516,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
     for (f, sel) in sels {
         let ix = union.subset(&sel);
         let tag = format!("{}", (f * 1000.0).round() as u64);
-        let out = out_dir.join(format!("islands-b{tag}.flab"));
+        let out = out_dir.join(format!("{stem}-b{tag}.flab"));
         ix.write(&out)?;
         ensure!(
             IslandIndex::read(&out)? == ix,
@@ -1519,6 +1534,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         let report = json!({
             "dataset": dataset,
             "calibration": calibration,
+            "prior": prior,
             "n_points": store.n_points(),
             "budget_fraction": f,
             "budget_bytes": (f * unit as f64) as u64,
@@ -1536,7 +1552,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
             "output": out,
         });
         std::fs::write(
-            out_dir.join(format!("islands-b{tag}.json")),
+            out_dir.join(format!("{stem}-b{tag}.json")),
             serde_json::to_string_pretty(&report)? + "\n",
         )?;
         println!(
