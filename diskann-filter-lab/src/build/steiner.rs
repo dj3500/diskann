@@ -13,7 +13,10 @@
 //!   order (the depth-first leaf order of a random-projection tree over all points): the
 //!   members, sorted by that order, in chunks of `b` under leaf routers; routers grouped `b` at
 //!   a time up to one root, which becomes the label's start. A label with at most `b` members
-//!   gets one router over all of them (a posting scan expressed as graph expansion).
+//!   gets one router over all of them (a posting scan expressed as graph expansion). With
+//!   `--partition kmeans` the tree is instead built top-down over the label's own members:
+//!   a node's members are split by k-means (k = min(b, ⌈m / b⌉), a few Lloyd iterations, seeded)
+//!   until at most `b` remain under a leaf router.
 //! - `connector`: for every selected label, one entry per source strongly connected component
 //!   of the subgraph its members induce (the member nearest to the component's centroid);
 //!   with several such components, a b-ary tree of routers over these entries whose root
@@ -46,6 +49,15 @@ pub enum Construction {
     Tree,
     /// Per-label routers over one entry per source component of the induced subgraph.
     Connector,
+}
+
+/// How a `tree` partitions a label's members.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Partition {
+    /// Chunks of `b` in the shared spatial order, grouped bottom-up.
+    Order,
+    /// Top-down k-means over the label's own members.
+    Kmeans,
 }
 
 /// Router vectors.
@@ -86,6 +98,12 @@ pub struct SteinerArgs {
     /// Router vectors.
     #[arg(long, value_enum, default_value = "centroid")]
     pub router: RouterVector,
+    /// `tree`: how a label's members are partitioned.
+    #[arg(long, value_enum, default_value = "order")]
+    pub partition: Partition,
+    /// `--partition kmeans`: Lloyd iterations per split.
+    #[arg(long, default_value_t = 4)]
+    pub kmeans_iters: usize,
     /// `tree`: keep the label's previous starts next to its root.
     #[arg(long)]
     pub keep_starts: bool,
@@ -206,6 +224,156 @@ fn tree_over<T: Element>(
     routers
 }
 
+/// A b-ary tree of routers over `members` built top-down by k-means on their own vectors
+/// (`vecs`: the members' rows as `f32`, in the same order): a node with more than `b` members
+/// is split into k = min(b, ⌈m / b⌉) clusters (Lloyd's iterations from k members spread over
+/// the node, seeded by `seed`); empty clusters are dropped and a split that leaves all members
+/// in one cluster falls back to consecutive chunks. Routers are pushed children first, the root
+/// last; their vectors are the centroids of their descendants (`medoid`: the descendant nearest
+/// to it).
+#[expect(clippy::too_many_arguments, reason = "the tree's inputs and options")]
+fn kmeans_tree<T: Element>(
+    base: &Matrix<T>,
+    members: &[u32],
+    vecs: &[f32],
+    b: usize,
+    rv: RouterVector,
+    iters: usize,
+    seed: u64,
+    row: &mut [f32],
+) -> Vec<(Vec<Child>, RouterVec)> {
+    let d = base.ncols();
+    let mut routers: Vec<(Vec<Child>, RouterVec)> = Vec::new();
+    // Work stack of (member positions, parent slot to fill); built post-order by recursion on
+    // an explicit stack: (positions, children collected so far, pending child groups).
+    fn vector_of<T: Element>(
+        base: &Matrix<T>,
+        ids: &[u32],
+        c: Vec<f32>,
+        rv: RouterVector,
+        row: &mut [f32],
+    ) -> RouterVec {
+        match rv {
+            RouterVector::Centroid => RouterVec::Centroid(c),
+            RouterVector::Medoid => RouterVec::Point(nearest_to(base, ids, &c, row)),
+        }
+    }
+    let centroid = |pos: &[usize]| -> Vec<f32> {
+        let mut sum = vec![0f64; d];
+        for &p in pos {
+            for (s, &v) in sum.iter_mut().zip(&vecs[p * d..(p + 1) * d]) {
+                *s += f64::from(v);
+            }
+        }
+        let c = pos.len().max(1) as f64;
+        sum.iter().map(|&s| (s / c) as f32).collect()
+    };
+    let split = |pos: &[usize], salt: u64| -> Vec<Vec<usize>> {
+        let m = pos.len();
+        let k = b.min(m.div_ceil(b)).max(2);
+        // Initial centres: k members evenly spaced in a seeded rotation of the node.
+        let off = (seed ^ salt).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize % m;
+        let mut centres: Vec<f32> = (0..k)
+            .flat_map(|j| {
+                let p = pos[(off + j * m / k) % m];
+                vecs[p * d..(p + 1) * d].to_vec()
+            })
+            .collect();
+        let mut assign = vec![0usize; m];
+        for it in 0..iters.max(1) {
+            for (a, &p) in assign.iter_mut().zip(pos) {
+                let v = &vecs[p * d..(p + 1) * d];
+                let mut best = (f32::INFINITY, 0usize);
+                for j in 0..k {
+                    let c = &centres[j * d..(j + 1) * d];
+                    let dist: f32 = v.iter().zip(c).map(|(x, y)| (x - y) * (x - y)).sum();
+                    if dist < best.0 {
+                        best = (dist, j);
+                    }
+                }
+                *a = best.1;
+            }
+            if it + 1 == iters.max(1) {
+                break;
+            }
+            let mut sums = vec![0f64; k * d];
+            let mut counts = vec![0usize; k];
+            for (&a, &p) in assign.iter().zip(pos) {
+                counts[a] += 1;
+                for (s, &v) in sums[a * d..(a + 1) * d]
+                    .iter_mut()
+                    .zip(&vecs[p * d..(p + 1) * d])
+                {
+                    *s += f64::from(v);
+                }
+            }
+            for j in 0..k {
+                if counts[j] > 0 {
+                    for t in 0..d {
+                        centres[j * d + t] = (sums[j * d + t] / counts[j] as f64) as f32;
+                    }
+                }
+            }
+        }
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); k];
+        for (&a, &p) in assign.iter().zip(pos) {
+            groups[a].push(p);
+        }
+        groups.retain(|g| !g.is_empty());
+        if groups.len() < 2 {
+            return pos.chunks(m.div_ceil(k)).map(<[usize]>::to_vec).collect();
+        }
+        groups
+    };
+    // Post-order construction with an explicit stack: each frame holds a node's positions, its
+    // child groups still to build and the router indices of the children built so far.
+    struct Frame {
+        pos: Vec<usize>,
+        pending: Vec<Vec<usize>>,
+        built: Vec<u32>,
+    }
+    let all: Vec<usize> = (0..members.len()).collect();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut salt = 0u64;
+    let mut push_node = |pos: Vec<usize>,
+                         stack: &mut Vec<Frame>,
+                         routers: &mut Vec<(Vec<Child>, RouterVec)>,
+                         row: &mut [f32]|
+     -> Option<u32> {
+        if pos.len() <= b {
+            let ids: Vec<u32> = pos.iter().map(|&p| members[p]).collect();
+            let v = vector_of(base, &ids, centroid(&pos), rv, row);
+            routers.push((ids.iter().map(|&x| Child::Point(x)).collect(), v));
+            return Some((routers.len() - 1) as u32);
+        }
+        salt += 1;
+        let mut pending = split(&pos, salt);
+        pending.reverse();
+        stack.push(Frame {
+            pos,
+            pending,
+            built: Vec::new(),
+        });
+        None
+    };
+    let mut done: Option<u32> = push_node(all, &mut stack, &mut routers, row);
+    while let Some(top) = stack.last_mut() {
+        if let Some(r) = done.take() {
+            top.built.push(r);
+        }
+        if let Some(g) = top.pending.pop() {
+            done = push_node(g, &mut stack, &mut routers, row);
+            continue;
+        }
+        let f = stack.pop().expect("non-empty");
+        let ids: Vec<u32> = f.pos.iter().map(|&p| members[p]).collect();
+        let v = vector_of(base, &ids, centroid(&f.pos), rv, row);
+        routers.push((f.built.iter().map(|&r| Child::Router(r)).collect(), v));
+        done = Some((routers.len() - 1) as u32);
+    }
+    routers
+}
+
 /// The routers of label `l`: a tree over its members in the shared order (`tree`; `leaf` =
 /// every point's leaf in that order), or over one entry per source component of the subgraph
 /// its members induce in `g0` (`connector`; `local` is all `u32::MAX` on entry and on return).
@@ -221,15 +389,29 @@ fn label_routers<T: Element>(
     leaf: &[u32],
     b: usize,
     rv: RouterVector,
+    kmeans: Option<(usize, u64)>,
     row: &mut [f32],
     local: &mut [u32],
 ) -> (Vec<(Vec<Child>, RouterVec)>, Vec<u32>) {
     match construction {
-        Construction::Tree => {
-            let mut m: Vec<u32> = members.to_vec();
-            m.sort_unstable_by_key(|&x| (leaf[x as usize], x));
-            (tree_over(base, &m, b, rv, row), Vec::new())
-        }
+        Construction::Tree => match kmeans {
+            Some((iters, seed)) if members.len() > b => {
+                let d = base.ncols();
+                let mut vecs = vec![0f32; members.len() * d];
+                for (i, &x) in members.iter().enumerate() {
+                    row_f32(base.row(x as usize), &mut vecs[i * d..(i + 1) * d]);
+                }
+                (
+                    kmeans_tree(base, members, &vecs, b, rv, iters, seed, row),
+                    Vec::new(),
+                )
+            }
+            _ => {
+                let mut m: Vec<u32> = members.to_vec();
+                m.sort_unstable_by_key(|&x| (leaf[x as usize], x));
+                (tree_over(base, &m, b, rv, row), Vec::new())
+            }
+        },
         Construction::Connector => {
             for (j, &x) in members.iter().enumerate() {
                 local[x as usize] = j as u32;
@@ -416,7 +598,7 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         .collect();
     let d = base.ncols();
     let mut leaf = vec![0u32; n];
-    if args.construction == Construction::Tree {
+    if args.construction == Construction::Tree && args.partition == Partition::Order {
         let all: Vec<u32> = (0..n as u32).collect();
         rp_leaves(&base, &all, args.order_block, args.seed, &mut leaf);
     }
@@ -427,6 +609,8 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         || (vec![0f32; d], vec![u32::MAX; n]),
         |i, (row, local)| {
             let l = selected[i];
+            let kmeans = (args.partition == Partition::Kmeans)
+                .then_some((args.kmeans_iters, args.seed ^ u64::from(l)));
             let (routers, point_starts) = label_routers(
                 args.construction,
                 g0,
@@ -435,6 +619,7 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
                 &leaf,
                 b,
                 args.router,
+                kmeans,
                 row,
                 local,
             );
@@ -469,6 +654,7 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         "construction": format!("{:?}", args.construction).to_lowercase(),
         "block": b, "min_size": args.min_size, "max_size": max_size,
         "router": format!("{:?}", args.router).to_lowercase(), "keep_starts": args.keep_starts,
+        "partition": format!("{:?}", args.partition).to_lowercase(), "kmeans_iters": args.kmeans_iters,
         "order_block": args.order_block, "seed": args.seed, "threads": args.threads,
         "n_data": n, "base_aux": g0.n_aux(), "r_max": r_max,
         "labels_selected": selected.len(),
@@ -576,6 +762,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_kmeans_tree_covers_every_member_once_and_splits_clusters_first() {
+        // Two clusters on a line, 0..50 and 1000..1050, members interleaved by id.
+        let n = 100;
+        let xs: Vec<f32> = (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (i / 2) as f32
+                } else {
+                    1000.0 + (i / 2) as f32
+                }
+            })
+            .collect();
+        let base = Matrix::from_slice(&xs, n, 1);
+        let members: Vec<u32> = (0..n as u32).collect();
+        let mut row = vec![0f32; 1];
+        let routers = kmeans_tree(
+            &base,
+            &members,
+            &xs,
+            4,
+            RouterVector::Centroid,
+            4,
+            7,
+            &mut row,
+        );
+        let root = routers.len() - 1;
+        let mut seen = vec![0u32; n];
+        let mut stack = vec![(root, None::<bool>)];
+        while let Some((r, side)) = stack.pop() {
+            assert!(routers[r].0.len() <= 4);
+            for c in &routers[r].0 {
+                match *c {
+                    Child::Point(x) => {
+                        seen[x as usize] += 1;
+                        // Below the root's children every point is on its child's side.
+                        if let Some(high) = side {
+                            assert_eq!(xs[x as usize] >= 1000.0, high, "point {x}");
+                        }
+                    }
+                    Child::Router(j) => {
+                        assert!((j as usize) < r, "children precede their parent");
+                        let s = side.or_else(|| match &routers[j as usize].1 {
+                            RouterVec::Centroid(c) => Some(c[0] >= 500.0),
+                            RouterVec::Point(_) => None,
+                        });
+                        stack.push((j as usize, s));
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&s| s == 1));
+        match &routers[root].1 {
+            RouterVec::Centroid(c) => assert!((c[0] - 524.5).abs() < 1e-3, "{c:?}"),
+            RouterVec::Point(_) => panic!("centroid expected"),
+        }
+    }
+
     /// 12 points on a line (edges i → i ± 1) and a frozen start (id 12, x = 5.5, edges to 5
     /// and 6); label `a=1` on {0, 3, 6, 9, 11} (no two adjacent), `b=1` on {0, 1, 2} (a path);
     /// base starts: `a=1` → 3, `b=1` → 0.
@@ -627,6 +871,7 @@ mod tests {
                     &leaf,
                     2,
                     RouterVector::Centroid,
+                    None,
                     &mut row,
                     &mut local,
                 );
