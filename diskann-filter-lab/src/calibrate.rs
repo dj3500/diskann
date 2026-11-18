@@ -58,7 +58,7 @@ mod effort;
 mod tree;
 
 pub use effort::EffortOptions;
-pub use tree::{tree_calibrate, tree_curve, tree_labels, TreeCurve, TreeOptions};
+pub use tree::{tree_calibrate, tree_curve, tree_labels, TreeCurve, TreeOptions, TreeQueries};
 
 use std::{path::Path, time::Instant};
 
