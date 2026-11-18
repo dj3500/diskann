@@ -363,8 +363,9 @@ enum SketchesCommand {
 
 #[derive(Subcommand)]
 enum PairsCommand {
-    /// Select and build the combination postings for each budget: writes `pairs-b<pct>.flab`
-    /// and `pairs-b<pct>.json` (sizes, build time, and the coverage of the `--report` queries).
+    /// Select and build the combination postings for each budget: writes `pairs-b<per-mille>.flab`
+    /// and `pairs-b<per-mille>.json` (sizes, build time, and the coverage of the `--report`
+    /// queries); `pairs-<prior>-b<per-mille>.*` under a prior other than `uniform`.
     Build {
         /// The label store.
         #[arg(long)]
@@ -381,6 +382,10 @@ enum PairsCommand {
         /// their candidates against the smallest clause bound).
         #[arg(long, value_delimiter = ',')]
         report: Vec<PathBuf>,
+        /// Which pairs queries are assumed to use: `uniform` (every co-occurring pair; rank by
+        /// gain per entry) or `rare` (as likely as the smaller label is frequent).
+        #[arg(long, default_value = "uniform")]
+        prior: diskann_filter_lab::pairs::Prior,
     },
 }
 
@@ -1404,10 +1409,15 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
             threads,
             out_dir,
             report,
+            prior,
         } => {
             let store = LabelStore::read(&labels)?;
             std::fs::create_dir_all(&out_dir)?;
             let postings = 4 * store.n_entries() as u64;
+            let stem = match prior {
+                diskann_filter_lab::pairs::Prior::Uniform => "pairs".to_owned(),
+                p => format!("pairs-{}", p.as_str()),
+            };
             let preds = report
                 .iter()
                 .map(|p| {
@@ -1419,10 +1429,11 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
             for f in budget {
                 ensure!(f > 0.0, "budgets must be positive");
                 let t = Instant::now();
-                let (ix, stats) = PairIndex::build(&store, (f * postings as f64) as u64, threads);
+                let (ix, stats) =
+                    PairIndex::build_with(&store, (f * postings as f64) as u64, threads, prior);
                 let build_s = secs(t);
                 let tag = format!("{}", (f * 1000.0).round() as u64);
-                let out = out_dir.join(format!("pairs-b{tag}.flab"));
+                let out = out_dir.join(format!("{stem}-b{tag}.flab"));
                 ix.write(&out)?;
                 ensure!(
                     PairIndex::read(&out)? == ix,
@@ -1446,7 +1457,7 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
                     "output": out,
                 });
                 std::fs::write(
-                    out_dir.join(format!("pairs-b{tag}.json")),
+                    out_dir.join(format!("{stem}-b{tag}.json")),
                     serde_json::to_string_pretty(&report)? + "\n",
                 )?;
                 println!(
