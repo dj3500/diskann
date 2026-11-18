@@ -282,6 +282,9 @@ pub struct Decision {
     pub postfilter: bool,
     /// The post-filter search starts from the configured starts (else the global ones).
     pub postfilter_configured: bool,
+    /// The island route: a search in island `.0` of the per-label sub-graphs with list size
+    /// `.1` (instead of the graph search).
+    pub island: Option<(usize, usize)>,
 }
 
 #[cfg(test)]

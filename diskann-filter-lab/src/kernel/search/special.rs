@@ -9,10 +9,11 @@
 //! exactly the answers and counters of the configurable loop (tested). They exist because the
 //! configurable loop costs a few percent more than these loops (`examples/kernel_overhead.rs`).
 
-use super::{Counters, Index, Query, Searcher, LOOKAHEAD};
+use super::{Counters, Index, Query, Route, Searcher, LOOKAHEAD};
 use crate::kernel::planner::Fallback;
 use crate::{
     bitsets::LabelBitsets,
+    islands::IslandIndex,
     kernel::{
         beam::{Inserted, PostfilterBeam, State, PACKED_MAX_NODES},
         collect::Collector,
@@ -237,6 +238,148 @@ impl Searcher {
             profile::add(&prof);
         }
         n
+    }
+
+    /// The island route: an unfiltered search with list size `l` inside island `i` (local ids:
+    /// positions in its label's posting list) from its medoid and the label's per-label starts,
+    /// then the `K` nearest matches of the evaluated members as in [`Self::postfilter_loop`]
+    /// (`deferred`: the final beam checked in distance order, the log of every evaluated
+    /// member when the beam runs out). Every member satisfies the island's clause.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    pub(super) fn island_search<T: Element, P: Eval>(
+        &mut self,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        isl: &IslandIndex,
+        i: usize,
+        l: usize,
+        bits: Option<&LabelBitsets>,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
+        ctr.route = Route::Island;
+        let k = ids.len();
+        let label = isl.label(i);
+        let members = ix.labels.postings(label);
+        let (vectors, qv) = (ix.vectors, q.vector);
+        self.visited.clear();
+        self.starts.clear();
+        let m = isl.medoid(i);
+        self.visited.test_and_set(m);
+        self.starts.push(m);
+        if let Some(st) = ix.label_starts {
+            if !ix.label_view {
+                for &g in st.label_starts(label) {
+                    if let Ok(v) = members.binary_search(&g) {
+                        if !self.visited.test_and_set(v as u32) {
+                            self.starts.push(v as u32);
+                        }
+                    }
+                }
+            }
+        }
+        ctr.n_start = self.starts.len() as u64;
+        let log = &mut self.log;
+        log.clear();
+        let mut beam = std::mem::take(&mut self.beam32);
+        beam.start(l + self.starts.len());
+        let mut c = Counters::default();
+        for &s in &self.starts {
+            let d = T::squared_l2(qv, vectors.get(members[s as usize]));
+            c.n_dist += 1;
+            log.push(pack(d, s));
+            if let Inserted::At {
+                evicted: Some(_), ..
+            } = beam.offer(fkey(d), s, State::Unknown)
+            {
+                c.n_evict += 1;
+            }
+        }
+        let nbrs = &mut self.nbrs;
+        while let Some(n) = beam.pop() {
+            c.n_expand += 1;
+            if self.row_prefetch {
+                if let Some(next) = beam.peek_id() {
+                    isl.prefetch_row(i, next);
+                }
+            }
+            nbrs.clear();
+            for &v in isl.neighbors(i, n) {
+                if !self.visited.test_and_set(v) {
+                    nbrs.push(v);
+                }
+            }
+            let len = nbrs.len();
+            c.n_dist += len as u64;
+            let la = LOOKAHEAD.min(len);
+            for &v in &nbrs[..la] {
+                diskann_vector::prefetch_hint_max::<4, _>(vectors.get(members[v as usize]));
+            }
+            for x in 0..len {
+                if x + la < len {
+                    diskann_vector::prefetch_hint_max::<4, _>(
+                        vectors.get(members[nbrs[x + la] as usize]),
+                    );
+                }
+                let v = nbrs[x];
+                let d = T::squared_l2(qv, vectors.get(members[v as usize]));
+                log.push(pack(d, v));
+                if let Inserted::At {
+                    evicted: Some(_), ..
+                } = beam.offer(fkey(d), v, State::Unknown)
+                {
+                    c.n_evict += 1;
+                }
+            }
+        }
+        c.n_hops = c.n_expand;
+        let mut cx = EvalCtx::new(ix.labels, &self.compiled, &self.bits, &[], &[]);
+        if let Some(b) = bits {
+            cx = cx.with_static(b);
+        }
+        self.answers.reset(Collector::FinalBeam, k, l);
+        let (mut found, mut bound) = (0, f32::INFINITY);
+        let mut stopped = false;
+        for x in 0..beam.len() {
+            let e = beam.entry(x);
+            if e.d > bound {
+                stopped = true;
+                break;
+            }
+            c.n_pred += 1;
+            let g = members[e.id as usize];
+            if P::full(&cx, g) {
+                self.answers.offer(e.d, g);
+                found += 1;
+                if found == k {
+                    bound = e.d;
+                }
+            }
+        }
+        if !stopped && k > 0 {
+            ctr.fallback = Fallback::Log as u64;
+            self.answers.reset(Collector::Heap, k, l);
+            log.sort_unstable();
+            for &p in log.iter() {
+                let (d, v) = unpack(p);
+                if self.answers.is_full() && d > self.answers.worst() {
+                    break;
+                }
+                c.n_pred += 1;
+                let g = members[v as usize];
+                if P::full(&cx, g) {
+                    self.answers.offer(d, g);
+                }
+            }
+        }
+        ctr.add(&c);
+        ctr.final_l = beam.search_l() as u64;
+        self.beam32 = beam;
+        self.answers.finish(ids, dists)
     }
 
     /// [`Self::postfilter_loop`] with the plan's beam (`packed_beam`), taken out of the searcher
