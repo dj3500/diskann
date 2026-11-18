@@ -439,6 +439,10 @@ enum IslandsCommand {
         /// `islands-<prior>-b*` for `data`.
         #[arg(long, default_value = "label")]
         prior: islands::Prior,
+        /// Only these labels are candidates (a file of label ids, one per line; e.g. a
+        /// counterfactual or oracle selection); output files `islands-restricted-b*`.
+        #[arg(long)]
+        restrict: Option<PathBuf>,
     },
 }
 
@@ -1473,10 +1477,12 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         threads,
         out_dir,
         prior,
+        restrict,
     } = c;
-    let stem = match prior {
-        islands::Prior::Label => "islands".to_owned(),
-        p => format!("islands-{}", p.as_str()),
+    let stem = match (prior, &restrict) {
+        (_, Some(_)) => "islands-restricted".to_owned(),
+        (islands::Prior::Label, None) => "islands".to_owned(),
+        (p, None) => format!("islands-{}", p.as_str()),
     };
     let store = LabelStore::read(&dataset.join("labels.flab"))?;
     let base = Matrix::<T>::read_bin(&run::data::base_file(&dataset)?)?;
@@ -1490,7 +1496,23 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
             g.label, g.size, g.exact_ns, g.base_ns, g.island_ns, g.gain_ns, g.bytes
         );
     }
-    std::fs::write(out_dir.join("gains.tsv"), tsv)?;
+    if restrict.is_none() {
+        std::fs::write(out_dir.join("gains.tsv"), tsv)?;
+    }
+    let gains: Vec<islands::Gain> = match &restrict {
+        Some(path) => {
+            let keep: std::collections::BTreeSet<u32> = std::fs::read_to_string(path)?
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .with_context(|| format!("label ids in {}", path.display()))?;
+            gains
+                .into_iter()
+                .filter(|g| keep.contains(&g.label))
+                .collect()
+        }
+        None => gains,
+    };
     let unit = 256 * store.n_points() as u64;
     let sels: Vec<(f64, Vec<u32>)> = budget
         .iter()
@@ -1544,6 +1566,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
             "dataset": dataset,
             "calibration": calibration,
             "prior": prior,
+            "restrict": restrict,
             "n_points": store.n_points(),
             "budget_fraction": f,
             "budget_bytes": (f * unit as f64) as u64,
