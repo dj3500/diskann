@@ -77,7 +77,7 @@ pub struct Effort {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-struct Dist(f32);
+pub(super) struct Dist(pub(super) f32);
 
 impl Eq for Dist {}
 
@@ -94,7 +94,7 @@ impl Ord for Dist {
 }
 
 /// The midpoint of two vectors (`u8`: rounded half up; `f32`: in double precision).
-fn midpoint<T: Element>(a: &[T], b: &[T]) -> Vec<T> {
+pub(super) fn midpoint<T: Element>(a: &[T], b: &[T]) -> Vec<T> {
     match T::DTYPE {
         DType::U8 => {
             let (a, b): (&[u8], &[u8]) = (bytemuck::cast_slice(a), bytemuck::cast_slice(b));

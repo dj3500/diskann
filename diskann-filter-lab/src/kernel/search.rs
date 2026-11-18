@@ -17,7 +17,7 @@ use super::{
     },
     config::{
         Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator,
+        StartSource, Terminator, TreeEffort,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -487,6 +487,12 @@ impl Plan {
                 "effort_curve needs unit costs with an effort curve (effort_r, effort_k, effort_l)"
             );
         }
+        if kernel.tree_effort == TreeEffort::Curve {
+            ensure!(
+                costs.as_ref().is_some_and(|c| !c.tree_r.is_empty()),
+                "tree_effort = curve needs unit costs with a tree effort curve (flab tree-calibrate)"
+            );
+        }
         if kernel.estimates == EstimateSource::Sketch {
             let sk = ix.sketches.ok_or_else(|| {
                 anyhow::anyhow!("the sketch estimates need bottom-b sketches of the labels")
@@ -802,7 +808,20 @@ impl Searcher {
         assert_eq!(ids.len(), dists.len());
         if let Some(tp) = plan.tree.as_deref() {
             if self.tree_eligible(tp, ix, q) {
-                let mut ctr = self.search(tp, ix, q, l, ids, dists, reference);
+                let mut pc = Counters {
+                    timing: plan.kernel.phase_times,
+                    ..Counters::default()
+                };
+                let l_tree = match plan.kernel.tree_effort {
+                    TreeEffort::List => l,
+                    TreeEffort::Curve => self.tree_list_size(plan, ix, l, ids.len(), &mut pc),
+                };
+                let mut ctr = self.search(tp, ix, q, l_tree, ids, dists, reference);
+                ctr.n_probe += pc.n_probe;
+                ctr.t_probe_ns += pc.t_probe_ns;
+                ctr.est_probe_ns = pc.est_probe_ns;
+                ctr.a_hat = pc.a_hat;
+                ctr.m_hat = pc.m_hat;
                 ctr.route = Route::Tree;
                 return ctr;
             }
@@ -1219,6 +1238,31 @@ impl Searcher {
                     !s.is_empty() && s.iter().all(|&v| v >= n)
                 })
         })
+    }
+
+    /// The tree route's list size under `tree_effort = curve` (the query compiled by the tree
+    /// plan): the calibrated router frontier for the target recall `effort / 1000` at `K / ρ̂`
+    /// members, `ρ̂ = M̂ / A` the estimated share of the binding clause's points that match
+    /// (at least one match; at most all of them).
+    fn tree_list_size<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        effort: usize,
+        k: usize,
+        ctr: &mut Counters,
+    ) -> usize {
+        let costs = plan.costs.as_ref().expect("validated: a tree effort curve");
+        let est = self.estimates(plan, ix, None, ctr);
+        ctr.a_hat = est.a as u64;
+        ctr.m_hat = est.m as u64;
+        let a = est.a.max(1.0);
+        let rho = (est.m / a).clamp(1.0 / a, 1.0);
+        let kprime = (k.max(1) as f64 / rho).min(a);
+        let l = costs
+            .tree_list(effort as f64 / 1000.0, kprime)
+            .expect("validated: a tree effort curve");
+        l.ceil().clamp(1.0, ix.graph.n_nodes() as f64) as usize
     }
 
     /// The post-filter route: an unfiltered search with list size `l` from the graph's global
@@ -1761,8 +1805,10 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     projected: bool,
     aux_g: f32,
     n_data: u32,
-    /// Expander `aux_only`: data points are never expanded.
+    /// Expander `aux_only` / `aux_frontier`: data points are never expanded.
     aux_only: bool,
+    /// Expander `aux_frontier`: data points never enter the list (routers only).
+    router_frontier: bool,
     lazy_ok: bool,
     /// Prefetch the next expansion's adjacency row (the kernel's `row_prefetch`).
     row_prefetch: bool,
@@ -2013,6 +2059,11 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
         c: &mut Counters,
     ) -> Outcome {
         let state = self.collect::<TRACE>(v, d, p, c);
+        if self.router_frontier {
+            // A frontier of routers: members are only collected.
+            self.trace_only::<TRACE>(v, source, Some(d), Some(p), "collected");
+            return Outcome::Navigated;
+        }
         if self.admits(p) {
             let key = self.sc.key(d, p.m, p.g);
             self.insert::<TRACE>(key, d, v, state, source, Some(p), "admitted", c);
@@ -2551,7 +2602,8 @@ fn run<T: Element, P: Eval, S: Score>(
         projected: compiled.is_projected(),
         aux_g: kernel.aux_g,
         n_data,
-        aux_only: kernel.expander == Expander::AuxOnly,
+        aux_only: matches!(kernel.expander, Expander::AuxOnly | Expander::AuxFrontier),
+        router_frontier: kernel.expander == Expander::AuxFrontier,
         lazy_ok: !adaptive.sampling(),
         row_prefetch: kernel.row_prefetch,
         beam,
