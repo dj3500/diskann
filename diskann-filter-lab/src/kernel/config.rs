@@ -506,6 +506,9 @@ pub enum TreeEffort {
     /// share of the binding clause's members that match (`M̂ / A`); the list holds routers
     /// only.
     Curve,
+    /// As `curve`, at most the router's `effort_curve(cap)` times the curve's list size at `K`
+    /// members (the graph route's cap on selective queries, applied to the tree route).
+    Capped,
 }
 
 impl TreeEffort {
@@ -513,7 +516,8 @@ impl TreeEffort {
         Ok(match s.trim() {
             "list" => Self::List,
             "curve" => Self::Curve,
-            v => bail!("unknown tree_effort {v:?} (list, curve)"),
+            "capped" => Self::Capped,
+            v => bail!("unknown tree_effort {v:?} (list, curve, capped)"),
         })
     }
 }
@@ -523,6 +527,7 @@ impl fmt::Display for TreeEffort {
         f.write_str(match self {
             Self::List => "list",
             Self::Curve => "curve",
+            Self::Capped => "capped",
         })
     }
 }
@@ -1160,7 +1165,7 @@ impl Kernel {
             self.tree_effort == TreeEffort::List
                 || (self.tree_route != TreeRoute::Off
                     && matches!(self.terminator, Terminator::EffortCurve { .. })),
-            "tree_effort = curve needs the tree route and effort_curve efforts (a target recall)"
+            "tree_effort = curve / capped needs the tree route and effort_curve efforts (a target recall)"
         );
         let two_hop = matches!(self.expander, Expander::TwoHop(_));
         match self.laziness {
@@ -1323,7 +1328,7 @@ impl Kernel {
             collector: Collector::Heap,
             expander: match self.tree_effort {
                 TreeEffort::List => Expander::AuxOnly,
-                TreeEffort::Curve => Expander::AuxFrontier,
+                TreeEffort::Curve | TreeEffort::Capped => Expander::AuxFrontier,
             },
             terminator: Terminator::Exhaust,
             predicate,
