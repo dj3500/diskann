@@ -489,6 +489,8 @@ pub struct Kernel {
     pub tree_route: TreeRoute,
     /// The tree route's list size (`list` by default).
     pub tree_effort: TreeEffort,
+    /// When a tree-eligible query takes the tree route (`always` by default).
+    pub tree_choice: TreeChoice,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -592,6 +594,36 @@ impl fmt::Display for TreeEffort {
     }
 }
 
+/// When a tree-eligible query takes the tree route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreeChoice {
+    /// Every tree-eligible query.
+    Always,
+    /// When the tree search's model cost (its router frontier's expansions, their member
+    /// checks and the distances of the members expected to match) is below the planned
+    /// route's (the crossover's estimate for the route it chose).
+    Cost,
+}
+
+impl TreeChoice {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "always" => Self::Always,
+            "cost" => Self::Cost,
+            v => bail!("unknown tree_choice {v:?} (always, cost)"),
+        })
+    }
+}
+
+impl fmt::Display for TreeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Always => "always",
+            Self::Cost => "cost",
+        })
+    }
+}
+
 impl Default for Kernel {
     /// The plain search: global start (force), everything admitted, eager evaluation, distance
     /// keys, final-beam collection, one hop, exhaustive termination, mode 1.
@@ -630,6 +662,7 @@ impl Default for Kernel {
             df_pipeline: false,
             tree_route: TreeRoute::Off,
             tree_effort: TreeEffort::List,
+            tree_choice: TreeChoice::Always,
         }
     }
 }
@@ -1171,6 +1204,7 @@ impl Kernel {
             }
             "tree_route" => self.tree_route = TreeRoute::parse(value)?,
             "tree_effort" => self.tree_effort = TreeEffort::parse(value)?,
+            "tree_choice" => self.tree_choice = TreeChoice::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1250,6 +1284,13 @@ impl Kernel {
                 || (self.tree_route != TreeRoute::Off
                     && matches!(self.terminator, Terminator::EffortCurve { .. })),
             "tree_effort = curve / capped needs the tree route and effort_curve efforts (a target recall)"
+        );
+        ensure!(
+            self.tree_choice == TreeChoice::Always
+                || (self.tree_route != TreeRoute::Off
+                    && self.tree_effort != TreeEffort::List
+                    && matches!(self.crossover, Crossover::Cost | Crossover::Graph)),
+            "tree_choice = cost needs the tree route, a tree effort curve and a cost crossover (cost or graph)"
         );
         let two_hop = matches!(self.expander, Expander::TwoHop(_));
         match self.laziness {
@@ -1402,6 +1443,9 @@ impl Kernel {
         }
         if self.tree_effort != TreeEffort::List {
             j["tree_effort"] = json!(self.tree_effort.to_string());
+        }
+        if self.tree_choice != TreeChoice::Always {
+            j["tree_choice"] = json!(self.tree_choice.to_string());
         }
         j
     }

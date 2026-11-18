@@ -17,7 +17,7 @@ use super::{
     },
     config::{
         Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator, TreeEffort,
+        StartSource, Terminator, TreeChoice, TreeEffort,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -356,6 +356,9 @@ pub struct Plan {
     exact_eval: ExactEval,
     /// The tree route's plan (`tree_route`).
     tree: Option<Box<Plan>>,
+    /// Mean out-degree of the graph's auxiliary nodes (the routers' fan-out; `tree_choice =
+    /// cost`).
+    tree_fanout: f64,
 }
 
 impl Plan {
@@ -549,6 +552,13 @@ impl Plan {
                 .tree_kernel()
                 .map(|k| Plan::new(&k, ix).map(Box::new))
                 .transpose()?,
+            tree_fanout: if kernel.tree_choice == TreeChoice::Cost {
+                let (n, a) = (ix.graph.n_data() as u32, ix.graph.n_aux() as u32);
+                let edges: usize = (n..n + a).map(|v| ix.graph.degree(v)).sum();
+                edges as f64 / f64::from(a.max(1))
+            } else {
+                0.0
+            },
         })
     }
 
@@ -806,8 +816,12 @@ impl Searcher {
         reference: Option<u64>,
     ) -> Counters {
         assert_eq!(ids.len(), dists.len());
+        let mut tree_candidate = false;
         if let Some(tp) = plan.tree.as_deref() {
-            if self.tree_eligible(tp, ix, q) {
+            if !self.tree_eligible(tp, ix, q) {
+            } else if plan.kernel.tree_choice == TreeChoice::Cost {
+                tree_candidate = true;
+            } else {
                 let mut pc = Counters {
                     timing: plan.kernel.phase_times,
                     ..Counters::default()
@@ -926,6 +940,36 @@ impl Searcher {
             let t = tic(&ctr);
             let d = self.decide(plan, ix, l, k, exact_stat, &mut ctr);
             toc(t, &mut ctr.t_decide_ns);
+            let tree_l = if tree_candidate {
+                self.tree_option(plan, ix, l, k, &d)
+            } else {
+                None
+            };
+            if let (Some(l_tree), Some(tp)) = (tree_l, plan.tree.as_deref()) {
+                let mut tc = self.search(tp, ix, q, l_tree, ids, dists, reference);
+                tc.n_probe += ctr.n_probe;
+                tc.t_probe_ns += ctr.t_probe_ns;
+                tc.t_decide_ns += ctr.t_decide_ns;
+                tc.est_probe_ns = ctr.est_probe_ns;
+                (tc.plan, tc.est_exact_ns, tc.est_graph_ns) =
+                    (ctr.plan, ctr.est_exact_ns, ctr.est_graph_ns);
+                (tc.a_hat, tc.m_hat, tc.m_hi) = (ctr.a_hat, ctr.m_hat, ctr.m_hi);
+                (
+                    tc.n_clauses,
+                    tc.res_words,
+                    tc.res_rows,
+                    tc.c1_words,
+                    tc.c1_rows,
+                ) = (
+                    ctr.n_clauses,
+                    ctr.res_words,
+                    ctr.res_rows,
+                    ctr.c1_words,
+                    ctr.c1_rows,
+                );
+                tc.route = Route::Tree;
+                return tc;
+            }
             if d.exact {
                 ctr.route = Route::Exact;
                 self.exact_v2(plan, ix, q, k, d.plan, exact_stat, false, &mut ctr);
@@ -1255,25 +1299,32 @@ impl Searcher {
         k: usize,
         ctr: &mut Counters,
     ) -> usize {
-        let costs = plan.costs.as_ref().expect("validated: a tree effort curve");
         let est = self.estimates(plan, ix, None, ctr);
         ctr.a_hat = est.a as u64;
         ctr.m_hat = est.m as u64;
-        let a = est.a.max(1.0);
-        let rho = (est.m / a).clamp(1.0 / a, 1.0);
-        let kprime = (k.max(1) as f64 / rho).min(a);
-        let r = effort as f64 / 1000.0;
-        let mut l = costs
-            .tree_list(r, kprime, a)
-            .expect("validated: a tree effort curve");
-        if let (TreeEffort::Capped, Terminator::EffortCurve { cap }) =
-            (plan.kernel.tree_effort, plan.kernel.terminator)
-        {
-            if cap.is_finite() {
-                l = l.min(cap * costs.tree_list(r, k.max(1) as f64, a).expect("validated"));
-            }
-        }
-        l.ceil().clamp(1.0, ix.graph.n_nodes() as f64) as usize
+        tree_frontier(plan, &est, effort, k, ix.graph.n_nodes()).0
+    }
+
+    /// `tree_choice = cost`: the tree route's list size when its model cost is below the cost
+    /// of the route the crossover chose (`d`, with the estimates it used): per router
+    /// expansion (the frontier, at most the binding clause's routers) its fan-out of member
+    /// checks, a distance per member expected to match and one for the router.
+    fn tree_option<T: Element>(
+        &self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        effort: usize,
+        k: usize,
+        d: &Decision,
+    ) -> Option<usize> {
+        let costs = plan.costs.as_ref()?;
+        let est = &self.last_estimates;
+        let (l_tree, a, rho) = tree_frontier(plan, est, effort, k, ix.graph.n_nodes());
+        let b = plan.tree_fanout.max(2.0);
+        let expansions = (l_tree as f64).min(a / (b - 1.0) + 1.0);
+        let cost = expansions * (b * costs.graph_pred_ns + (b * rho + 1.0) * costs.graph_dist_ns);
+        let planned = if d.exact { d.est_exact } else { d.est_graph };
+        (cost < planned).then_some(l_tree)
     }
 
     /// The post-filter route: an unfiltered search with list size `l` from the graph's global
@@ -1562,6 +1613,33 @@ fn start_count<T: Element>(kernel: &Kernel, ix: &Index<'_, T>, q: &Compiled) -> 
 fn planned_l(l0: usize, est: &Estimates, scale: f64) -> usize {
     let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
     ((l0 as f64) * l_multiplier(rate, scale)).round().max(1.0) as usize
+}
+
+/// The tree route's router frontier for the estimates `est` (see `Searcher::tree_list_size`),
+/// with the clause size `Â` and the match share `ρ̂` it used.
+fn tree_frontier(
+    plan: &Plan,
+    est: &Estimates,
+    effort: usize,
+    k: usize,
+    n_nodes: usize,
+) -> (usize, f64, f64) {
+    let costs = plan.costs.as_ref().expect("validated: a tree effort curve");
+    let a = est.a.max(1.0);
+    let rho = (est.m / a).clamp(1.0 / a, 1.0);
+    let kprime = (k.max(1) as f64 / rho).min(a);
+    let r = effort as f64 / 1000.0;
+    let mut l = costs
+        .tree_list(r, kprime, a)
+        .expect("validated: a tree effort curve");
+    if let (TreeEffort::Capped, Terminator::EffortCurve { cap }) =
+        (plan.kernel.tree_effort, plan.kernel.terminator)
+    {
+        if cap.is_finite() {
+            l = l.min(cap * costs.tree_list(r, k.max(1) as f64, a).expect("validated"));
+        }
+    }
+    (l.ceil().clamp(1.0, n_nodes as f64) as usize, a, rho)
 }
 
 /// `effort_curve(cap)`: the calibrated unfiltered list size for the target recall `effort / 1000`
