@@ -1263,11 +1263,9 @@ fn the_tree_effort_curve_sets_the_tree_list_size() {
     assert!(Plan::new(&k, &ix0).is_err());
 }
 
-#[test]
-fn the_capped_tree_effort_bounds_diluted_queries() {
-    use super::cost::UnitCosts;
-    // Ten points on a line; label x on 0..=5 under routers 10 = {0, 1, 2}, 11 = {3, 4, 5} and
-    // the root 12; label y on {1, 3, 5, 6, ..., 9}: x AND y keeps half of x (rho = 0.5).
+/// Ten points on a line; label x on 0..=5 under routers 10 = {0, 1, 2}, 11 = {3, 4, 5} and
+/// the root 12; label y on {1, 3, 5, 6, ..., 9}: x AND y keeps half of x (rho = 0.5).
+fn diluted_tree() -> (Matrix<f32>, Graph, LabelStore, Starts) {
     let n = 10;
     let base = Matrix::from_slice(&(0..n).map(|i| i as f32).collect::<Vec<_>>(), n, 1);
     let aux = AuxNodes::new(
@@ -1297,6 +1295,13 @@ fn the_capped_tree_effort_bounds_diluted_queries() {
     let mut st = Starts::new(&g);
     st.set_label_starts(&labels, &[(labels.name_index()["x=1"], 12)])
         .unwrap();
+    (base, g, labels, st)
+}
+
+#[test]
+fn the_capped_tree_effort_bounds_diluted_queries() {
+    use super::cost::UnitCosts;
+    let (base, g, labels, st) = diluted_tree();
     let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
     // The tree curve's frontier is 1.2 times the number of members (L(K') = 1.2 K').
     let costs = UnitCosts {
@@ -1349,6 +1354,72 @@ fn the_capped_tree_effort_bounds_diluted_queries() {
     assert!(l_curve >= 6, "{l_curve}");
     // ... capped at 1.5 times the frontier for K = 2 (3.6, rounded up).
     assert_eq!(run("capped"), (vec![5, 3], 4 + 1));
+}
+
+#[test]
+fn tree_choice_cost_takes_the_tree_route_only_when_it_is_cheaper() {
+    use super::cost::UnitCosts;
+    let (base, g, labels, st) = diluted_tree();
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let curves = UnitCosts {
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        tree_r: vec![0.5, 0.9],
+        tree_k: vec![1.0, 100.0],
+        tree_l: vec![vec![1.2, 120.0], vec![1.2, 120.0]],
+        ..UnitCosts::default()
+    };
+    // Graph searches of 10 L + 200 distances, or of about one.
+    let cheap_graph = UnitCosts {
+        graph_alpha: 0.001,
+        graph_beta: 1.0,
+        ..curves.clone()
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    let preds = pb.finish();
+    let run = |costs: &UnitCosts| {
+        let ix = Index {
+            costs: Some(costs),
+            sketches: Some(&sketches),
+            ..tree_index(&base, &g, &labels, &st)
+        };
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("terminator", "effort_curve"),
+            ("laziness", "heap_bound"),
+            ("crossover", "graph"),
+            ("exact", "planned"),
+            ("estimates", "sketch"),
+            ("tree_route", "row_scan"),
+            ("tree_effort", "curve"),
+            ("tree_choice", "cost"),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 2], vec![0f32; 2]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 900, &mut ids, &mut d, None);
+        ids.truncate(ctr.n_out as usize);
+        (ctr.route, ids, ctr.est_graph_ns)
+    };
+    // A few router expansions against a graph search of hundreds of distances: the tree.
+    let (route, ids, g_ns) = run(&curves);
+    assert_eq!((route, ids), (Route::Tree, vec![5, 3]), "graph {g_ns} ns");
+    // Against a search of about one distance: the planned route.
+    let (route, _, g_ns) = run(&cheap_graph);
+    assert_ne!(route, Route::Tree, "graph {g_ns} ns");
+    // tree_choice = cost needs a tree effort curve.
+    let mut k = Kernel::default();
+    k.set("tree_route", "row_scan").unwrap();
+    k.set("tree_choice", "cost").unwrap();
+    assert!(k.validate().is_err());
 }
 
 #[test]
