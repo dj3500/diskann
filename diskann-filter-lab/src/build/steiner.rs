@@ -104,6 +104,11 @@ pub struct SteinerArgs {
     /// `--partition kmeans`: Lloyd iterations per split.
     #[arg(long, default_value_t = 4)]
     pub kmeans_iters: usize,
+    /// `--partition kmeans`: the iterations of a split of more than this many members times
+    /// its k run on an evenly strided sample of that size; one pass then assigns every member
+    /// (0: every iteration on all members).
+    #[arg(long, default_value_t = 0)]
+    pub kmeans_sample: usize,
     /// `tree`: keep the label's previous starts next to its root.
     #[arg(long)]
     pub keep_starts: bool,
@@ -239,6 +244,7 @@ fn kmeans_tree<T: Element>(
     b: usize,
     rv: RouterVector,
     iters: usize,
+    sample: usize,
     seed: u64,
     row: &mut [f32],
 ) -> Vec<(Vec<Child>, RouterVec)> {
@@ -279,26 +285,35 @@ fn kmeans_tree<T: Element>(
                 vecs[p * d..(p + 1) * d].to_vec()
             })
             .collect();
-        let mut assign = vec![0usize; m];
-        for it in 0..iters.max(1) {
-            for (a, &p) in assign.iter_mut().zip(pos) {
-                let v = &vecs[p * d..(p + 1) * d];
-                let mut best = (f32::INFINITY, 0usize);
-                for j in 0..k {
-                    let c = &centres[j * d..(j + 1) * d];
-                    let dist: f32 = v.iter().zip(c).map(|(x, y)| (x - y) * (x - y)).sum();
-                    if dist < best.0 {
-                        best = (dist, j);
-                    }
+        // Lloyd's iterations on `fit` (all positions, or a strided sample), then one pass that
+        // assigns every position to its nearest centre.
+        let fit: Vec<usize> = if sample > 0 && m > sample * k {
+            (0..sample * k).map(|i| pos[i * m / (sample * k)]).collect()
+        } else {
+            pos.to_vec()
+        };
+        let nearest = |v: &[f32], centres: &[f32]| -> usize {
+            let mut best = (f32::INFINITY, 0usize);
+            for j in 0..k {
+                let c = &centres[j * d..(j + 1) * d];
+                let dist: f32 = v.iter().zip(c).map(|(x, y)| (x - y) * (x - y)).sum();
+                if dist < best.0 {
+                    best = (dist, j);
                 }
-                *a = best.1;
+            }
+            best.1
+        };
+        let mut assign = vec![0usize; fit.len()];
+        for it in 0..iters.max(1) {
+            for (a, &p) in assign.iter_mut().zip(&fit) {
+                *a = nearest(&vecs[p * d..(p + 1) * d], &centres);
             }
             if it + 1 == iters.max(1) {
                 break;
             }
             let mut sums = vec![0f64; k * d];
             let mut counts = vec![0usize; k];
-            for (&a, &p) in assign.iter().zip(pos) {
+            for (&a, &p) in assign.iter().zip(&fit) {
                 counts[a] += 1;
                 for (s, &v) in sums[a * d..(a + 1) * d]
                     .iter_mut()
@@ -314,6 +329,12 @@ fn kmeans_tree<T: Element>(
                     }
                 }
             }
+        }
+        if fit.len() < m {
+            assign = pos
+                .iter()
+                .map(|&p| nearest(&vecs[p * d..(p + 1) * d], &centres))
+                .collect();
         }
         let mut groups: Vec<Vec<usize>> = vec![Vec::new(); k];
         for (&a, &p) in assign.iter().zip(pos) {
@@ -389,20 +410,20 @@ fn label_routers<T: Element>(
     leaf: &[u32],
     b: usize,
     rv: RouterVector,
-    kmeans: Option<(usize, u64)>,
+    kmeans: Option<(usize, usize, u64)>,
     row: &mut [f32],
     local: &mut [u32],
 ) -> (Vec<(Vec<Child>, RouterVec)>, Vec<u32>) {
     match construction {
         Construction::Tree => match kmeans {
-            Some((iters, seed)) if members.len() > b => {
+            Some((iters, sample, seed)) if members.len() > b => {
                 let d = base.ncols();
                 let mut vecs = vec![0f32; members.len() * d];
                 for (i, &x) in members.iter().enumerate() {
                     row_f32(base.row(x as usize), &mut vecs[i * d..(i + 1) * d]);
                 }
                 (
-                    kmeans_tree(base, members, &vecs, b, rv, iters, seed, row),
+                    kmeans_tree(base, members, &vecs, b, rv, iters, sample, seed, row),
                     Vec::new(),
                 )
             }
@@ -609,8 +630,11 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         || (vec![0f32; d], vec![u32::MAX; n]),
         |i, (row, local)| {
             let l = selected[i];
-            let kmeans = (args.partition == Partition::Kmeans)
-                .then_some((args.kmeans_iters, args.seed ^ u64::from(l)));
+            let kmeans = (args.partition == Partition::Kmeans).then_some((
+                args.kmeans_iters,
+                args.kmeans_sample,
+                args.seed ^ u64::from(l),
+            ));
             let (routers, point_starts) = label_routers(
                 args.construction,
                 g0,
@@ -655,6 +679,7 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         "block": b, "min_size": args.min_size, "max_size": max_size,
         "router": format!("{:?}", args.router).to_lowercase(), "keep_starts": args.keep_starts,
         "partition": format!("{:?}", args.partition).to_lowercase(), "kmeans_iters": args.kmeans_iters,
+        "kmeans_sample": args.kmeans_sample,
         "order_block": args.order_block, "seed": args.seed, "threads": args.threads,
         "n_data": n, "base_aux": g0.n_aux(), "r_max": r_max,
         "labels_selected": selected.len(),
@@ -785,9 +810,32 @@ mod tests {
             4,
             RouterVector::Centroid,
             4,
+            0,
             7,
             &mut row,
         );
+        // Fitting on a strided sample of 2 x k members per split also separates the clusters.
+        let sampled = kmeans_tree(
+            &base,
+            &members,
+            &xs,
+            4,
+            RouterVector::Centroid,
+            4,
+            2,
+            7,
+            &mut row,
+        );
+        let top = sampled.last().expect("a root");
+        for c in &top.0 {
+            let Child::Router(j) = *c else {
+                panic!("a router child expected")
+            };
+            let RouterVec::Centroid(v) = &sampled[j as usize].1 else {
+                panic!("centroid expected")
+            };
+            assert!(v[0] < 60.0 || v[0] > 990.0, "{v:?}");
+        }
         let root = routers.len() - 1;
         let mut seen = vec![0u32; n];
         let mut stack = vec![(root, None::<bool>)];
