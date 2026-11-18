@@ -278,17 +278,17 @@ pub(crate) fn filter_masked<P: Eval>(
     out.clear();
     let n = cands.len();
     for &v in &cands[..n.min(AHEAD_OFFSETS)] {
-        P::prefetch_offsets(cx, v);
+        P::prefetch_masked_offsets(cx, v, mask);
     }
     for &v in &cands[..n.min(AHEAD_ROWS)] {
-        P::prefetch(cx, v);
+        P::prefetch_masked(cx, v, mask);
     }
     for i in 0..n {
         if i + AHEAD_OFFSETS < n {
-            P::prefetch_offsets(cx, cands[i + AHEAD_OFFSETS]);
+            P::prefetch_masked_offsets(cx, cands[i + AHEAD_OFFSETS], mask);
         }
         if i + AHEAD_ROWS < n {
-            P::prefetch(cx, cands[i + AHEAD_ROWS]);
+            P::prefetch_masked(cx, cands[i + AHEAD_ROWS], mask);
         }
         let v = cands[i];
         if P::masked(cx, v, mask) {

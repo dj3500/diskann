@@ -533,6 +533,18 @@ pub trait Eval: Copy + Send + Sync + 'static {
     fn prefetch(cx: &EvalCtx<'_>, v: u32);
     /// First prefetch stage (the row offsets).
     fn prefetch_offsets(cx: &EvalCtx<'_>, v: u32);
+    /// [`Self::prefetch`] for [`Self::masked`] with `mask`.
+    #[inline(always)]
+    fn prefetch_masked(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        let _ = mask;
+        Self::prefetch(cx, v);
+    }
+    /// [`Self::prefetch_offsets`] for [`Self::masked`] with `mask`.
+    #[inline(always)]
+    fn prefetch_masked_offsets(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        let _ = mask;
+        Self::prefetch_offsets(cx, v);
+    }
     /// The failed clauses of data point `v` among all clauses of the query (bit `j` for the
     /// clause at position `j` of the Boolean order; complete evaluation of the first 64
     /// clauses).
@@ -896,6 +908,22 @@ impl Eval for StaticBits {
             return ClauseSearch::failed_all(cx, v);
         }
         static_failed(cx, v, check_mask(cx), false)
+    }
+
+    /// The row, when a clause of `mask` has row labels.
+    #[inline(always)]
+    fn prefetch_masked(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        if !cx.q.use_bits || cx.q.small_mask & mask != 0 {
+            RowScan::prefetch(cx, v);
+        }
+    }
+
+    /// The row offsets, when a clause of `mask` has row labels.
+    #[inline(always)]
+    fn prefetch_masked_offsets(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        if !cx.q.use_bits || cx.q.small_mask & mask != 0 {
+            RowScan::prefetch_offsets(cx, v);
+        }
     }
 
     /// The row offsets (when the row is likely to be read) and the bitset word of the most

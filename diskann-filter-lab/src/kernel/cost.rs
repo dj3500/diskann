@@ -27,11 +27,13 @@
 //! rowand          words(c*) + Σ_{j≥1} W·reach_j·(base(ρ) + hot_j·word(ρ))
 //!                 + Σ_{j≥1} Σ_{ℓ rare in c_j} probes(min(W·reach_j, P_j), |post ℓ|) + M·enum_bit
 //!                 + M·dist(M/n)
-//! pair            lists·gallop_cold + E·merge·log2(lists) + E·pred(E/n) + min(M, E)·dist(M/n)
+//! pair            lists·gallop_cold + E·merge·log2(lists) + E·pred_mask(E/n) + min(M, E)·dist(M/n)
 //!                 (combination postings, B3a: the `E` entries of the stored joint postings —
 //!                 and of the smaller label posting of every pair not stored — of the clause
 //!                 pair with the fewest; the checks cover the other clauses, all clauses when a
-//!                 label posting is among the lists; `M = E` for two clauses)
+//!                 label posting is among the lists, at the worst-case work of those clauses
+//!                 (`MemberWork::of_mask`: every bitset word, the row if one has row labels);
+//!                 `M = E` for two clauses)
 //! ```
 //!
 //! with `merge(c*) = P*·merge·log2 k` for a clause of `k ≥ 2` labels (a single posting list is
@@ -1133,6 +1135,38 @@ impl MemberWork {
     }
 }
 
+impl MemberWork {
+    /// Worst-case work of checking the clauses in `mask` (bit `j`: clause `j`): every bitset
+    /// word of those clauses probed, and the row read once if one of them has row labels. The
+    /// `pair` plan's checks: its candidates come from joint or single postings, without the
+    /// survival estimates of `union(c*)`, and its mask may include `c*`.
+    pub fn of_mask(q: &Compiled, split: bool, mask: u64) -> Self {
+        if mask == 0 || q.is_empty() {
+            return Self::default();
+        }
+        if !split {
+            return Self {
+                words: 0.0,
+                prefetch: 1.0,
+                rows: 1.0,
+                class_rows: true,
+            };
+        }
+        let (mut words, mut row) = (0.0, false);
+        for j in (0..q.n_clauses()).filter(|&j| mask >> j & 1 == 1) {
+            words += q.static_slots(j).len() as f64;
+            row |= !q.row_labels(j).is_empty();
+        }
+        let r = if row { 1.0 } else { 0.0 };
+        Self {
+            words,
+            prefetch: r,
+            rows: r,
+            class_rows: row,
+        }
+    }
+}
+
 /// Inputs of the exact plan costs of one query.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanInputs<'a> {
@@ -1346,9 +1380,17 @@ impl PlanInputs<'_> {
         if lists > 1.0 {
             cost += e * c.merge_ns * lists.log2();
         }
-        let checked = !cv.exact || self.q.n_clauses() > 2;
-        if checked {
-            cost += e * c.member_at(&x.work, c.pos(e / x.n));
+        // The check mask of `exact::planned`: every clause but the covered pair's (exact
+        // cover), else every clause.
+        let full = self.q.full_mask();
+        let mask = if cv.exact {
+            full & !(1u64 << cv.i) & !(1u64 << cv.j)
+        } else {
+            full
+        };
+        if mask != 0 {
+            let w = MemberWork::of_mask(self.q, self.bitsets.is_some(), mask);
+            cost += e * c.member_at(&w, c.pos(e / x.n));
         }
         let m = if cv.exact && self.q.n_clauses() <= 2 {
             e

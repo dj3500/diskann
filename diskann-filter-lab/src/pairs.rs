@@ -641,7 +641,8 @@ impl PairIndex {
         for (rw, w) in row_offsets.windows(2).enumerate() {
             let ps = &partners[w[0] as usize..w[1] as usize];
             ensure!(
-                ps.windows(2).all(|x| x[0] < x[1]) && ps.iter().all(|&c| (c as usize) > rw && (c as usize) < nb),
+                ps.windows(2).all(|x| x[0] < x[1])
+                    && ps.iter().all(|&c| (c as usize) > rw && (c as usize) < nb),
                 "partners must increase above their row"
             );
         }
@@ -693,7 +694,7 @@ mod tests {
             if (150..350).contains(&p) {
                 v.push(("k", "b"));
             }
-            if p < 100 || p >= 300 {
+            if !(100..300).contains(&p) {
                 v.push(("k", "c"));
             }
             if p >= 390 {
