@@ -65,6 +65,9 @@ enum Command {
     Sketches(SketchesCommand),
     /// Measure the unit costs of the cost model on this machine and dataset (JSON).
     Calibrate(CalibrateArgs),
+    /// Add the tree effort curve of a Steiner graph's router trees (`flab steiner`) to a
+    /// calibration of its base graph (read by `tree_effort = curve`).
+    TreeCalibrate(TreeCalibrateArgs),
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
     /// kernel and write run directories (see `run` in the crate documentation).
     Run(RunArgs),
@@ -412,6 +415,33 @@ struct PermuteArgs {
 }
 
 #[derive(Args)]
+struct TreeCalibrateArgs {
+    /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
+    #[arg(long)]
+    dataset: PathBuf,
+    /// The Steiner graph (a directory with `graph.flab`, or a `graph.flab`).
+    #[arg(long)]
+    graph: PathBuf,
+    /// Its start table (the routers' roots as per-label starts).
+    #[arg(long)]
+    starts: PathBuf,
+    /// The calibration of the base graph (`flab calibrate` output) to extend.
+    #[arg(long)]
+    calibration: PathBuf,
+    /// Queries (one label sampled in proportion to its size each).
+    #[arg(long, default_value_t = 200)]
+    queries: usize,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Largest router frontier measured (above it the curve is extrapolated).
+    #[arg(long, default_value_t = 65_536)]
+    l_max: usize,
+    /// Output JSON.
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+#[derive(Args)]
 struct CalibrateArgs {
     /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
     #[arg(long)]
@@ -549,6 +579,45 @@ fn main() -> Result<()> {
             println!(
                 "calibrated in {:.1} s -> {}",
                 report["elapsed_s"].as_f64().unwrap_or(0.0),
+                a.output.display()
+            );
+            Ok(())
+        }
+        Command::TreeCalibrate(a) => {
+            let t0 = std::time::Instant::now();
+            let opts = calibrate::TreeOptions {
+                queries: a.queries,
+                seed: a.seed,
+                l_max: a.l_max,
+            };
+            let input: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&a.calibration)?)?;
+            let base = run::data::base_file(&a.dataset)?;
+            let doc = match DType::from_path(&base)? {
+                DType::U8 => calibrate::tree_calibrate::<u8>(
+                    &a.dataset,
+                    &a.graph,
+                    Some(&a.starts),
+                    &input,
+                    &opts,
+                )?,
+                DType::F32 => calibrate::tree_calibrate::<f32>(
+                    &a.dataset,
+                    &a.graph,
+                    Some(&a.starts),
+                    &input,
+                    &opts,
+                )?,
+            };
+            if let Some(dir) = a.output.parent() {
+                if !dir.as_os_str().is_empty() {
+                    std::fs::create_dir_all(dir)?;
+                }
+            }
+            std::fs::write(&a.output, serde_json::to_string_pretty(&doc)? + "\n")?;
+            println!(
+                "tree effort curve in {:.1} s -> {}",
+                t0.elapsed().as_secs_f64(),
                 a.output.display()
             );
             Ok(())

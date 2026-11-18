@@ -1082,6 +1082,169 @@ fn the_tree_route_serves_tree_eligible_queries() {
     }
 }
 
+/// Six points on a line (x = i, all labelled `x=1`), leaf routers 6 (over 0, 1, 2; at 1) and
+/// 7 (over 3, 4, 5; at 4) under a root 8 (at 2.5), the root as the label's only start.
+fn router_tree() -> (Matrix<f32>, Graph, LabelStore, Starts) {
+    let n = 6;
+    let base = Matrix::from_slice(&(0..n).map(|i| i as f32).collect::<Vec<_>>(), n, 1);
+    let aux = AuxNodes::new(
+        vec![AuxKind::Router; 3],
+        &Matrix::from_slice(&[1.0f32, 4.0, 2.5], 3, 1),
+    )
+    .unwrap();
+    let mut g = Graph::new(n, 4, aux).unwrap();
+    for i in 0..n as u32 {
+        let nb: Vec<u32> = [i.checked_sub(1), (i + 1 < n as u32).then_some(i + 1)]
+            .into_iter()
+            .flatten()
+            .collect();
+        g.set_neighbors(i, &nb).unwrap();
+    }
+    g.set_neighbors(6, &[0, 1, 2]).unwrap();
+    g.set_neighbors(7, &[3, 4, 5]).unwrap();
+    g.set_neighbors(8, &[6, 7]).unwrap();
+    g.set_starts(vec![0]).unwrap();
+    let mut b = LabelStoreBuilder::new();
+    for _ in 0..n {
+        b.push_point([("x", "x=1")]).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(labels.name_index()["x=1"], 8)])
+        .unwrap();
+    (base, g, labels, st)
+}
+
+fn tree_index<'a>(
+    base: &'a Matrix<f32>,
+    g: &'a Graph,
+    labels: &'a LabelStore,
+    st: &'a Starts,
+) -> Index<'a, f32> {
+    Index {
+        graph: g,
+        vectors: g.vectors(base).unwrap(),
+        labels,
+        global: &[0],
+        label_starts: Some(st),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 0.5,
+        bitsets: None,
+        costs: None,
+        sketches: None,
+    }
+}
+
+#[test]
+fn aux_frontier_keeps_only_routers_in_the_list() {
+    let (base, g, labels, st) = router_tree();
+    let ix = tree_index(&base, &g, &labels, &st);
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    let run = |expander: &str, l: usize| {
+        let k = kernel(&[
+            ("starts", "label(c*)"),
+            ("admission", "strict"),
+            ("laziness", "predicate_first"),
+            ("collector", "heap"),
+            ("expander", expander),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 6], vec![0f32; 6]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, l, &mut ids, &mut d, None);
+        ids.truncate(ctr.n_out as usize);
+        (ids, ctr)
+    };
+    // A frontier of two routers: both leaves are expanded, every member is collected.
+    let (ids, ctr) = run("aux_frontier", 2);
+    assert_eq!(ids, [5, 4, 3, 2, 1, 0]);
+    assert_eq!(ctr.n_aux_expand, 3);
+    // aux_only: the near leaf's members enter the list of two and evict the far leaf.
+    let (ids, ctr) = run("aux_only", 2);
+    assert_eq!(ids, [5, 4, 3]);
+    assert_eq!(ctr.n_aux_expand, 2);
+    // A frontier of one router keeps only the nearer leaf.
+    let (ids, _) = run("aux_frontier", 1);
+    assert_eq!(ids, [5, 4, 3]);
+    // aux_frontier needs the heap collector.
+    let mut k = kernel(&[("starts", "label(c*)"), ("expander", "aux_frontier")]);
+    k.collector = super::collect::Collector::FinalBeam;
+    assert!(k.validate().is_err());
+}
+
+#[test]
+fn the_tree_effort_curve_sets_the_tree_list_size() {
+    use super::cost::UnitCosts;
+    let (base, g, labels, st) = router_tree();
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        tree_r: vec![0.5, 0.9],
+        tree_k: vec![1.0, 100.0],
+        tree_l: vec![vec![1.0, 1.0], vec![2.0, 2.0]],
+        ..UnitCosts::default()
+    };
+    assert_eq!(costs.tree_list(0.9, 6.0), Some(2.0));
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..tree_index(&base, &g, &labels, &st)
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    let k = kernel(&[
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("terminator", "effort_curve"),
+        ("laziness", "heap_bound"),
+        ("crossover", "graph"),
+        ("exact", "planned"),
+        ("estimates", "sketch"),
+        ("tree_route", "row_scan"),
+        ("tree_effort", "curve"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut s = Searcher::for_index(&ix, &[&plan]);
+    for (effort, want) in [(900, vec![5, 4, 3, 2, 1, 0]), (500, vec![5, 4, 3])] {
+        let (mut ids, mut d) = (vec![0u32; 6], vec![0f32; 6]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, effort, &mut ids, &mut d, None);
+        ids.truncate(ctr.n_out as usize);
+        assert_eq!(ctr.route, Route::Tree);
+        // Every member matches (rho = 1): the frontier for R at K' = K.
+        assert_eq!(ids, want, "effort {effort}");
+        assert_eq!(ctr.m_hat, 6);
+    }
+    // Without a tree curve the plan is rejected.
+    let c0 = UnitCosts {
+        tree_r: Vec::new(),
+        tree_k: Vec::new(),
+        tree_l: Vec::new(),
+        ..costs.clone()
+    };
+    let ix0 = Index {
+        costs: Some(&c0),
+        ..ix
+    };
+    assert!(Plan::new(&k, &ix0).is_err());
+}
+
 #[test]
 fn many_clauses_use_mode_2() {
     let mut b = LabelStoreBuilder::new();

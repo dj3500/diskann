@@ -129,6 +129,9 @@ pub enum Expander {
     /// Only auxiliary nodes (routers) are expanded; data points are evaluated and collected
     /// but never expanded (a search over router trees: their leaves' members are scanned).
     AuxOnly,
+    /// As `aux_only`, and data points never enter the list either: the list is a frontier of
+    /// routers only (its size bounds the routers kept; members go to the collector).
+    AuxFrontier,
 }
 
 /// Terminator role.
@@ -424,6 +427,8 @@ pub struct Kernel {
     pub packed_beam: bool,
     /// The tree route for tree-eligible queries (`off` by default).
     pub tree_route: TreeRoute,
+    /// The tree route's list size (`list` by default).
+    pub tree_effort: TreeEffort,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -491,6 +496,37 @@ impl fmt::Display for TreeRoute {
     }
 }
 
+/// The list size of the tree route's search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreeEffort {
+    /// The configuration's list size (the tree search's list holds routers and matches).
+    List,
+    /// The calibrated tree effort curve (`tree_*` in the unit costs) at the configuration's
+    /// target recall (`effort_curve` efforts) for `K / ρ̂` members, `ρ̂` = the estimated
+    /// share of the binding clause's members that match (`M̂ / A`); the list holds routers
+    /// only.
+    Curve,
+}
+
+impl TreeEffort {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "list" => Self::List,
+            "curve" => Self::Curve,
+            v => bail!("unknown tree_effort {v:?} (list, curve)"),
+        })
+    }
+}
+
+impl fmt::Display for TreeEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::List => "list",
+            Self::Curve => "curve",
+        })
+    }
+}
+
 impl Default for Kernel {
     /// The plain search: global start (force), everything admitted, eager evaluation, distance
     /// keys, final-beam collection, one hop, exhaustive termination, mode 1.
@@ -525,6 +561,7 @@ impl Default for Kernel {
             row_prefetch: false,
             packed_beam: false,
             tree_route: TreeRoute::Off,
+            tree_effort: TreeEffort::List,
         }
     }
 }
@@ -795,7 +832,10 @@ impl Expander {
             ("two_hop", []) => Self::TwoHop(None),
             ("two_hop", [c]) => Self::TwoHop(Some(num(c, "two-hop cap")?)),
             ("aux_only", []) => Self::AuxOnly,
-            _ => bail!("unknown expander {s:?} (one_hop, two_hop, two_hop(cap), aux_only)"),
+            ("aux_frontier", []) => Self::AuxFrontier,
+            _ => bail!(
+                "unknown expander {s:?} (one_hop, two_hop, two_hop(cap), aux_only, aux_frontier)"
+            ),
         })
     }
 }
@@ -807,6 +847,7 @@ impl fmt::Display for Expander {
             Self::TwoHop(None) => write!(f, "two_hop"),
             Self::TwoHop(Some(c)) => write!(f, "two_hop({c})"),
             Self::AuxOnly => write!(f, "aux_only"),
+            Self::AuxFrontier => write!(f, "aux_frontier"),
         }
     }
 }
@@ -1040,6 +1081,7 @@ impl Kernel {
                 }
             }
             "tree_route" => self.tree_route = TreeRoute::parse(value)?,
+            "tree_effort" => self.tree_effort = TreeEffort::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1105,9 +1147,20 @@ impl Kernel {
         if let Expander::TwoHop(Some(c)) = self.expander {
             ensure!(c >= 1, "two_hop(cap) needs cap >= 1");
         }
+        let aux_expander = matches!(self.expander, Expander::AuxOnly | Expander::AuxFrontier);
         ensure!(
-            !(self.expander == Expander::AuxOnly && self.scorer.needs_pilot()),
-            "aux_only cannot use a pilot scorer (the pilot expands the global start)"
+            !(aux_expander && self.scorer.needs_pilot()),
+            "aux_only / aux_frontier cannot use a pilot scorer (the pilot expands the global start)"
+        );
+        ensure!(
+            self.expander != Expander::AuxFrontier || self.collector == Collector::Heap,
+            "aux_frontier collects matches in the heap collector only (they never enter the list)"
+        );
+        ensure!(
+            self.tree_effort == TreeEffort::List
+                || (self.tree_route != TreeRoute::Off
+                    && matches!(self.terminator, Terminator::EffortCurve { .. })),
+            "tree_effort = curve needs the tree route and effort_curve efforts (a target recall)"
         );
         let two_hop = matches!(self.expander, Expander::TwoHop(_));
         match self.laziness {
@@ -1249,6 +1302,9 @@ impl Kernel {
         if self.tree_route != TreeRoute::Off {
             j["tree_route"] = json!(self.tree_route.to_string());
         }
+        if self.tree_effort != TreeEffort::List {
+            j["tree_effort"] = json!(self.tree_effort.to_string());
+        }
         j
     }
 
@@ -1265,7 +1321,10 @@ impl Kernel {
             admission: Admission::Strict,
             laziness: Laziness::PredicateFirst,
             collector: Collector::Heap,
-            expander: Expander::AuxOnly,
+            expander: match self.tree_effort {
+                TreeEffort::List => Expander::AuxOnly,
+                TreeEffort::Curve => Expander::AuxFrontier,
+            },
             terminator: Terminator::Exhaust,
             predicate,
             materializer,
