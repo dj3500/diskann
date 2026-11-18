@@ -1284,7 +1284,7 @@ fn seeded_exact_paths_exhaust_every_candidate() {
         collect::{Answers, Collector},
         cost::ExactPlan,
         eval::{Compiled, EvalCtx, Weights},
-        exact::{run_planned, ExactEval},
+        exact::{run_planned, DfPipeline, ExactEval},
         materialize::Materialized,
     };
     let f = fixture(300, 9, false);
@@ -1313,7 +1313,11 @@ fn seeded_exact_paths_exhaust_every_candidate() {
                 .copied()
                 .collect();
             for seed in [&far, &mixed] {
-                for plan in ExactPlan::ALL {
+                for (plan, pipelined) in ExactPlan::ALL
+                    .into_iter()
+                    .map(|p| (p, false))
+                    .chain([(ExactPlan::DistanceFirst, true)])
+                {
                     for eval in [ExactEval::RowScan, ExactEval::StaticBits] {
                         let mut cx = EvalCtx::new(&f.labels, &q, &bits, &[], &[]);
                         if eval == ExactEval::StaticBits {
@@ -1324,6 +1328,7 @@ fn seeded_exact_paths_exhaust_every_candidate() {
                             answers.offer_unique(d, id);
                         }
                         let mut ctr = Counters::default();
+                        let mut df = DfPipeline::new();
                         run_planned(
                             plan,
                             eval,
@@ -1335,6 +1340,7 @@ fn seeded_exact_paths_exhaust_every_candidate() {
                             &mut mat,
                             &mut answers,
                             true,
+                            pipelined.then_some(&mut df),
                             &mut ctr,
                         );
                         let mut ids = vec![0u32; k];
@@ -2302,4 +2308,69 @@ fn inline_rank_plans_the_inline_search_at_the_kth_match_rank() {
         }
     }
     assert!(raised > 0, "no list raised");
+}
+
+#[test]
+fn df_pipeline_checks_and_answers_as_the_direct_loop() {
+    use super::{
+        collect::{Answers, Collector},
+        cost::ExactPlan,
+        eval::{Compiled, EvalCtx, Weights},
+        exact::{run_planned, DfPipeline, ExactEval},
+        materialize::Materialized,
+    };
+    // More candidates than a pipeline block, so that checks wait across blocks.
+    let f = fixture(1000, 5, false);
+    let vectors = f.graph.vectors(&f.base).unwrap();
+    let mut bits = vec![0u64; f.labels.n_labels()];
+    let mut q = Compiled::new();
+    let mut mat = Materialized::new(1000, true);
+    let mut answers = Answers::new();
+    let mut df = DfPipeline::new();
+    let mut multi = 0;
+    for qi in 0..f.preds.len() {
+        q.compile(&f.labels, f.preds.get(qi), Weights::Unit, None, &mut bits);
+        if q.is_empty() {
+            q.clear_bits(&mut bits);
+            continue;
+        }
+        q.split_static(&f.labels, &f.bitsets, 1, false);
+        multi += usize::from(q.n_clauses() > 1);
+        for k in [1usize, 10, 50] {
+            for eval in [ExactEval::RowScan, ExactEval::StaticBits] {
+                let mut cx = EvalCtx::new(&f.labels, &q, &bits, &[], &[]);
+                if eval == ExactEval::StaticBits {
+                    cx = cx.with_static(&f.bitsets);
+                }
+                let mut run = |pipelined: bool| {
+                    let mut ctr = Counters::default();
+                    answers.reset(Collector::Heap, k, k);
+                    run_planned(
+                        ExactPlan::DistanceFirst,
+                        eval,
+                        &cx,
+                        &vectors,
+                        1000,
+                        f.queries.row(qi),
+                        k,
+                        &mut mat,
+                        &mut answers,
+                        false,
+                        pipelined.then_some(&mut df),
+                        &mut ctr,
+                    );
+                    let mut ids = vec![0u32; k];
+                    let mut ds = vec![0f32; k];
+                    let n = answers.finish(&mut ids, &mut ds);
+                    (ids[..n].to_vec(), ds[..n].to_vec(), ctr.n_pred, ctr.n_dist)
+                };
+                let direct = run(false);
+                assert_eq!(run(true), direct, "q={qi} k={k} {eval:?}");
+                let truth: Vec<u32> = f.truth(qi, k).iter().map(|&(_, id)| id).collect();
+                assert_eq!(direct.0, truth, "q={qi} k={k} {eval:?}");
+            }
+        }
+        q.clear_bits(&mut bits);
+    }
+    assert!(multi > 0, "the fixture has queries with residual clauses");
 }

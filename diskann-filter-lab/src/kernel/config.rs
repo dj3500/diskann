@@ -453,6 +453,11 @@ pub struct Kernel {
     /// evaluated nodes reach the rank of the `K`-th match at the estimated match rate, as the
     /// post-filter route does (A7b); off: `L₀ × m(M̂ / n)` only.
     pub inline_rank: bool,
+    /// The exact plan `df` checks a candidate inside the answer bound one block of candidates
+    /// after its distance, with its row offsets and row prefetched meanwhile (A7b), as `scan`
+    /// prefetches its checks; off: each check reads its row at once. The same checks and
+    /// answers, only memory timing.
+    pub df_pipeline: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -520,6 +525,7 @@ impl Default for Kernel {
             packed_beam: false,
             df_lower: false,
             inline_rank: false,
+            df_pipeline: false,
         }
     }
 }
@@ -1042,6 +1048,13 @@ impl Kernel {
                     v => bail!("unknown inline_rank {v:?} (on, off)"),
                 }
             }
+            "df_pipeline" => {
+                self.df_pipeline = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown df_pipeline {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1241,6 +1254,9 @@ impl Kernel {
         }
         if self.inline_rank {
             j["inline_rank"] = json!("on");
+        }
+        if self.df_pipeline {
+            j["df_pipeline"] = json!("on");
         }
         if self.row_reads != RowReads::Clause {
             j["row_reads"] = json!(self.row_reads.to_string());

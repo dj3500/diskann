@@ -27,7 +27,7 @@ use super::{
         ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
         StaticBits,
     },
-    exact::{self, ExactEval},
+    exact::{self, DfPipeline, ExactEval},
     materialize::{Materialized, Materializer},
     planner::{Decision, Fallback, Guard, Probe, PROBE_STAGE},
     score::{
@@ -663,6 +663,8 @@ pub struct Searcher {
     starts: Vec<u32>,
     /// Starts a post-filter search offers once it ends (`by_rate_late`).
     late: Vec<u32>,
+    /// The pipelined `df` plan's scratch (`df_pipeline`).
+    df: DfPipeline,
     pilot: Vec<(u32, f32)>,
     pilot_d: Vec<f32>,
     sorted: Vec<f32>,
@@ -705,6 +707,7 @@ impl Searcher {
             answers: Answers::new(),
             starts: Vec::new(),
             late: Vec::new(),
+            df: DfPipeline::new(),
             pilot: Vec::new(),
             pilot_d: Vec::new(),
             sorted: Vec::new(),
@@ -1288,6 +1291,7 @@ impl Searcher {
             &mut self.mat,
             &mut self.answers,
             seeded,
+            plan.kernel.df_pipeline.then_some(&mut self.df),
             ctr,
         );
         toc(t, &mut ctr.t_exact_ns);

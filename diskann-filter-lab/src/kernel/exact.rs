@@ -260,7 +260,15 @@ pub(crate) fn filter<P: Eval>(
     ctr.n_pred += n as u64;
 }
 
+/// Candidates per block of the pipelined `df` (`df_pipeline`): a block's distances cover the
+/// latency of the previous block's row prefetches.
+const DF_BLOCK: usize = 32;
+
 /// Distance first: every candidate's distance; the predicate only inside the answer bound.
+/// `pipeline`: a candidate inside the bound when its distance is computed has its row offsets
+/// prefetched, its row prefetched after its block, and is checked after the next block's
+/// distances if it is still inside the bound. The bound only shrinks and the checks keep the
+/// candidate order, so the checks, answers and counters are those of the direct loop.
 #[inline]
 #[expect(
     clippy::too_many_arguments,
@@ -274,11 +282,41 @@ fn distance_first<T: Element, P: Eval>(
     query: &[T],
     answers: &mut Answers,
     seeded: bool,
+    pipeline: Option<&mut DfPipeline>,
     ctr: &mut Counters,
 ) {
     let n = cands.len();
     for &v in &cands[..n.min(AHEAD_VECTORS)] {
         diskann_vector::prefetch_hint_max::<4, _>(vectors.get(v));
+    }
+    if let (true, Some(pl)) = (checks, pipeline) {
+        pl.pending.clear();
+        pl.current.clear();
+        for start in (0..n).step_by(DF_BLOCK) {
+            for i in start..(start + DF_BLOCK).min(n) {
+                if i + AHEAD_VECTORS < n {
+                    diskann_vector::prefetch_hint_max::<4, _>(
+                        vectors.get(cands[i + AHEAD_VECTORS]),
+                    );
+                }
+                let v = cands[i];
+                let d = T::squared_l2(query, vectors.get(v));
+                ctr.n_dist += 1;
+                if answers.is_full() && d > answers.worst() {
+                    continue;
+                }
+                P::prefetch_offsets(cx, v);
+                pl.current.push((d, v));
+            }
+            df_checks::<P>(cx, &pl.pending, answers, seeded, ctr);
+            for &(_, v) in &pl.current {
+                P::prefetch(cx, v);
+            }
+            std::mem::swap(&mut pl.pending, &mut pl.current);
+            pl.current.clear();
+        }
+        df_checks::<P>(cx, &pl.pending, answers, seeded, ctr);
+        return;
     }
     for i in 0..n {
         if i + AHEAD_VECTORS < n {
@@ -299,6 +337,52 @@ fn distance_first<T: Element, P: Eval>(
             }
         }
         offer_answer(answers, seeded, d, v);
+    }
+}
+
+/// The pipelined `df`'s checks of `block` (candidates in order with their distances), each only
+/// if still inside the answer bound.
+#[inline]
+fn df_checks<P: Eval>(
+    cx: &EvalCtx<'_>,
+    block: &[(f32, u32)],
+    answers: &mut Answers,
+    seeded: bool,
+    ctr: &mut Counters,
+) {
+    for &(d, v) in block {
+        if answers.is_full() && d > answers.worst() {
+            continue;
+        }
+        ctr.n_pred += 1;
+        if check::<P>(cx, v) {
+            offer_answer(answers, seeded, d, v);
+        }
+    }
+}
+
+/// Scratch of the pipelined `df`: the candidates of the current block inside the answer bound
+/// and those of the previous block, awaiting their checks.
+#[derive(Debug)]
+pub struct DfPipeline {
+    current: Vec<(f32, u32)>,
+    pending: Vec<(f32, u32)>,
+}
+
+impl DfPipeline {
+    /// Scratch for blocks of [`DF_BLOCK`] candidates (allocated now: no allocation during a
+    /// search).
+    pub fn new() -> Self {
+        Self {
+            current: Vec::with_capacity(DF_BLOCK),
+            pending: Vec::with_capacity(DF_BLOCK),
+        }
+    }
+}
+
+impl Default for DfPipeline {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -335,7 +419,8 @@ fn candidates<'a>(cx: &EvalCtx<'a>, n_data: usize, mat: &mut Materialized) -> Op
 
 /// Runs the exact path v2 with `plan`; the answers are left in `answers` (a `heap(K)`
 /// collector). With `seeded`, `answers` already holds a `heap(K)` of answers of another
-/// search (kept; see the module documentation).
+/// search (kept; see the module documentation). `df`: the pipelined `df` loop's scratch
+/// (`df_pipeline`; `None`: the direct loop).
 #[expect(
     clippy::too_many_arguments,
     reason = "the exact path reads every per-query input"
@@ -351,18 +436,19 @@ pub fn run_planned<T: Element>(
     mat: &mut Materialized,
     answers: &mut Answers,
     seeded: bool,
+    df: Option<&mut DfPipeline>,
     ctr: &mut Counters,
 ) {
     if !seeded {
         answers.reset(Collector::Heap, k, k);
     }
     match eval {
-        ExactEval::RowScan => {
-            planned::<T, RowScan>(plan, cx, vectors, n_data, query, mat, answers, seeded, ctr);
-        }
-        ExactEval::StaticBits => {
-            planned::<T, StaticBits>(plan, cx, vectors, n_data, query, mat, answers, seeded, ctr);
-        }
+        ExactEval::RowScan => planned::<T, RowScan>(
+            plan, cx, vectors, n_data, query, mat, answers, seeded, df, ctr,
+        ),
+        ExactEval::StaticBits => planned::<T, StaticBits>(
+            plan, cx, vectors, n_data, query, mat, answers, seeded, df, ctr,
+        ),
     }
 }
 
@@ -379,6 +465,7 @@ fn planned<T: Element, P: Eval>(
     mat: &mut Materialized,
     answers: &mut Answers,
     seeded: bool,
+    df: Option<&mut DfPipeline>,
     ctr: &mut Counters,
 ) {
     let checks = cx.q.n_clauses() > 1;
@@ -391,7 +478,7 @@ fn planned<T: Element, P: Eval>(
             ctr.n_exact_cand += cands.len() as u64;
             if plan == ExactPlan::DistanceFirst {
                 let t = tic(ctr);
-                distance_first::<T, P>(cx, cands, checks, vectors, query, answers, seeded, ctr);
+                distance_first::<T, P>(cx, cands, checks, vectors, query, answers, seeded, df, ctr);
                 toc(t, &mut ctr.t_dist_ns);
             } else if checks {
                 let t = tic(ctr);
