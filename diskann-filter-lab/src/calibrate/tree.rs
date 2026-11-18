@@ -10,7 +10,9 @@
 //!   in size classes by decade (≤ 10 points, 11–100, 101–1,000, ...; a tree's depth and leaf
 //!   count grow with its label's size); per class, `queries` labels sampled with probability
 //!   proportional to their size (seeded).
-//! - **Queries**: per sampled label, the midpoint of two random members (`u8`: rounded half up).
+//! - **Queries**: per sampled label, the midpoint of two random members (`label`, queries
+//!   inside the label's region) or of two random data points (`base`, queries independent of
+//!   the label, as the graph's effort curve; `u8`: rounded half up).
 //! - **Ground truth**: the label's `kmax` nearest members (one scan of its postings).
 //! - **Searches**: the tree route's search with a frontier of routers only (`aux_frontier`),
 //!   the label as the predicate, a heap of `kmax`. The traversal does not depend on the
@@ -49,14 +51,34 @@ const STOP_RECALL: f64 = 0.995;
 /// Extrapolation above the largest measured frontier stops at this multiple of it.
 const EXTRAPOLATION_CAP: f64 = 8.0;
 
+/// Where the calibration queries come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeQueries {
+    /// Midpoints of two random members of the sampled label.
+    Label,
+    /// Midpoints of two random data points (independent of the label).
+    Base,
+}
+
+impl TreeQueries {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "label" => Self::Label,
+            "base" => Self::Base,
+            v => anyhow::bail!("unknown tree calibration queries {v:?} (label, base)"),
+        })
+    }
+}
+
 /// Options of the tree effort calibration.
 #[derive(Debug, Clone)]
 pub struct TreeOptions {
-    /// Queries (one sampled label each).
+    /// Queries per size class (one sampled label each).
     pub queries: usize,
     pub seed: u64,
     /// Largest measured frontier.
     pub l_max: usize,
+    pub queries_from: TreeQueries,
 }
 
 impl Default for TreeOptions {
@@ -65,6 +87,7 @@ impl Default for TreeOptions {
             queries: 200,
             seed: 0,
             l_max: 65_536,
+            queries_from: TreeQueries::Label,
         }
     }
 }
@@ -127,8 +150,16 @@ fn class_curve<T: Element>(
     for _ in 0..opts.queries {
         let x = rng.next() % total;
         let l = trees[cum.partition_point(|&c| c <= x)];
-        let p = labels.postings(l);
-        let (a, b) = (p[rng.below(p.len())], p[rng.below(p.len())]);
+        let (a, b) = match opts.queries_from {
+            TreeQueries::Label => {
+                let p = labels.postings(l);
+                (p[rng.below(p.len())], p[rng.below(p.len())])
+            }
+            TreeQueries::Base => (
+                rng.below(base.nrows()) as u32,
+                rng.below(base.nrows()) as u32,
+            ),
+        };
         queries.push(midpoint(base.row(a as usize), base.row(b as usize)));
         chosen.push(l);
     }
@@ -327,6 +358,7 @@ pub fn tree_curve<T: Element>(
         docs.push(c.doc.clone());
     }
     let doc = json!({
+        "queries_from": format!("{:?}", opts.queries_from).to_lowercase(),
         "queries_per_class": opts.queries,
         "seed": opts.seed,
         "tree_labels": trees.len(),
@@ -485,6 +517,7 @@ mod tests {
                 queries: 20,
                 seed: 3,
                 l_max: 64,
+                queries_from: TreeQueries::Label,
             },
         )
         .unwrap();
@@ -510,5 +543,19 @@ mod tests {
         // The frontier needed grows with the recall and with K'.
         let last = e.l.len() - 1;
         assert!(e.l[last][1] >= e.l[0][0]);
+        // Queries anywhere on the line (base midpoints) reach full recall within the tree too.
+        let b = tree_curve(
+            &base,
+            &ix,
+            &labels,
+            &TreeOptions {
+                queries: 20,
+                seed: 3,
+                l_max: 64,
+                queries_from: TreeQueries::Base,
+            },
+        )
+        .unwrap();
+        assert!(b.l.iter().flatten().all(|&l| (1.0..=8.0).contains(&l)));
     }
 }

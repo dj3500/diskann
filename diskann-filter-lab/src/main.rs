@@ -428,7 +428,8 @@ struct TreeCalibrateArgs {
     /// The calibration of the base graph (`flab calibrate` output) to extend.
     #[arg(long)]
     calibration: PathBuf,
-    /// Queries (one label sampled in proportion to its size each).
+    /// Queries per label-size class (one label of the class sampled in proportion to its size
+    /// each).
     #[arg(long, default_value_t = 200)]
     queries: usize,
     #[arg(long, default_value_t = 0)]
@@ -436,6 +437,10 @@ struct TreeCalibrateArgs {
     /// Largest router frontier measured (above it the curve is extrapolated).
     #[arg(long, default_value_t = 65_536)]
     l_max: usize,
+    /// Calibration queries: `label` (midpoints of two members of the sampled label) or `base`
+    /// (midpoints of two random data points).
+    #[arg(long, default_value = "label")]
+    queries_from: String,
     /// Output JSON.
     #[arg(short, long)]
     output: PathBuf,
@@ -589,6 +594,7 @@ fn main() -> Result<()> {
                 queries: a.queries,
                 seed: a.seed,
                 l_max: a.l_max,
+                queries_from: calibrate::TreeQueries::parse(&a.queries_from)?,
             };
             let input: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&a.calibration)?)?;
