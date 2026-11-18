@@ -15,8 +15,14 @@
 //! - every pair of big labels that co-occurs (`j = |P_a ∩ P_b| > 0`) is a candidate with gain
 //!   `g = min(|P_a|, |P_b|) − j` (the candidates a plan saves by enumerating the pair instead of
 //!   the smaller label) and cost `j + 3` entries (its list and its directory entry, 4 bytes
-//!   each). Pairs are taken by decreasing `g / (j + 3)` while the budget lasts (a threshold on
-//!   the ratio, read from a histogram of 8 bins per octave);
+//!   each). Pairs are taken by decreasing key while the budget lasts (a threshold on the key,
+//!   read from a histogram of 8 bins per octave). The key is the expected saving per stored
+//!   entry under a [`Prior`] on which pairs queries use: `g / (j + 3)` when every co-occurring
+//!   pair is equally likely (`uniform`), `(min(|P_a|, |P_b|) / n) · g / (j + 3)` when a pair is
+//!   as likely as its smaller label is frequent (`rare`: a query's rarest label drawn like a
+//!   data point's label). Under `uniform` a larger budget, which lowers `T`, admits many pairs of
+//!   small labels with tiny joints (high gain per entry, small saving per query) that can
+//!   displace pairs of large labels; `rare` ranks those below;
 //! - the co-occurrence matrix tells which big pairs are empty: they need no list.
 //!
 //! A lookup of labels `(a, b)` answers [`Joint::Stored`] (the list), [`Joint::Empty`] (both big,
@@ -51,10 +57,62 @@ const NONE: u32 = u32::MAX;
 pub const T_MIN: u64 = 64;
 /// Directory cost of a stored pair, in entries (partner id and list offset).
 const PAIR_OVERHEAD: u64 = 3;
-/// Histogram resolution of the gain/cost ratio: bins per octave, and the ratio of bin 0.
+/// Histogram resolution of the selection key: bins per octave over 80 octaves from the
+/// prior's [`Prior::key_min_log2`].
 const BINS_PER_OCTAVE: f64 = 8.0;
-const RATIO_MIN_LOG2: f64 = -10.0;
-const N_BINS: usize = 8 * 48;
+const N_BINS: usize = 8 * 80;
+
+/// Which label pairs queries are assumed to use (the selection's ranking; see the module
+/// documentation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Prior {
+    /// Every co-occurring pair equally likely: rank by gain per entry.
+    #[default]
+    Uniform,
+    /// A pair as likely as its smaller label is frequent: gain per entry times
+    /// `min(|P_a|, |P_b|) / n`.
+    Rare,
+}
+
+impl Prior {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Rare => "rare",
+        }
+    }
+
+    /// log2 of the key at the top of histogram bin 0.
+    fn key_min_log2(self) -> f64 {
+        match self {
+            Self::Uniform => -10.0,
+            Self::Rare => -40.0,
+        }
+    }
+
+    /// Selection key of a pair with smaller label `min` members, `gain` and `cost` entries on
+    /// `n` points.
+    fn key(self, min: u64, gain: u64, cost: u64, n: u64) -> f64 {
+        let r = gain as f64 / cost as f64;
+        match self {
+            Self::Uniform => r,
+            Self::Rare => r * min as f64 / n.max(1) as f64,
+        }
+    }
+}
+
+impl std::str::FromStr for Prior {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "uniform" => Ok(Self::Uniform),
+            "rare" => Ok(Self::Rare),
+            _ => anyhow::bail!("unknown pair prior {s:?} (uniform, rare)"),
+        }
+    }
+}
 
 /// Result of a pair lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +132,7 @@ pub struct PairIndex {
     dict_hash: u64,
     /// Size threshold of the big labels.
     t_big: u64,
-    /// Selection threshold on `gain / cost` (pairs at or above it are stored).
+    /// Selection threshold on the prior's key (pairs at or above it are stored).
     ratio: f64,
     /// Big index of every label (`NONE` for the others); increasing with the label id.
     big: Vec<u32>,
@@ -96,6 +154,7 @@ pub struct PairIndex {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PairStats {
     pub budget_bytes: u64,
+    pub prior: Prior,
     pub t_big: u64,
     pub n_big: usize,
     pub big_entries: u64,
@@ -159,12 +218,12 @@ impl Cover {
 pub const MAX_LOOKUPS: usize = 64;
 
 #[inline]
-fn ratio_bin(gain: u64, cost: u64) -> usize {
+fn key_bin(prior: Prior, min: u64, gain: u64, cost: u64, n: u64) -> usize {
     if gain == 0 {
         return 0;
     }
-    let r = gain as f64 / cost as f64;
-    let b = ((r.log2() - RATIO_MIN_LOG2) * BINS_PER_OCTAVE).floor();
+    let k = prior.key(min, gain, cost, n);
+    let b = ((k.log2() - prior.key_min_log2()) * BINS_PER_OCTAVE).floor();
     if b < 1.0 {
         0
     } else {
@@ -173,15 +232,27 @@ fn ratio_bin(gain: u64, cost: u64) -> usize {
 }
 
 /// Lower edge of histogram bin `b` (`b ≥ 1`).
-fn bin_floor(b: usize) -> f64 {
-    (RATIO_MIN_LOG2 + b as f64 / BINS_PER_OCTAVE).exp2()
+fn bin_floor(prior: Prior, b: usize) -> f64 {
+    (prior.key_min_log2() + b as f64 / BINS_PER_OCTAVE).exp2()
 }
 
 impl PairIndex {
-    /// Selects and builds the combination postings of `labels` within `budget_bytes` (with up
-    /// to `threads` threads; the result does not depend on the thread count).
+    /// Selects and builds the combination postings of `labels` within `budget_bytes` under the
+    /// `uniform` prior (with up to `threads` threads; the result does not depend on the thread
+    /// count).
     pub fn build(labels: &LabelStore, budget_bytes: u64, threads: usize) -> (Self, PairStats) {
+        Self::build_with(labels, budget_bytes, threads, Prior::Uniform)
+    }
+
+    /// [`Self::build`] under `prior`.
+    pub fn build_with(
+        labels: &LabelStore,
+        budget_bytes: u64,
+        threads: usize,
+        prior: Prior,
+    ) -> (Self, PairStats) {
         let nl = labels.n_labels();
+        let n = labels.n_points() as u64;
         let sizes: Vec<u64> = (0..nl as u32)
             .map(|l| labels.posting_len(l) as u64)
             .collect();
@@ -204,6 +275,7 @@ impl PairIndex {
         let words = nb.div_ceil(64);
         let mut stats = PairStats {
             budget_bytes,
+            prior,
             t_big: t,
             n_big: nb,
             big_entries: big_labels.iter().map(|&l| sizes[l as usize]).sum(),
@@ -252,8 +324,8 @@ impl PairIndex {
                 let j = u64::from(s.count[c as usize]);
                 s.count[c as usize] = 0;
                 bits[c as usize / 64] |= 1u64 << (c % 64);
-                let gain = sa.min(size_of(c)) - j;
-                row_hist[ratio_bin(gain, j + PAIR_OVERHEAD)] += j + PAIR_OVERHEAD;
+                let min = sa.min(size_of(c));
+                row_hist[key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n)] += j + PAIR_OVERHEAD;
             }
             let hist: Vec<(u16, u64)> = row_hist
                 .iter()
@@ -287,7 +359,7 @@ impl PairIndex {
         let ratio = if cut >= N_BINS {
             f64::INFINITY
         } else {
-            bin_floor(cut)
+            bin_floor(prior, cut)
         };
         stats.ratio = ratio;
 
@@ -304,8 +376,8 @@ impl PairIndex {
             for &c in &s.touched {
                 let j = u64::from(s.count[c as usize]);
                 s.count[c as usize] = 0;
-                let gain = sa.min(size_of(c)) - j;
-                if ratio_bin(gain, j + PAIR_OVERHEAD) >= cut {
+                let min = sa.min(size_of(c));
+                if key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n) >= cut {
                     s.slot[c as usize] = partners.len() as u32;
                     partners.push(c);
                 }
@@ -744,6 +816,44 @@ mod tests {
         let mut buf = Vec::new();
         ix.write_to(&mut buf).unwrap();
         assert_eq!(PairIndex::read_from(std::io::Cursor::new(buf)).unwrap(), ix);
+    }
+
+    #[test]
+    fn the_rare_prior_prefers_the_pair_of_larger_labels() {
+        // 2,000 points: s1 = 0..200 and s2 = 199..400 meet once (gain per entry 199/4); L1 =
+        // 0..1000 and L2 = 960..2000 meet on 40 points (960/43, but ×10 more frequent).
+        let mut b = LabelStoreBuilder::new();
+        for p in 0..2000u32 {
+            let mut v = vec![];
+            if p < 200 {
+                v.push(("k", "s1"));
+            }
+            if (199..400).contains(&p) {
+                v.push(("k", "s2"));
+            }
+            if p < 1000 {
+                v.push(("k", "L1"));
+            }
+            if p >= 960 {
+                v.push(("k", "L2"));
+            }
+            b.push_point(v).unwrap();
+        }
+        let s = b.finish().unwrap();
+        let id = s.name_index();
+        let (s1, s2, l1, l2) = (id["s1"], id["s2"], id["L1"], id["L2"]);
+        // Room for one of the two lists (4 + 43 entries do not fit).
+        let budget = 4 * 4 + 32 + 8 * 6 + 4 * 45;
+        let (u, su) = PairIndex::build_with(&s, budget, 1, Prior::Uniform);
+        let (r, sr) = PairIndex::build_with(&s, budget, 1, Prior::Rare);
+        assert_eq!((su.t_big, sr.t_big), (64, 64));
+        assert!(matches!(u.joint(s1, s2), Joint::Stored(..)), "{su:?}");
+        assert_eq!(u.joint(l1, l2), Joint::Unknown);
+        assert!(matches!(r.joint(l1, l2), Joint::Stored(..)), "{sr:?}");
+        assert_eq!(r.joint(s1, s2), Joint::Unknown);
+        // Containments (s1 ⊂ L1) have no gain under either prior.
+        assert_eq!(r.joint(s1, l1), Joint::Unknown);
+        r.check_sample(&s, 1).unwrap();
     }
 
     #[test]
