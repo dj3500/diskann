@@ -391,6 +391,10 @@ enum PairsCommand {
         /// gain per entry) or `rare` (as likely as the smaller label is frequent).
         #[arg(long, default_value = "uniform")]
         prior: diskann_filter_lab::pairs::Prior,
+        /// Nested selections: the budgets in increasing order, each keeping every pair of the
+        /// previous one (monotone in the budget); files `pairs[-<prior>]-nested-b*`.
+        #[arg(long)]
+        nested: bool,
     },
 }
 
@@ -1599,14 +1603,21 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
             out_dir,
             report,
             prior,
+            nested,
         } => {
             let store = LabelStore::read(&labels)?;
             std::fs::create_dir_all(&out_dir)?;
             let postings = 4 * store.n_entries() as u64;
-            let stem = match prior {
+            let mut stem = match prior {
                 diskann_filter_lab::pairs::Prior::Uniform => "pairs".to_owned(),
                 p => format!("pairs-{}", p.as_str()),
             };
+            let mut budget = budget;
+            if nested {
+                stem += "-nested";
+                budget.sort_by(f64::total_cmp);
+            }
+            let mut prev: Option<PairIndex> = None;
             let preds = report
                 .iter()
                 .map(|p| {
@@ -1618,8 +1629,13 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
             for f in budget {
                 ensure!(f > 0.0, "budgets must be positive");
                 let t = Instant::now();
-                let (ix, stats) =
-                    PairIndex::build_with(&store, (f * postings as f64) as u64, threads, prior);
+                let (ix, stats) = PairIndex::build_nested(
+                    &store,
+                    (f * postings as f64) as u64,
+                    threads,
+                    prior,
+                    prev.as_ref().filter(|_| nested),
+                );
                 let build_s = secs(t);
                 let tag = format!("{}", (f * 1000.0).round() as u64);
                 let out = out_dir.join(format!("{stem}-b{tag}.flab"));
@@ -1639,6 +1655,7 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
                     "n_points": store.n_points(),
                     "n_labels": store.n_labels(),
                     "budget_fraction": f,
+                    "nested": nested,
                     "stats": stats,
                     "build_s": build_s,
                     "threads": threads,
@@ -1664,6 +1681,7 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
                 for c in &cov {
                     println!("  {c}");
                 }
+                prev = Some(ix);
             }
         }
     }

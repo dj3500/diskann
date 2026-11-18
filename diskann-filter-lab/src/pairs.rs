@@ -22,7 +22,9 @@
 //!   as likely as its smaller label is frequent (`rare`: a query's rarest label drawn like a
 //!   data point's label). Under `uniform` a larger budget, which lowers `T`, admits many pairs of
 //!   small labels with tiny joints (high gain per entry, small saving per query) that can
-//!   displace pairs of large labels; `rare` ranks those below;
+//!   displace pairs of large labels; `rare` ranks those below; a *nested* build
+//!   ([`PairIndex::build_nested`]) keeps every pair of a smaller budget's selection, so that a
+//!   ladder of budgets is monotone;
 //! - the co-occurrence matrix tells which big pairs are empty: they need no list.
 //!
 //! A lookup of labels `(a, b)` answers [`Joint::Stored`] (the list), [`Joint::Empty`] (both big,
@@ -251,6 +253,20 @@ impl PairIndex {
         threads: usize,
         prior: Prior,
     ) -> (Self, PairStats) {
+        Self::build_nested(labels, budget_bytes, threads, prior, None)
+    }
+
+    /// [`Self::build_with`] keeping every pair stored by `keep` (a selection at a smaller budget
+    /// of the same labels, whose big labels are then big here too): those are stored first and
+    /// the rest of the budget goes to the best other pairs, so that a ladder of budgets stores
+    /// nested selections (monotone in the budget although `T` falls with it).
+    pub fn build_nested(
+        labels: &LabelStore,
+        budget_bytes: u64,
+        threads: usize,
+        prior: Prior,
+        keep: Option<&PairIndex>,
+    ) -> (Self, PairStats) {
         let nl = labels.n_labels();
         let n = labels.n_points() as u64;
         let sizes: Vec<u64> = (0..nl as u32)
@@ -315,15 +331,28 @@ impl PairIndex {
             s.touched.sort_unstable();
         };
         let size_of = |c: u32| sizes[big_labels[c as usize] as usize];
+        let kept = |r: u32, c: u32| {
+            keep.is_some_and(|k| {
+                matches!(
+                    k.joint(big_labels[r as usize], big_labels[c as usize]),
+                    Joint::Stored(..)
+                )
+            })
+        };
         let pass1 = parallel::par_map(nb, threads, init, |r, s| {
             count_row(r, s);
             let sa = size_of(r as u32);
             let mut bits = vec![0u64; words];
             let mut row_hist = [0u64; N_BINS];
+            let mut forced = 0u64;
             for &c in &s.touched {
                 let j = u64::from(s.count[c as usize]);
                 s.count[c as usize] = 0;
                 bits[c as usize / 64] |= 1u64 << (c % 64);
+                if kept(r as u32, c) {
+                    forced += j + PAIR_OVERHEAD;
+                    continue;
+                }
                 let min = sa.min(size_of(c));
                 row_hist[key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n)] += j + PAIR_OVERHEAD;
             }
@@ -333,21 +362,23 @@ impl PairIndex {
                 .filter(|&(_, &v)| v > 0)
                 .map(|(b, &v)| (b as u16, v))
                 .collect();
-            (bits, hist, s.touched.len() as u64)
+            (bits, hist, s.touched.len() as u64, forced)
         });
         let mut cooc = vec![0u64; nb * words];
         let mut hist = vec![0u64; N_BINS];
-        for (r, (bits, h, n)) in pass1.into_iter().enumerate() {
+        let mut forced = 0u64;
+        for (r, (bits, h, n, f)) in pass1.into_iter().enumerate() {
             cooc[r * words..(r + 1) * words].copy_from_slice(&bits);
             for (b, cost) in h {
                 hist[b as usize] += cost;
             }
             stats.cooc_pairs += n;
+            forced += f;
         }
         // Threshold: whole bins from the highest ratio down while the budget lasts.
         let fixed = 4 * nl as u64 + stats.matrix_bytes + 8 * (nb as u64 + 2);
         let avail = budget_bytes.saturating_sub(fixed) / 4;
-        let mut used = 0u64;
+        let mut used = forced;
         let mut cut = N_BINS;
         for b in (1..N_BINS).rev() {
             if used + hist[b] > avail {
@@ -368,7 +399,7 @@ impl PairIndex {
             let mut partners = Vec::new();
             let mut lens = Vec::new();
             let mut points = Vec::new();
-            if cut >= N_BINS {
+            if cut >= N_BINS && forced == 0 {
                 return (partners, lens, points);
             }
             count_row(r, s);
@@ -377,7 +408,7 @@ impl PairIndex {
                 let j = u64::from(s.count[c as usize]);
                 s.count[c as usize] = 0;
                 let min = sa.min(size_of(c));
-                if key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n) >= cut {
+                if kept(r as u32, c) || key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n) >= cut {
                     s.slot[c as usize] = partners.len() as u32;
                     partners.push(c);
                 }
@@ -854,6 +885,39 @@ mod tests {
         // Containments (s1 ⊂ L1) have no gain under either prior.
         assert_eq!(r.joint(s1, l1), Joint::Unknown);
         r.check_sample(&s, 1).unwrap();
+    }
+
+    #[test]
+    fn nested_builds_keep_the_smaller_budgets_pairs() {
+        let s = store();
+        let id = s.name_index();
+        let (a, b, c, e, x) = (id["a"], id["b"], id["c"], id["e"], id["x"]);
+        let labels = [a, b, c, e, x];
+        let stored = |ix: &PairIndex| -> Vec<(u32, u32)> {
+            let mut v = Vec::new();
+            for &p in &labels {
+                for &q in &labels {
+                    if p < q && matches!(ix.joint(p, q), Joint::Stored(..)) {
+                        v.push((p, q));
+                    }
+                }
+            }
+            v
+        };
+        let mut prev: Option<PairIndex> = None;
+        let mut last = Vec::new();
+        for budget in [200u64, 400, 800, 1 << 20] {
+            let (ix, st) = PairIndex::build_nested(&s, budget, 1, Prior::Uniform, prev.as_ref());
+            let now = stored(&ix);
+            assert!(
+                last.iter().all(|p| now.contains(p)),
+                "{last:?} not in {now:?} ({st:?})"
+            );
+            ix.check_sample(&s, 1).unwrap();
+            last = now;
+            prev = Some(ix);
+        }
+        assert!(!last.is_empty());
     }
 
     #[test]
