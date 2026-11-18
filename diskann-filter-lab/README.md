@@ -86,6 +86,14 @@ taskset -c 7 flab calibrate --dataset <dir> --graph <graph> -o costs.json
 flab sketches build --labels labels.flab -b 64,128,256 -t 4 --out-dir <dir>
 flab sketches stats --labels labels.flab -b 64,128,256
 
+# Combination postings (joint postings of label pairs; budgets as fractions of the label postings'
+# bytes; one pairs-b<per-mille>.flab per budget, with the coverage of the --report predicate sets)
+flab pairs build --labels labels.flab --budget 0.05,0.2 -t 2 --out-dir <dir> --report q10K.fpred
+
+# Per-label sub-graphs ("islands"; budgets as fractions of 256 bytes per point; selection terms in
+# gains.tsv; one islands-b<per-mille>.flab per budget)
+flab islands build --dataset <dir> --calibration costs.json --budget 0.25,1 -t 2 --out-dir <dir>
+
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
 
@@ -153,7 +161,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
-| `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap+rowand` (default) or any subset (`rowand` needs a calibration with the A6 enumeration costs) |
+| `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap+rowand+pair` (default) or any subset (`rowand` needs a calibration with the A6 enumeration costs; `pair` needs a `pairs_sidecar`) |
 | `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector), `graph` (graph only, track G: the estimates set the list size and the post-filter route, the exact path is never taken; the hopeless gate does not apply) |
 | `estimates` | `bounds` (posting bounds), `sketch` (a probe of the bottom-b sketches) |
 | `fallback` | signals of `guarded`: `forecast+budget+witness` (default), any subset, or `none` |
@@ -226,6 +234,15 @@ computes the per-query terms once for all plans, interpolates with cached grid l
 (`UnitCosts::prepare`) and skips `df` / `gallop` when a cheap lower bound already loses: the
 same costs and choices, ≈ 0.39 µs per call for a 4-clause query with five plans (0.87 µs with
 four plans before A6b; ignored test `planning_time`).
+A sixth plan, `pair` (batch B3a), needs combination postings (`pairs.flab`, module `pairs`):
+the joint postings `P_a ∩ P_b` of label pairs selected from the label store alone under a
+budget (big labels of at least `T` points, `T` from the budget; pairs by decreasing saved
+candidates per stored entry, `(min(|P_a|, |P_b|) − |P_ab|) / (|P_ab| + 3)`; `--prior rare`
+weights that by `min(|P_a|, |P_b|) / n`). Per query the cover takes the clause pair whose
+lists (stored joint postings, nothing for empty pairs, the smaller posting otherwise) hold the
+fewest entries; the plan merges them, checks the other clauses (all of them when a label
+posting is among the lists; priced at that mask's worst-case work) and computes distances.
+Without the sidecar its cost is infinite and nothing changes.
 Candidate rows and vectors are prefetched in a software pipeline, and checks use the static
 bitsets when the run has them. Every candidate of `scan` and `df` (and every point of the probe
 below) is a member of `union(c*)`, so with `exact_checks = "residual"` only the residual
@@ -253,6 +270,15 @@ of the miss rate through the last two sizes, at most 8× it). It takes a few
 seconds (1M points) to a few minutes (40M) per dataset; the costs are loaded with the experiment
 or configuration key `calibration`. Calibrations without the newer terms reproduce the batch-B6
 cost model.
+
+**The `island` route** (batch B3b; module `islands`, sidecar `islands.flab`): one label-blind
+Vamana graph (the lab builder, `R` 32) over the members of each selected label (by modelled
+saving per byte, or by saving with `--prior data`, under a budget of bytes; local ids are
+positions in the label's posting list, the builder's auxiliary start merged into the medoid).
+In the cost crossover, a query with a single-label clause whose label has an island may take a
+post-filter search inside the smallest such island (list size at least the configuration's,
+match rate `M̂ / s` inside it), the rest of the predicate checked on the evaluated members in
+distance order, when that is cheaper than the graph, post-filter and exact routes.
 
 **Estimates and the cost crossover** (`kernel::planner`, module `sketches`): every data point
 has a fixed hash priority and every label keeps its `b` lowest-priority members (sidecar
@@ -321,6 +347,8 @@ graph = "/path/to/graph"         # default graph: a directory with graph.flab, a
 #                                           # (θ = ⌈n/64⌉ for the planned exact path alone)
 # calibration = "/path/to/costs.json"       # unit costs (flab calibrate) of the planned exact path
 # sketches_sidecar = "/path/to/sketches.flab" # bottom-b sketches (estimates = "sketch")
+# pairs_sidecar = "/path/to/pairs.flab"     # combination postings (the exact path's `pair` plan)
+# islands_sidecar = "/path/to/islands.flab" # per-label sub-graphs (the `island` route)
 # view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred
 queries = "q10K"                 # a whole query set, or:
 # panel = "panels/screen.tsv"    # TSV with columns qset, qidx (optional split); relative to the dataset
@@ -639,6 +667,36 @@ the number of entries `E` (`Σ_ℓ min(b, |post(ℓ)|)`). An entry is `(priority
 |---|---|---|---|
 | 0 | `u64` | `n_labels + 1` | per-label offsets into section 1 |
 | 1 | `u64` | `E` | each label's `min(b, |post|)` lowest entries, increasing |
+
+### Combination postings: `pairs.flab` (magic `FLABPRS\0`)
+
+Parameters: `n_points`, `n_labels`, `dict_hash` of the label store, the size threshold `T` of the
+big labels, their number `N`, the stored pairs `S`, their entries `E`, the selection threshold
+(`f64` bits). Big labels are indexed in increasing label id; `w = ⌈N / 64⌉`.
+
+| Section | Type | Length | Content |
+|---|---|---|---|
+| 0 | `u32` | `n_labels` | big index of every label (`u32::MAX`: not big) |
+| 1 | `u64` | `N × w` | co-occurrence bits: row `r`, bit `c` (`r < c`) set when big labels `r` and `c` share a point |
+| 2 | `u64` | `N + 1` | per-row offsets into section 3 |
+| 3 | `u32` | `S` | partners `c > r` of each row with a stored joint posting, increasing |
+| 4 | `u64` | `S + 1` | offsets of the joint postings into section 5, in the order of section 3 |
+| 5 | `u32` | `E` | the joint postings (increasing point ids) |
+
+### Per-label sub-graphs: `islands.flab` (magic `FLABISL\0`)
+
+Parameters: `n_points`, `n_labels`, `dict_hash` of the label store, the islands `I`, the length of
+section 4 (`Σ (s_i + 1)` for islands of `s_i` members), the edges `E`, the degree bound `R` and
+the build list size. Local id `v` of island `i` is position `v` of its label's posting list.
+
+| Section | Type | Length | Content |
+|---|---|---|---|
+| 0 | `u32` | `n_labels` | island of every label (`u32::MAX`: none) |
+| 1 | `u32` | `I` | each island's label |
+| 2 | `u32` | `I` | each island's start (local id of the medoid) |
+| 3 | `u64` | `I + 1` | each island's first entry in section 4 (island `i` has `s_i + 1` entries) |
+| 4 | `u64` | `Σ (s_i + 1)` | per island, the edge offsets of its rows into section 5 (row `v`: `[o_v, o_{v+1})`) |
+| 5 | `u32` | `E` | neighbours (local ids) |
 
 ### Candidate pools: `pools.flab` (magic `FLABPOL\0`)
 
