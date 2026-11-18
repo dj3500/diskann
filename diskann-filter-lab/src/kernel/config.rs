@@ -221,6 +221,10 @@ pub enum PostfilterStarts {
     /// Never fewer or farther answers than `by_rate`; the second search costs little when both
     /// reach the query's neighbourhood.
     ByRateBoth,
+    /// `by_rate_both` with the second search's list size `K` (at most the first one's): the
+    /// smallest search that can return `K` answers of its own, a hedge against a first search
+    /// held in the wrong region whose cost does not grow with the first search's list.
+    ByRateBothK,
 }
 
 impl PostfilterStarts {
@@ -231,9 +235,10 @@ impl PostfilterStarts {
             "by_rate" => Self::ByRate,
             "by_rate_late" => Self::ByRateLate,
             "by_rate_both" => Self::ByRateBoth,
+            "by_rate_both_k" => Self::ByRateBothK,
             _ => bail!(
                 "unknown postfilter_starts {s:?} (global, configured, by_rate, by_rate_late, \
-                 by_rate_both)"
+                 by_rate_both, by_rate_both_k)"
             ),
         })
     }
@@ -243,7 +248,9 @@ impl PostfilterStarts {
         match self {
             Self::Global => false,
             Self::Configured => true,
-            Self::ByRate | Self::ByRateLate | Self::ByRateBoth => rate < super::cost::BROAD_RATE,
+            Self::ByRate | Self::ByRateLate | Self::ByRateBoth | Self::ByRateBothK => {
+                rate < super::cost::BROAD_RATE
+            }
         }
     }
 
@@ -256,7 +263,16 @@ impl PostfilterStarts {
     /// Whether a search from the global starts at estimated match rate `rate` is followed by a
     /// second search from the configured starts.
     pub fn both_at(self, rate: f64) -> bool {
-        self == Self::ByRateBoth && !self.configured_at(rate)
+        matches!(self, Self::ByRateBoth | Self::ByRateBothK) && !self.configured_at(rate)
+    }
+
+    /// The list size of the second search (`by_rate_both*`) after a first one with list size
+    /// `l`, for `K = k` answers.
+    pub fn second_list(self, l: usize, k: usize) -> usize {
+        match self {
+            Self::ByRateBothK => k.clamp(1, l.max(1)),
+            _ => l,
+        }
     }
 }
 
@@ -268,6 +284,7 @@ impl fmt::Display for PostfilterStarts {
             Self::ByRate => "by_rate",
             Self::ByRateLate => "by_rate_late",
             Self::ByRateBoth => "by_rate_both",
+            Self::ByRateBothK => "by_rate_both_k",
         })
     }
 }

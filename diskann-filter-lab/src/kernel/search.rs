@@ -867,6 +867,9 @@ impl Searcher {
                 self.answers.finish(ids, dists)
             } else if d.postfilter {
                 let t = tic(&ctr);
+                let second_l = d
+                    .postfilter_both
+                    .then(|| kernel.postfilter_starts.second_list(d.l, k));
                 let n = self.postfilter(
                     plan,
                     ix,
@@ -874,7 +877,7 @@ impl Searcher {
                     d.l,
                     d.postfilter_configured,
                     d.postfilter_late || d.postfilter_both,
-                    d.postfilter_both,
+                    second_l,
                     exact_stat,
                     &mut ctr,
                     ids,
@@ -1160,7 +1163,7 @@ impl Searcher {
         l: usize,
         configured_starts: bool,
         late_starts: bool,
-        second_search: bool,
+        second_l: Option<usize>,
         exact_stat: Option<&LabelBitsets>,
         ctr: &mut Counters,
         ids: &mut [u32],
@@ -1189,9 +1192,10 @@ impl Searcher {
             }
         }
         ctr.n_start = self.starts.len() as u64;
-        // `by_rate_both`: the configured starts seed a second search instead of a late offer.
+        // `by_rate_both*`: the configured starts seed a second search (list size `second_l`)
+        // instead of a late offer.
         let mut second = Vec::new();
-        if second_search {
+        if second_l.is_some() {
             std::mem::swap(&mut second, &mut self.late);
         }
         let n = self.postfilter_pass(ix, q, l, exact_stat, ctr, ids, dists);
@@ -1218,7 +1222,7 @@ impl Searcher {
             .zip(ids[..n].iter().copied())
             .collect();
         let final_l = ctr.final_l;
-        let n2 = self.postfilter_pass(ix, q, l, exact_stat, ctr, ids, dists);
+        let n2 = self.postfilter_pass(ix, q, second_l.unwrap_or(l), exact_stat, ctr, ids, dists);
         ctr.final_l = final_l;
         // The K nearest matches of both searches (disjoint evaluated nodes), by (distance, id).
         both.extend(dists[..n2].iter().copied().zip(ids[..n2].iter().copied()));
