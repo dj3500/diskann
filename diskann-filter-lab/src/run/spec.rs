@@ -32,6 +32,7 @@
 //!                                  # the planned exact path and the cost crossovers
 //! sketches_sidecar = "<sketches.flab>" # bottom-b sketches (`estimates = "sketch"`)
 //! pairs_sidecar = "<pairs.flab>"   # combination postings (the exact path's `pair` plan)
+//! islands_sidecar = "<islands.flab>" # per-label sub-graphs (the `island` route)
 //!
 //! [[config]]
 //! name = "inline"
@@ -48,6 +49,7 @@
 //! calibration = "<costs.json>"     # per-configuration unit costs (e.g. another calibration)
 //! sketches_sidecar = "<sketches.flab>" # per-configuration sketches (e.g. another priority seed)
 //! pairs_sidecar = "<pairs.flab>"   # per-configuration combination postings (e.g. a budget)
+//! islands_sidecar = "<islands.flab>" # per-configuration per-label sub-graphs
 //! ```
 
 use std::{
@@ -114,6 +116,7 @@ struct RawExperiment {
     calibration: Option<PathBuf>,
     sketches_sidecar: Option<PathBuf>,
     pairs_sidecar: Option<PathBuf>,
+    islands_sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -147,6 +150,8 @@ pub struct ConfigSpec {
     pub sketches_sidecar: Option<PathBuf>,
     /// Combination postings of this configuration (the experiment's unless overridden).
     pub pairs_sidecar: Option<PathBuf>,
+    /// Per-label sub-graphs of this configuration (the experiment's unless overridden).
+    pub islands_sidecar: Option<PathBuf>,
     /// The overrides as given (for the record).
     pub overrides: BTreeMap<String, String>,
 }
@@ -191,6 +196,8 @@ pub struct Experiment {
     pub sketches_sidecar: Option<PathBuf>,
     /// Combination postings of the dataset's labels (`pairs.flab`).
     pub pairs_sidecar: Option<PathBuf>,
+    /// Per-label sub-graphs of the dataset (`islands.flab`).
+    pub islands_sidecar: Option<PathBuf>,
     pub configs: Vec<ConfigSpec>,
 }
 
@@ -296,6 +303,9 @@ impl Experiment {
             let pairs_sidecar = text(&mut table, "pairs_sidecar")?
                 .map(PathBuf::from)
                 .or_else(|| e.pairs_sidecar.clone());
+            let islands_sidecar = text(&mut table, "islands_sidecar")?
+                .map(PathBuf::from)
+                .or_else(|| e.islands_sidecar.clone());
             let efforts = match table.remove("efforts") {
                 None => None,
                 Some(toml::Value::Array(items)) => {
@@ -350,6 +360,7 @@ impl Experiment {
                 calibration: calibration.map(|p| resolve(dir, &p)),
                 sketches_sidecar: sketches_sidecar.map(|p| resolve(dir, &p)),
                 pairs_sidecar: pairs_sidecar.map(|p| resolve(dir, &p)),
+                islands_sidecar: islands_sidecar.map(|p| resolve(dir, &p)),
                 overrides,
             });
         }
@@ -392,6 +403,7 @@ impl Experiment {
             calibration: e.calibration.map(|p| resolve(dir, &p)),
             sketches_sidecar: e.sketches_sidecar.map(|p| resolve(dir, &p)),
             pairs_sidecar: e.pairs_sidecar.map(|p| resolve(dir, &p)),
+            islands_sidecar: e.islands_sidecar.map(|p| resolve(dir, &p)),
             configs,
         })
     }

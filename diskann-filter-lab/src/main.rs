@@ -17,6 +17,7 @@ use diskann_filter_lab::{
     calibrate, container, diskann_io,
     graph::{self, Graph, GraphStats},
     gt::{self, DiskannTruth, GroundTruth},
+    islands::{self, IslandIndex},
     jsonl, label_starts, labels,
     labels::LabelStore,
     pairs::{Cover, PairIndex},
@@ -68,6 +69,10 @@ enum Command {
     /// memory budget, for the exact path's `pair` plan).
     #[command(subcommand)]
     Pairs(PairsCommand),
+    /// Per-label sub-graphs (`islands.flab`: a Vamana graph over each selected label's members
+    /// within a memory budget, for the `island` route of the cost crossover).
+    #[command(subcommand)]
+    Islands(IslandsCommand),
     /// Measure the unit costs of the cost model on this machine and dataset (JSON).
     Calibrate(CalibrateArgs),
     /// Run an experiment file (configurations × panel × effort grid) with the lab search
@@ -398,6 +403,40 @@ enum PairsCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum IslandsCommand {
+    /// Select the labels (gain per byte under the cost model) for each budget and build their
+    /// islands with the lab's Vamana builder (the union once): writes `islands-b<per-mille>.flab`
+    /// and `islands-b<per-mille>.json`, and `gains.tsv` (every label's selection terms).
+    Build {
+        /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
+        #[arg(long)]
+        dataset: PathBuf,
+        /// Unit costs of the cost model (`flab calibrate` output).
+        #[arg(long)]
+        calibration: PathBuf,
+        /// Budgets as fractions of `256·n` bytes (an adjacency of 64 slots per point).
+        #[arg(short, long, value_delimiter = ',', required = true)]
+        budget: Vec<f64>,
+        /// Answers `K` of the selection's cost terms.
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        /// Degree bound `R` of the islands.
+        #[arg(long, default_value_t = 32)]
+        r: usize,
+        #[arg(long, default_value_t = 64)]
+        l_build: usize,
+        #[arg(long, default_value_t = 1.2)]
+        alpha: f32,
+        /// Islands built at a time (one thread each).
+        #[arg(short, long, default_value_t = 2)]
+        threads: usize,
+        /// Output directory (created if needed).
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum OrderArg {
     /// Unchanged ids (a copy in the lab's formats).
@@ -543,6 +582,13 @@ fn main() -> Result<()> {
         Command::Bitsets(c) => bitsets_command(c),
         Command::Sketches(c) => sketches_command(c),
         Command::Pairs(c) => pairs_command(c),
+        Command::Islands(c) => {
+            let IslandsCommand::Build { dataset, .. } = &c;
+            match DType::from_path(&run::data::base_file(dataset)?)? {
+                DType::U8 => islands_command::<u8>(c),
+                DType::F32 => islands_command::<f32>(c),
+            }
+        }
         Command::Calibrate(a) => {
             let opts = calibrate::Options {
                 reps: a.reps,
@@ -1406,6 +1452,110 @@ fn bitsets_command(c: BitsetsCommand) -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand) -> Result<()> {
+    let IslandsCommand::Build {
+        dataset,
+        calibration,
+        budget,
+        k,
+        r,
+        l_build,
+        alpha,
+        threads,
+        out_dir,
+    } = c;
+    let store = LabelStore::read(&dataset.join("labels.flab"))?;
+    let base = Matrix::<T>::read_bin(&run::data::base_file(&dataset)?)?;
+    let costs = run::read_costs(&calibration)?;
+    std::fs::create_dir_all(&out_dir)?;
+    let gains = islands::gains(&store, &costs, k, r);
+    let mut tsv = String::from("label\tsize\texact_ns\tbase_ns\tisland_ns\tgain_ns\tbytes\n");
+    for g in &gains {
+        tsv += &format!(
+            "{}\t{}\t{:.0}\t{:.0}\t{:.0}\t{:.0}\t{}\n",
+            g.label, g.size, g.exact_ns, g.base_ns, g.island_ns, g.gain_ns, g.bytes
+        );
+    }
+    std::fs::write(out_dir.join("gains.tsv"), tsv)?;
+    let unit = 256 * store.n_points() as u64;
+    let sels: Vec<(f64, Vec<u32>)> = budget
+        .iter()
+        .map(|&f| (f, islands::select(&gains, (f * unit as f64) as u64)))
+        .collect();
+    let mut all: Vec<u32> = sels.iter().flat_map(|(_, s)| s.iter().copied()).collect();
+    all.sort_unstable();
+    all.dedup();
+    let params = diskann_filter_lab::build::BuildParams {
+        rule: diskann_filter_lab::build::PruneRule::Alpha { r, alpha },
+        l_build,
+        ..Default::default()
+    };
+    let t = Instant::now();
+    let (union, stats, per_island) = IslandIndex::build(&base, &store, &all, &params, threads)?;
+    let wall = secs(t);
+    println!(
+        "{} islands ({} members, {} edges, {} members patched, {:.1} MiB) in {wall:.1} s wall, {:.1} s summed over islands, {} threads",
+        stats.islands,
+        stats.members,
+        stats.edges,
+        stats.patched,
+        stats.bytes as f64 / (1u64 << 20) as f64,
+        per_island.iter().sum::<f64>(),
+        threads
+    );
+    for (f, sel) in sels {
+        let ix = union.subset(&sel);
+        let tag = format!("{}", (f * 1000.0).round() as u64);
+        let out = out_dir.join(format!("islands-b{tag}.flab"));
+        ix.write(&out)?;
+        ensure!(
+            IslandIndex::read(&out)? == ix,
+            "{} does not read back identically",
+            out.display()
+        );
+        ix.check(&store)?;
+        let build_s: f64 = all
+            .iter()
+            .zip(&per_island)
+            .filter(|(l, _)| sel.binary_search(l).is_ok())
+            .map(|(_, s)| s)
+            .sum();
+        let sizes: Vec<usize> = sel.iter().map(|&l| store.posting_len(l)).collect();
+        let report = json!({
+            "dataset": dataset,
+            "calibration": calibration,
+            "n_points": store.n_points(),
+            "budget_fraction": f,
+            "budget_bytes": (f * unit as f64) as u64,
+            "k": k, "r": r, "l_build": l_build, "alpha": alpha,
+            "candidates": gains.iter().filter(|g| g.gain_ns > 0.0).count(),
+            "islands": ix.n_islands(),
+            "members": ix.n_members(),
+            "edges": ix.n_edges(),
+            "bytes": ix.bytes(),
+            "build_cpu_s": build_s,
+            "build_wall_s_union": wall,
+            "patched_union": stats.patched,
+            "sizes": sizes,
+            "labels": sel,
+            "output": out,
+        });
+        std::fs::write(
+            out_dir.join(format!("islands-b{tag}.json")),
+            serde_json::to_string_pretty(&report)? + "\n",
+        )?;
+        println!(
+            "budget {f}: {} islands, {} members, {} edges, {:.1} MiB, {build_s:.1} CPU-s -> {}",
+            ix.n_islands(),
+            ix.n_members(),
+            ix.n_edges(),
+            ix.bytes() as f64 / (1u64 << 20) as f64,
+            out.display()
+        );
     }
     Ok(())
 }
