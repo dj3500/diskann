@@ -7,7 +7,9 @@
 //! `tree_effort = curve` through [`crate::kernel::cost::UnitCosts::tree_list`]).
 //!
 //! - **Labels**: the labels whose per-label starts are all auxiliary nodes (router-tree roots),
-//!   sampled with probability proportional to their size (seeded).
+//!   in size classes by decade (≤ 10 points, 11–100, 101–1,000, ...; a tree's depth and leaf
+//!   count grow with its label's size); per class, `queries` labels sampled with probability
+//!   proportional to their size (seeded).
 //! - **Queries**: per sampled label, the midpoint of two random members (`u8`: rounded half up).
 //! - **Ground truth**: the label's `kmax` nearest members (one scan of its postings).
 //! - **Searches**: the tree route's search with a frontier of routers only (`aux_frontier`),
@@ -15,9 +17,11 @@
 //!   collector, so the `K'` nearest collected members are the answers of a heap(K') search with
 //!   the same frontier, for every `K' ≤ kmax`; a query counts for the `K'` its label has members
 //!   for. Frontiers 2^i up to `l_max`, stopping after the first at which every `K'` has a mean
-//!   recall of at least 0.995.
-//! - **Table**: as the graph's effort curve ([`super::effort::fit_table`]): per target recall
-//!   and `K'`, the smallest frontier whose mean recall reaches it.
+//!   recall of at least 0.995 (per class).
+//! - **Table**: per class as the graph's effort curve ([`super::effort::fit_table`]): per target
+//!   recall and `K'`, the smallest frontier whose mean recall reaches it; a class without labels
+//!   of `K'` members extends its largest measured `K'` in proportion (as the lookup does). The
+//!   class's size (`tree_a`) is the geometric mean of its sampled labels' sizes.
 
 use std::{collections::BinaryHeap, time::Instant};
 
@@ -25,7 +29,7 @@ use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 
 use super::{
-    effort::{fit_table, midpoint, Dist, Effort, K_GRID, R_GRID},
+    effort::{fit_table, midpoint, Dist, K_GRID, R_GRID},
     Rng,
 };
 use crate::{
@@ -79,28 +83,45 @@ pub fn tree_labels<T: Element>(ix: &Index<'_, T>, labels: &LabelStore) -> Vec<u3
         .collect()
 }
 
-/// Measures the tree effort curve of the graph of `ix` (see the module documentation).
-pub fn tree_curve<T: Element>(
+/// The size class of a label of `s` points (decades: ≤ 10, 11–100, 101–1,000, ...).
+fn size_class(s: usize) -> usize {
+    let mut c = 0;
+    let mut top = 10usize;
+    while s > top {
+        c += 1;
+        top = top.saturating_mul(10);
+    }
+    c
+}
+
+/// One size class's measurement: its frontiers, per-`K'` mean recalls, work and report.
+struct ClassCurve {
+    size: f64,
+    ks: Vec<usize>,
+    ls: Vec<f64>,
+    recall: Vec<Vec<f64>>,
+    doc: Value,
+}
+
+/// Measures the recall of tree searches over the labels `trees` (one class; see the module
+/// documentation).
+fn class_curve<T: Element>(
     base: &Matrix<T>,
     ix: &Index<'_, T>,
     labels: &LabelStore,
+    trees: &[u32],
     opts: &TreeOptions,
-) -> Result<Effort> {
+    seed: u64,
+) -> Result<ClassCurve> {
     let t0 = Instant::now();
-    let trees = tree_labels(ix, labels);
-    ensure!(
-        !trees.is_empty(),
-        "no label has router-tree roots as its only starts (a Steiner graph's start table?)"
-    );
-    ensure!(opts.queries > 0, "the tree effort curve needs queries");
     // Labels sampled in proportion to their size.
     let mut cum = Vec::with_capacity(trees.len());
     let mut total = 0u64;
-    for &l in &trees {
+    for &l in trees {
         total += labels.posting_len(l) as u64;
         cum.push(total);
     }
-    let mut rng = Rng(opts.seed);
+    let mut rng = Rng(seed);
     let mut chosen = Vec::with_capacity(opts.queries);
     let mut queries: Vec<Vec<T>> = Vec::with_capacity(opts.queries);
     for _ in 0..opts.queries {
@@ -208,38 +229,123 @@ pub fn tree_curve<T: Element>(
     for row in &mut recall {
         row.truncate(measured);
     }
-    let lsf: Vec<f64> = ls.iter().map(|&l| l as f64).collect();
-    let top = lsf[lsf.len() - 1];
-    let cap = EXTRAPOLATION_CAP * top;
-    let table = fit_table(&lsf, &recall, &R_GRID, cap);
-    let extrapolated = table.iter().flatten().filter(|&&l| l > top).count();
+    let mut sizes: Vec<usize> = chosen.iter().map(|&l| labels.posting_len(l)).collect();
+    sizes.sort_unstable();
+    let size = (sizes.iter().map(|&s| (s as f64).ln()).sum::<f64>() / sizes.len() as f64).exp();
     let by_k: serde_json::Map<String, Value> = ks
         .iter()
         .zip(&recall)
         .map(|(k, r)| (k.to_string(), json!(r)))
         .collect();
-    let mut sizes: Vec<usize> = chosen.iter().map(|&l| labels.posting_len(l)).collect();
-    sizes.sort_unstable();
-    let size_range = [sizes[0], sizes[sizes.len() / 2], sizes[sizes.len() - 1]];
     let doc = json!({
+        "labels": trees.len(),
         "queries": queries.len(),
-        "seed": opts.seed,
-        "tree_labels": trees.len(),
-        "label_sizes_sampled_min_median_max": size_range,
+        "size": size,
+        "label_sizes_sampled_min_median_max": [sizes[0], sizes[sizes.len() / 2], sizes[sizes.len() - 1]],
         "queries_per_k": ks.iter().zip(&count).map(|(k, c)| json!([k, c])).collect::<Vec<_>>(),
         "l": ls,
         "n_dist": n_dist,
         "n_router_expansions": n_aux,
         "recall": by_k,
-        "extrapolated_entries": extrapolated,
-        "extrapolation_cap": cap,
         "ground_truth_s": t_gt,
         "elapsed_s": t0.elapsed().as_secs_f64(),
     });
-    Ok(Effort {
+    Ok(ClassCurve {
+        size,
+        ks,
+        ls: ls.iter().map(|&l| l as f64).collect(),
+        recall,
+        doc,
+    })
+}
+
+/// The tree effort curve of a graph of `ix`: one table per label-size class (see the module
+/// documentation), with the classes' sizes.
+pub struct TreeCurve {
+    pub r: Vec<f64>,
+    pub k: Vec<f64>,
+    /// `a.len()` blocks of `r.len()` rows (class by class).
+    pub l: Vec<Vec<f64>>,
+    pub a: Vec<f64>,
+    pub doc: Value,
+}
+
+/// Measures the tree effort curve of the graph of `ix` (see the module documentation).
+pub fn tree_curve<T: Element>(
+    base: &Matrix<T>,
+    ix: &Index<'_, T>,
+    labels: &LabelStore,
+    opts: &TreeOptions,
+) -> Result<TreeCurve> {
+    let t0 = Instant::now();
+    let trees = tree_labels(ix, labels);
+    ensure!(
+        !trees.is_empty(),
+        "no label has router-tree roots as its only starts (a Steiner graph's start table?)"
+    );
+    ensure!(opts.queries > 0, "the tree effort curve needs queries");
+    let mut by_class: Vec<Vec<u32>> = Vec::new();
+    for &l in &trees {
+        let c = size_class(labels.posting_len(l));
+        if by_class.len() <= c {
+            by_class.resize(c + 1, Vec::new());
+        }
+        by_class[c].push(l);
+    }
+    let mut classes = Vec::new();
+    for (c, members) in by_class.iter().enumerate() {
+        if !members.is_empty() {
+            let seed = opts.seed.wrapping_add(c as u64);
+            classes.push(class_curve(base, ix, labels, members, opts, seed)?);
+        }
+    }
+    // Shared K' columns: a class without labels of K' members extends its largest measured K'
+    // in proportion (the lookup's rule beyond the table).
+    let ks: Vec<usize> = K_GRID
+        .iter()
+        .copied()
+        .filter(|k| classes.iter().any(|c| c.ks.contains(k)))
+        .collect();
+    let (mut l, mut a, mut extrapolated, mut docs) = (Vec::new(), Vec::new(), 0, Vec::new());
+    for c in &classes {
+        let top = c.ls[c.ls.len() - 1];
+        let cap = EXTRAPOLATION_CAP * top;
+        let table = fit_table(&c.ls, &c.recall, &R_GRID, cap);
+        extrapolated += table.iter().flatten().filter(|&&x| x > top).count();
+        let k_top = *c.ks.last().expect("measured") as f64;
+        for row in table {
+            l.push(
+                ks.iter()
+                    .map(|&k| match c.ks.iter().position(|&x| x == k) {
+                        Some(j) => row[j],
+                        None => row[row.len() - 1] * k as f64 / k_top,
+                    })
+                    .collect(),
+            );
+        }
+        a.push(c.size);
+        docs.push(c.doc.clone());
+    }
+    let doc = json!({
+        "queries_per_class": opts.queries,
+        "seed": opts.seed,
+        "tree_labels": trees.len(),
+        "class_sizes": a,
+        "classes": docs,
+        "extrapolated_entries": extrapolated,
+        "extrapolation_cap": EXTRAPOLATION_CAP,
+        "elapsed_s": t0.elapsed().as_secs_f64(),
+    });
+    // Equal class sizes cannot happen (decades), but guard the increasing order.
+    ensure!(
+        a.windows(2).all(|w| w[0] < w[1]),
+        "size classes out of order"
+    );
+    Ok(TreeCurve {
         r: R_GRID.to_vec(),
         k: ks.iter().map(|&k| k as f64).collect(),
-        l: table,
+        l,
+        a,
         doc,
     })
 }
@@ -287,7 +393,7 @@ pub fn tree_calibrate<T: Element>(
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("the calibration has no unit costs"))?,
     )?;
-    (costs.tree_r, costs.tree_k, costs.tree_l) = (e.r, e.k, e.l);
+    (costs.tree_r, costs.tree_k, costs.tree_l, costs.tree_a) = (e.r, e.k, e.l, e.a);
     costs.validate()?;
     doc["costs"] = serde_json::to_value(&costs)?;
     let mut tree = e.doc;
@@ -382,8 +488,19 @@ mod tests {
             },
         )
         .unwrap();
-        // a=1 has 32 members: K' = 10 and 30 are measured.
+        // a=1 has 32 members: one size class (11-100 points), K' = 10 and 30 are measured.
         assert_eq!(e.k, [10.0, 30.0]);
+        assert_eq!(e.a, [32.0]);
+        assert_eq!(e.l.len(), R_GRID.len());
+        assert_eq!(
+            (
+                size_class(10),
+                size_class(11),
+                size_class(100),
+                size_class(101)
+            ),
+            (0, 1, 1, 2)
+        );
         // A frontier of 8 routers holds the whole tree (5 routers): every recall reached.
         assert!(
             e.l.iter().flatten().all(|&l| (1.0..=8.0).contains(&l)),

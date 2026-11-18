@@ -1176,7 +1176,9 @@ fn aux_frontier_keeps_only_routers_in_the_list() {
     let (ids, _) = run("aux_frontier", 1);
     assert_eq!(ids, [5, 4, 3]);
     // aux_frontier needs the heap collector.
-    let mut k = kernel(&[("starts", "label(c*)"), ("expander", "aux_frontier")]);
+    let mut k = Kernel::default();
+    k.set("starts", "label(c*)").unwrap();
+    k.set("expander", "aux_frontier").unwrap();
     k.collector = super::collect::Collector::FinalBeam;
     assert!(k.validate().is_err());
 }
@@ -1195,7 +1197,23 @@ fn the_tree_effort_curve_sets_the_tree_list_size() {
         tree_l: vec![vec![1.0, 1.0], vec![2.0, 2.0]],
         ..UnitCosts::default()
     };
-    assert_eq!(costs.tree_list(0.9, 6.0), Some(2.0));
+    assert_eq!(costs.tree_list(0.9, 6.0, 6.0), Some(2.0));
+    // Size classes: log-linear in the label size between the classes, clamped outside them.
+    let classes = UnitCosts {
+        tree_a: vec![10.0, 1000.0],
+        tree_l: vec![
+            vec![1.0, 1.0],
+            vec![2.0, 2.0],
+            vec![100.0, 100.0],
+            vec![200.0, 200.0],
+        ],
+        ..costs.clone()
+    };
+    classes.validate().unwrap();
+    let at = |a: f64| classes.tree_list(0.9, 6.0, a).unwrap();
+    for (a, want) in [(5.0, 2.0), (100.0, 20.0), (5000.0, 200.0)] {
+        assert!((at(a) - want).abs() < 1e-9, "a = {a}: {}", at(a));
+    }
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
@@ -1243,6 +1261,94 @@ fn the_tree_effort_curve_sets_the_tree_list_size() {
         ..ix
     };
     assert!(Plan::new(&k, &ix0).is_err());
+}
+
+#[test]
+fn the_capped_tree_effort_bounds_diluted_queries() {
+    use super::cost::UnitCosts;
+    // Ten points on a line; label x on 0..=5 under routers 10 = {0, 1, 2}, 11 = {3, 4, 5} and
+    // the root 12; label y on {1, 3, 5, 6, ..., 9}: x AND y keeps half of x (rho = 0.5).
+    let n = 10;
+    let base = Matrix::from_slice(&(0..n).map(|i| i as f32).collect::<Vec<_>>(), n, 1);
+    let aux = AuxNodes::new(
+        vec![AuxKind::Router; 3],
+        &Matrix::from_slice(&[1.0f32, 4.0, 2.5], 3, 1),
+    )
+    .unwrap();
+    let mut g = Graph::new(n, 4, aux).unwrap();
+    for i in 0..n as u32 {
+        let nb: Vec<u32> = [i.checked_sub(1), (i + 1 < n as u32).then_some(i + 1)]
+            .into_iter()
+            .flatten()
+            .collect();
+        g.set_neighbors(i, &nb).unwrap();
+    }
+    g.set_neighbors(10, &[0, 1, 2]).unwrap();
+    g.set_neighbors(11, &[3, 4, 5]).unwrap();
+    g.set_neighbors(12, &[10, 11]).unwrap();
+    g.set_starts(vec![0]).unwrap();
+    let mut b = LabelStoreBuilder::new();
+    for i in 0..n {
+        let x = (i <= 5).then_some(("x", "x=1"));
+        let y = (i >= 6 || i % 2 == 1).then_some(("y", "y=1"));
+        b.push_point(x.into_iter().chain(y)).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(labels.name_index()["x=1"], 12)])
+        .unwrap();
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    // The tree curve's frontier is 1.2 times the number of members (L(K') = 1.2 K').
+    let costs = UnitCosts {
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        tree_r: vec![0.5, 0.9],
+        tree_k: vec![1.0, 100.0],
+        tree_l: vec![vec![1.2, 120.0], vec![1.2, 120.0]],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..tree_index(&base, &g, &labels, &st)
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    let preds = pb.finish();
+    let run = |effort: &str| {
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("terminator", "effort_curve(1.5)"),
+            ("laziness", "heap_bound"),
+            ("crossover", "graph"),
+            ("exact", "planned"),
+            ("estimates", "sketch"),
+            ("tree_route", "row_scan"),
+            ("tree_effort", effort),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 2], vec![0f32; 2]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 900, &mut ids, &mut d, None);
+        assert_eq!(ctr.route, Route::Tree);
+        assert_eq!((ctr.a_hat, ctr.m_hat), (6, 3));
+        ids.truncate(ctr.n_out as usize);
+        (ids, ctr.final_l)
+    };
+    // K = 2 at rho <= 0.5 (sketch estimates): the curve's frontier for K' >= 4 members (the
+    // list's capacity is the frontier plus the start, upstream's padding) ...
+    let (ids, l_curve) = run("curve");
+    assert_eq!(ids, [5, 3]);
+    assert!(l_curve >= 6, "{l_curve}");
+    // ... capped at 1.5 times the frontier for K = 2 (3.6, rounded up).
+    assert_eq!(run("capped"), (vec![5, 3], 4 + 1));
 }
 
 #[test]

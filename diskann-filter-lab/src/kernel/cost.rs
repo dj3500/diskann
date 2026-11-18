@@ -240,6 +240,11 @@ pub struct UnitCosts {
     pub tree_k: Vec<f64>,
     #[serde(default)]
     pub tree_l: Vec<Vec<f64>>,
+    /// Label-size classes of the tree effort curve (increasing representative sizes; empty =
+    /// one class). With `m` classes `tree_l` holds `m` blocks of `tree_r.len()` rows, class by
+    /// class, and [`Self::tree_list`] interpolates between the classes around a label's size.
+    #[serde(default)]
+    pub tree_a: Vec<f64>,
     /// Planner caches ([`Self::prepare`]).
     #[serde(skip)]
     pub prepared: Prepared,
@@ -292,6 +297,7 @@ impl Default for UnitCosts {
             tree_r: Vec::new(),
             tree_k: Vec::new(),
             tree_l: Vec::new(),
+            tree_a: Vec::new(),
             prepared: Prepared::default(),
         }
     }
@@ -438,7 +444,9 @@ impl UnitCosts {
             "the effort curve needs increasing recalls and neighbour counts and one list size (>= 1) each"
         );
         anyhow::ensure!(
-            self.tree_l.len() == self.tree_r.len()
+            self.tree_l.len() == self.tree_a.len().max(1) * self.tree_r.len()
+                && self.tree_a.windows(2).all(|w| w[0] < w[1])
+                && self.tree_a.iter().all(|&a| a >= 1.0)
                 && self.tree_l.iter().all(|row| row.len() == self.tree_k.len())
                 && self.tree_r.windows(2).all(|w| w[0] < w[1])
                 && self.tree_k.windows(2).all(|w| w[0] < w[1])
@@ -796,9 +804,31 @@ impl UnitCosts {
     }
 
     /// The calibrated router frontier of a tree search for mean recall `r` at `kprime` members
-    /// of the label (the same interpolation as [`Self::effort_list`]). `None` without a curve.
-    pub fn tree_list(&self, r: f64, kprime: f64) -> Option<f64> {
-        curve_list(&self.tree_r, &self.tree_k, &self.tree_l, r, kprime)
+    /// of a label (or clause) of `a` points: the same interpolation as [`Self::effort_list`]
+    /// within a size class, log-linear in the size between the classes around `a` (clamped to
+    /// the smallest and largest class). `None` without a curve.
+    pub fn tree_list(&self, r: f64, kprime: f64, a: f64) -> Option<f64> {
+        let nr = self.tree_r.len();
+        let block = |c: usize| {
+            curve_list(
+                &self.tree_r,
+                &self.tree_k,
+                &self.tree_l[c * nr..(c + 1) * nr],
+                r,
+                kprime,
+            )
+        };
+        let g = &self.tree_a;
+        if g.len() <= 1 || a <= g[0] {
+            return block(0);
+        }
+        let last = g.len() - 1;
+        if a >= g[last] {
+            return block(last);
+        }
+        let i = g.partition_point(|&v| v <= a);
+        let t = (a.ln() - g[i - 1].ln()) / (g[i].ln() - g[i - 1].ln());
+        Some(((1.0 - t) * block(i - 1)?.ln() + t * block(i)?.ln()).exp())
     }
 
     /// The smallest list size whose graph search computes `nodes` distances (the inverse of

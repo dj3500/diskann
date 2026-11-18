@@ -487,10 +487,10 @@ impl Plan {
                 "effort_curve needs unit costs with an effort curve (effort_r, effort_k, effort_l)"
             );
         }
-        if kernel.tree_effort == TreeEffort::Curve {
+        if kernel.tree_effort != TreeEffort::List {
             ensure!(
                 costs.as_ref().is_some_and(|c| !c.tree_r.is_empty()),
-                "tree_effort = curve needs unit costs with a tree effort curve (flab tree-calibrate)"
+                "tree_effort = curve / capped needs unit costs with a tree effort curve (flab tree-calibrate)"
             );
         }
         if kernel.estimates == EstimateSource::Sketch {
@@ -814,7 +814,9 @@ impl Searcher {
                 };
                 let l_tree = match plan.kernel.tree_effort {
                     TreeEffort::List => l,
-                    TreeEffort::Curve => self.tree_list_size(plan, ix, l, ids.len(), &mut pc),
+                    TreeEffort::Curve | TreeEffort::Capped => {
+                        self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
+                    }
                 };
                 let mut ctr = self.search(tp, ix, q, l_tree, ids, dists, reference);
                 ctr.n_probe += pc.n_probe;
@@ -1242,8 +1244,9 @@ impl Searcher {
 
     /// The tree route's list size under `tree_effort = curve` (the query compiled by the tree
     /// plan): the calibrated router frontier for the target recall `effort / 1000` at `K / ρ̂`
-    /// members, `ρ̂ = M̂ / A` the estimated share of the binding clause's points that match
-    /// (at least one match; at most all of them).
+    /// members of a clause of `Â` points, `ρ̂ = M̂ / Â` the estimated share of the binding
+    /// clause's points that match (at least one match; at most all of them). `capped`: at most
+    /// the router's `effort_curve(cap)` times the frontier at `K` members.
     fn tree_list_size<T: Element>(
         &mut self,
         plan: &Plan,
@@ -1259,9 +1262,17 @@ impl Searcher {
         let a = est.a.max(1.0);
         let rho = (est.m / a).clamp(1.0 / a, 1.0);
         let kprime = (k.max(1) as f64 / rho).min(a);
-        let l = costs
-            .tree_list(effort as f64 / 1000.0, kprime)
+        let r = effort as f64 / 1000.0;
+        let mut l = costs
+            .tree_list(r, kprime, a)
             .expect("validated: a tree effort curve");
+        if let (TreeEffort::Capped, Terminator::EffortCurve { cap }) =
+            (plan.kernel.tree_effort, plan.kernel.terminator)
+        {
+            if cap.is_finite() {
+                l = l.min(cap * costs.tree_list(r, k.max(1) as f64, a).expect("validated"));
+            }
+        }
         l.ceil().clamp(1.0, ix.graph.n_nodes() as f64) as usize
     }
 
