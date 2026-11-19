@@ -14,7 +14,8 @@
 //! Candidates are the points of the predicate's smallest clause (least total posting length).
 //! Before its distance is computed, each candidate is checked against the other clauses,
 //! either in the forward store or with per-query bitsets built from postings
-//! ([`Evaluation`]); both checks are exact.
+//! ([`Evaluation`]); both checks are exact. Queries without clauses (every point matches) are
+//! computed in blocks that read each chunk of the base once per block ([`open_truth`]).
 
 use std::{
     cmp::Ordering,
@@ -102,6 +103,13 @@ pub struct Params {
     pub threads: usize,
     pub evaluation: Evaluation,
 }
+
+/// Queries without clauses per block of [`open_truth`].
+const OPEN_BLOCK: usize = 64;
+/// Bytes of base vectors per chunk of [`open_truth`] (about an L2 cache).
+const OPEN_CHUNK_BYTES: usize = 1 << 18;
+/// Kept entries per query of [`open_truth`] before the list is cut back to its K-th distance.
+const OPEN_CAP: usize = 4096;
 
 #[derive(Default)]
 struct Scratch {
@@ -238,6 +246,62 @@ fn query_truth<T: Element>(
     }
 }
 
+/// The truth of queries without clauses (every point matches), computed together: the base is
+/// scanned in chunks of `chunk` points, each chunk once for all queries. A query keeps the points
+/// within its bound, the K-th smallest distance among the points it keeps (infinite before it
+/// keeps K); its list is cut back to that distance, ties included, when it reaches `cap`
+/// entries. The bound never falls below the final K-th distance, so every point of the band is
+/// kept, and the band is exactly the one of [`query_truth`].
+fn open_truth<T: Element>(
+    base: &Matrix<T>,
+    queries: &[&[T]],
+    k: usize,
+    chunk: usize,
+    cap: usize,
+) -> Vec<QueryTruth> {
+    let (n, chunk, cap) = (base.nrows(), chunk.max(1), cap.max(k + 1));
+    let mut kept: Vec<Vec<(f32, u32)>> = vec![Vec::new(); queries.len()];
+    let mut bound = vec![f32::INFINITY; queries.len()];
+    for lo in (0..n).step_by(chunk) {
+        let hi = (lo + chunk).min(n);
+        for ((query, found), b) in queries.iter().zip(&mut kept).zip(&mut bound) {
+            for p in lo..hi {
+                let d = T::squared_l2(query, base.row(p));
+                if d <= *b {
+                    found.push((d, p as u32));
+                }
+            }
+            if found.len() >= cap {
+                let kth = found
+                    .select_nth_unstable_by(k - 1, by_distance_then_id)
+                    .1
+                     .0;
+                found.retain(|e| e.0 <= kth);
+                *b = kth;
+            }
+        }
+    }
+    kept.into_iter()
+        .map(|mut found| {
+            if found.len() > k {
+                let kth = found
+                    .select_nth_unstable_by(k - 1, by_distance_then_id)
+                    .1
+                     .0;
+                found.retain(|e| e.0 <= kth);
+            }
+            found.sort_unstable_by(by_distance_then_id);
+            QueryTruth {
+                n_matches: n as u32,
+                min_clause: NO_CLAUSE,
+                min_clause_sum: n as u64,
+                min_clause_union: n as u32,
+                band: found,
+            }
+        })
+        .collect()
+}
+
 /// Computes the ground truth of all queries. `progress` is called with the number of finished
 /// queries after each query.
 pub fn compute<T: Element>(
@@ -273,13 +337,44 @@ pub fn compute<T: Element>(
     );
     predicates.check_dictionary(labels)?;
     let done = std::sync::atomic::AtomicUsize::new(0);
-    let results = par_map(queries.nrows(), params.threads, Scratch::default, |q, s| {
+    let finished = |m: usize| {
+        let before = done.fetch_add(m, std::sync::atomic::Ordering::Relaxed);
+        (before + 1..=before + m).for_each(progress);
+    };
+    let (open, other): (Vec<usize>, Vec<usize>) =
+        (0..queries.nrows()).partition(|&q| predicates.get(q).clauses().next().is_none());
+    let blocks: Vec<&[usize]> = open.chunks(OPEN_BLOCK).collect();
+    let chunk = OPEN_CHUNK_BYTES / (base.ncols() * std::mem::size_of::<T>()).max(1);
+    let open_results = par_map(
+        blocks.len(),
+        params.threads,
+        || (),
+        |b, _| {
+            let rows: Vec<&[T]> = blocks[b].iter().map(|&q| queries.row(q)).collect();
+            let truth = open_truth(base, &rows, k, chunk, OPEN_CAP);
+            finished(rows.len());
+            truth
+        },
+    );
+    let other_results = par_map(other.len(), params.threads, Scratch::default, |i, s| {
+        let q = other[i];
         let truth = query_truth(base, labels, queries.row(q), predicates.get(q), params, s);
-        progress(done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+        finished(1);
         truth
     });
+    let mut results: Vec<Option<QueryTruth>> = (0..queries.nrows()).map(|_| None).collect();
+    for (q, truth) in open
+        .iter()
+        .zip(open_results.into_iter().flatten())
+        .chain(other.iter().zip(other_results))
+    {
+        results[*q] = Some(truth);
+    }
+    let results = results
+        .into_iter()
+        .map(|r| r.expect("every query computed"));
 
-    let nq = results.len();
+    let nq = queries.nrows();
     let mut gt = GroundTruth {
         k: k as u32,
         n_points: base.nrows() as u32,
@@ -759,6 +854,36 @@ mod tests {
             all.retain(|e| e.0 <= kth);
         }
         (n, all)
+    }
+
+    #[test]
+    fn open_queries_in_blocks_match_brute_force() {
+        // Few distinct coordinates (many ties and duplicates), tiny chunks and caps, so that the
+        // kept lists are cut back often; K below, at and above the number of distinct distances.
+        let (n, dim) = (500, 3);
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let data: Vec<u8> = (0..n * dim).map(|_| rng.next(3) as u8).collect();
+        let base = Matrix::from_slice(&data, n, dim);
+        let qdata: Vec<u8> = (0..9 * dim).map(|_| rng.next(4) as u8).collect();
+        let rows: Vec<&[u8]> = qdata.chunks(dim).collect();
+        for k in [1, 4, 30, 499, 600] {
+            for (chunk, cap) in [(7, k + 2), (64, 3 * k), (n, OPEN_CAP)] {
+                let got = open_truth(&base, &rows, k, chunk, cap);
+                for (query, truth) in rows.iter().zip(&got) {
+                    let mut all: Vec<(f32, u32)> = (0..n as u32)
+                        .map(|p| (u8::squared_l2(query, base.row(p as usize)), p))
+                        .collect();
+                    all.sort_by(by_distance_then_id);
+                    if all.len() > k {
+                        let kth = all[k - 1].0;
+                        all.retain(|e| e.0 <= kth);
+                    }
+                    assert_eq!(truth.band, all, "k {k}, chunk {chunk}, cap {cap}");
+                    assert_eq!(truth.n_matches as usize, n);
+                    assert_eq!(truth.min_clause, NO_CLAUSE);
+                }
+            }
+        }
     }
 
     #[test]
