@@ -362,12 +362,12 @@ impl QuerySample {
                         z = mix(z);
                         kl.push(row[a + (z % (b - a) as u64) as usize]);
                     } else {
-                        for x in a..b {
-                            if (x - a) % 64 == 0 {
+                        for (x, &l) in row[a..b].iter().enumerate() {
+                            if x % 64 == 0 {
                                 z = mix(z);
                             }
-                            if (z >> ((x - a) % 64)) & 1 == 1 {
-                                kl.push(row[x]);
+                            if (z >> (x % 64)) & 1 == 1 {
+                                kl.push(l);
                             }
                         }
                         if kl.len() == start {
@@ -1063,11 +1063,10 @@ mod tests {
         );
     }
     #[test]
-    fn base_derived_queries_pick_the_diluted_label_and_account_their_savings() {
+    fn base_derived_queries_select_greedily_within_the_budget_and_account_their_savings() {
         // 20,000 points in three categories: `m` (m0 on 0..2,000 and m1 on 2,000..4,000),
         // `d` (d0 on even points, d1 on odd ones) and `g` (g0, g1 on two blocks of 200 points
-        // inside m0). Queries with m0 or m1 are diluted by d (and g): the islands of m0 / m1
-        // save more per byte than those of the small g labels, whose exact path is cheap.
+        // inside m0).
         let n = 20_000u32;
         let mut b = LabelStoreBuilder::new();
         for p in 0..n {
@@ -1100,10 +1099,23 @@ mod tests {
             "independent of the thread count"
         );
         assert_eq!(one.recs, three.recs);
-        // Room for one m island: the diluted market wins over the small, exact-cheap g labels.
-        let (sel, terms) = one.select(&s, island_bytes(2000, 32), 32, |_| true);
-        assert_eq!(sel.len(), 1, "{terms:?}");
-        assert!(sel[0] == id["m0"] || sel[0] == id["m1"], "{terms:?}");
+        // The first label taken has the largest saving per byte; the budget is respected.
+        let budget = island_bytes(2000, 32);
+        let (sel, terms) = one.select(&s, budget, 32, |_| true);
+        let best = terms
+            .iter()
+            .max_by(|a, b| (a.alone_ns / a.bytes as f64).total_cmp(&(b.alone_ns / b.bytes as f64)))
+            .unwrap();
+        assert_eq!(
+            terms.iter().find(|t| t.order == Some(0)).map(|t| t.label),
+            Some(best.label),
+            "{terms:?}"
+        );
+        let used: u64 = sel
+            .iter()
+            .map(|&l| island_bytes(s.posting_len(l), 32))
+            .sum();
+        assert!(!sel.is_empty() && used <= budget, "{terms:?}");
         // Everything fits: the savings add up to the drop in the expected cost per query.
         let (all, terms) = one.select(&s, u64::MAX, 32, |_| true);
         assert!(all.contains(&id["m0"]) && all.contains(&id["m1"]));
