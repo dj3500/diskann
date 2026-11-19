@@ -50,10 +50,15 @@
 //! - **Effort curve** (when a graph is given; `calibrate/effort.rs`): the unfiltered list size for mean
 //!   recall R at K' neighbours on midpoints of random base pairs (`effort_r`, `effort_k`,
 //!   `effort_l`), read by `terminator = effort_curve`.
+//! - **Tree effort curve** (`flab tree-calibrate`, `calibrate/tree.rs`): for a Steiner graph's
+//!   router trees, the router frontier for mean recall R at K' members of a label, per
+//!   label-size class (`tree_r`, `tree_k`, `tree_l`, `tree_a`), read by `tree_effort = curve`.
 
 mod effort;
+mod tree;
 
 pub use effort::EffortOptions;
+pub use tree::{tree_calibrate, tree_curve, tree_labels, TreeCurve, TreeOptions, TreeQueries};
 
 use std::{path::Path, time::Instant};
 

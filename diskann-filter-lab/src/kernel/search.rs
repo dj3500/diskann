@@ -17,15 +17,15 @@ use super::{
     },
     config::{
         Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator,
+        StartSource, Terminator, TreeChoice, TreeEffort,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
     },
     entry::{self, SampleIndex, StartPredicate},
     eval::{
-        ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, PredOut, RowScan, SparseList,
-        StaticBits,
+        ClauseSearch, Compiled, DenseBitmap, Eval, EvalCtx, NavBitmap, PredOut, RowScan,
+        SparseList, StaticBits,
     },
     exact::{self, DfPipeline, ExactEval},
     materialize::{Materialized, Materializer},
@@ -110,6 +110,8 @@ pub enum Route {
     Fallback,
     /// A post-filter search (global starts, no checks during the traversal).
     Postfilter,
+    /// The tree route's search over router trees (`tree_route`).
+    Tree,
 }
 
 impl Route {
@@ -120,6 +122,7 @@ impl Route {
             Self::Empty => "empty",
             Self::Fallback => "fallback",
             Self::Postfilter => "postfilter",
+            Self::Tree => "tree",
         }
     }
 }
@@ -334,6 +337,8 @@ pub enum EvalMode {
     Dense,
     Sparse,
     StaticBits,
+    /// Bitmap of the navigation clauses (`dense_nav`), the row for the other clauses.
+    NavBitmap,
 }
 
 /// A kernel configuration resolved against an index (validated once per run).
@@ -341,6 +346,8 @@ pub enum EvalMode {
 pub struct Plan {
     pub kernel: Kernel,
     projection: Option<Vec<u32>>,
+    /// Admission `projection(c*)`: navigation evaluates only the query's binding clause.
+    project_smallest: bool,
     two_hop_cap: usize,
     eval: EvalMode,
     /// `θ` of the `static_bits(θ)` mode.
@@ -354,6 +361,11 @@ pub struct Plan {
     costs: Option<UnitCosts>,
     /// Evaluator of the planned exact path and of the probe.
     exact_eval: ExactEval,
+    /// The tree route's plan (`tree_route`).
+    tree: Option<Box<Plan>>,
+    /// Mean out-degree of the graph's auxiliary nodes (the routers' fan-out; `tree_choice =
+    /// cost`).
+    tree_fanout: f64,
 }
 
 impl Plan {
@@ -388,6 +400,7 @@ impl Plan {
             (PredicateMode::Bitmap, Materializer::Dense | Materializer::DenseStatic) => {
                 EvalMode::Dense
             }
+            (PredicateMode::Bitmap, Materializer::DenseNav) => EvalMode::NavBitmap,
             (PredicateMode::Bitmap, _) => EvalMode::Sparse,
             (PredicateMode::StaticBits(_), _) => EvalMode::StaticBits,
         };
@@ -417,6 +430,12 @@ impl Plan {
             let b = ix.bitsets.ok_or_else(|| {
                 anyhow::anyhow!("the dense_static materializer needs static per-label bitsets")
             })?;
+            ensure!(
+                b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
+                "the static bitsets refer to another label store"
+            );
+        }
+        if let (Materializer::DenseNav, Some(b)) = (kernel.materializer, ix.bitsets) {
             ensure!(
                 b.dict_hash() == labels.dict_hash() && b.n_points() == labels.n_points(),
                 "the static bitsets refer to another label store"
@@ -478,6 +497,12 @@ impl Plan {
                 "effort_curve needs unit costs with an effort curve (effort_r, effort_k, effort_l)"
             );
         }
+        if matches!(kernel.tree_effort, TreeEffort::Curve | TreeEffort::Capped) {
+            ensure!(
+                costs.as_ref().is_some_and(|c| !c.tree_r.is_empty()),
+                "tree_effort = curve / capped needs unit costs with a tree effort curve (flab tree-calibrate)"
+            );
+        }
         if kernel.estimates == EstimateSource::Sketch {
             let sk = ix.sketches.ok_or_else(|| {
                 anyhow::anyhow!("the sketch estimates need bottom-b sketches of the labels")
@@ -520,6 +545,7 @@ impl Plan {
         Ok(Self {
             kernel: kernel.clone(),
             projection,
+            project_smallest: kernel.admission == Admission::ProjectionSmallest,
             two_hop_cap,
             eval,
             static_theta,
@@ -530,6 +556,17 @@ impl Plan {
             fast,
             costs,
             exact_eval,
+            tree: kernel
+                .tree_kernel()
+                .map(|k| Plan::new(&k, ix).map(Box::new))
+                .transpose()?,
+            tree_fanout: if kernel.tree_choice == TreeChoice::Cost {
+                let (n, a) = (ix.graph.n_data() as u32, ix.graph.n_aux() as u32);
+                let edges: usize = (n..n + a).map(|v| ix.graph.degree(v)).sum();
+                edges as f64 / f64::from(a.max(1))
+            } else {
+                0.0
+            },
         })
     }
 
@@ -538,10 +575,11 @@ impl Plan {
     pub fn needs_dense(&self) -> bool {
         matches!(
             self.kernel.materializer,
-            Materializer::Dense | Materializer::DenseStatic
+            Materializer::Dense | Materializer::DenseStatic | Materializer::DenseNav
         ) || (self.kernel.exact.is_planned()
             && (self.kernel.exact_plans.contains(ExactPlan::Bitmap)
                 || self.kernel.exact_plans.contains(ExactPlan::RowAnd)))
+            || self.tree.as_ref().is_some_and(|t| t.needs_dense())
     }
 
     /// The same plan without its hand-specialized fast path (every query runs the
@@ -568,15 +606,17 @@ impl Plan {
         let force = k.start_admission == StartAdmission::Force;
         let g_adm = match &k.admission {
             Admission::All => nav_w,
-            Admission::Strict | Admission::Projection(_) => 0.0,
+            Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest => 0.0,
             Admission::Cutoff(t) => (*t as f32 * q.max_nav_weight()).min(nav_w),
         };
         let g_aux = if self.n_aux > 0 { k.aux_g } else { 0.0 };
         let g_max = g_adm.max(if force { nav_w } else { 0.0 }).max(g_aux);
         let mut p = score::Params {
             g_max,
-            nonmatch_in_beam: !matches!(k.admission, Admission::Strict | Admission::Projection(_))
-                || force
+            nonmatch_in_beam: !matches!(
+                k.admission,
+                Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest
+            ) || force
                 || self.n_aux > 0,
             ..score::Params::default()
         };
@@ -695,6 +735,9 @@ pub struct Searcher {
     pbeam: PackedBeam,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
+    /// Start nodes appended to the configured starts of every graph search (untimed
+    /// diagnostics, e.g. oracle entries); empty in normal runs.
+    pub extra_starts: Vec<u32>,
 }
 
 impl Searcher {
@@ -734,6 +777,7 @@ impl Searcher {
             packed_beam: false,
             pbeam: PackedBeam::default(),
             trace: None,
+            extra_starts: Vec::new(),
         }
     }
 
@@ -751,6 +795,12 @@ impl Searcher {
     /// The final beam of the last graph search with `f32` keys (diagnostics).
     pub fn beam(&self) -> &Beam<u32> {
         &self.beam32
+    }
+
+    /// Whether the last search offered node `v` (diagnostics; second-hop candidates that
+    /// failed admission are not recorded).
+    pub fn visited(&self, v: u32) -> bool {
+        self.visited.contains(v)
     }
 
     /// Answers query `q` with list size `l`, writing `ids.len()` = K results (ids and true
@@ -777,6 +827,33 @@ impl Searcher {
         reference: Option<u64>,
     ) -> Counters {
         assert_eq!(ids.len(), dists.len());
+        let mut tree_candidate = false;
+        if let Some(tp) = plan.tree.as_deref() {
+            if !self.tree_eligible(tp, ix, q) {
+            } else if plan.kernel.tree_choice == TreeChoice::Cost {
+                tree_candidate = true;
+            } else {
+                let mut pc = Counters {
+                    timing: plan.kernel.phase_times,
+                    ..Counters::default()
+                };
+                let l_tree = match plan.kernel.tree_effort {
+                    TreeEffort::List => l,
+                    TreeEffort::Fixed(f) => f as usize,
+                    TreeEffort::Curve | TreeEffort::Capped => {
+                        self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
+                    }
+                };
+                let mut ctr = self.search(tp, ix, q, l_tree, ids, dists, reference);
+                ctr.n_probe += pc.n_probe;
+                ctr.t_probe_ns += pc.t_probe_ns;
+                ctr.est_probe_ns = pc.est_probe_ns;
+                ctr.a_hat = pc.a_hat;
+                ctr.m_hat = pc.m_hat;
+                ctr.route = Route::Tree;
+                return ctr;
+            }
+        }
         let k = ids.len();
         let kernel = &plan.kernel;
         self.row_prefetch = kernel.row_prefetch;
@@ -792,6 +869,9 @@ impl Searcher {
             plan.projection.as_deref(),
             &mut self.bits,
         );
+        if plan.project_smallest {
+            self.compiled.project_smallest();
+        }
         let stat = (plan.eval == EvalMode::StaticBits).then(|| {
             let b = ix
                 .bitsets
@@ -933,6 +1013,36 @@ impl Searcher {
             let t = tic(&ctr);
             let d = self.decide(plan, ix, l, k, exact_stat, &mut ctr);
             toc(t, &mut ctr.t_decide_ns);
+            let tree_l = if tree_candidate {
+                self.tree_option(plan, ix, l, k, &d)
+            } else {
+                None
+            };
+            if let (Some(l_tree), Some(tp)) = (tree_l, plan.tree.as_deref()) {
+                let mut tc = self.search(tp, ix, q, l_tree, ids, dists, reference);
+                tc.n_probe += ctr.n_probe;
+                tc.t_probe_ns += ctr.t_probe_ns;
+                tc.t_decide_ns += ctr.t_decide_ns;
+                tc.est_probe_ns = ctr.est_probe_ns;
+                (tc.plan, tc.est_exact_ns, tc.est_graph_ns) =
+                    (ctr.plan, ctr.est_exact_ns, ctr.est_graph_ns);
+                (tc.a_hat, tc.m_hat, tc.m_hi) = (ctr.a_hat, ctr.m_hat, ctr.m_hi);
+                (
+                    tc.n_clauses,
+                    tc.res_words,
+                    tc.res_rows,
+                    tc.c1_words,
+                    tc.c1_rows,
+                ) = (
+                    ctr.n_clauses,
+                    ctr.res_words,
+                    ctr.res_rows,
+                    ctr.c1_words,
+                    ctr.c1_rows,
+                );
+                tc.route = Route::Tree;
+                return tc;
+            }
             if d.exact {
                 ctr.route = Route::Exact;
                 self.exact_v2(plan, ix, q, k, d.plan, exact_stat, false, &mut ctr);
@@ -1222,6 +1332,77 @@ impl Searcher {
         }
     }
 
+    /// Whether query `q` is tree-eligible: every label of its binding clause (the first clause
+    /// of the query compiled by the tree plan, the one `label(c*)` starts from) has points
+    /// only if its per-label starts are all auxiliary nodes (the roots of its router trees).
+    fn tree_eligible<T: Element>(
+        &mut self,
+        tp: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+    ) -> bool {
+        let Some(t) = ix
+            .label_starts
+            .filter(|_| !ix.label_view && q.view.is_none())
+        else {
+            return false;
+        };
+        self.compiled
+            .compile(ix.labels, q.cnf, tp.kernel.weights, None, &mut self.bits);
+        if self.compiled.is_empty() || self.compiled.n_clauses() == 0 {
+            return false;
+        }
+        let n = ix.graph.n_data() as u32;
+        self.compiled.clause(0).iter().all(|&l| {
+            ix.labels.posting_len(l) == 0
+                || ((l as usize) < t.n_labels() && {
+                    let s = t.label_starts(l);
+                    !s.is_empty() && s.iter().all(|&v| v >= n)
+                })
+        })
+    }
+
+    /// The tree route's list size under `tree_effort = curve` (the query compiled by the tree
+    /// plan): the calibrated router frontier for the target recall `effort / 1000` at `K / ρ̂`
+    /// members of a clause of `Â` points, `ρ̂ = M̂ / Â` the estimated share of the binding
+    /// clause's points that match (at least one match; at most all of them). `capped`: at most
+    /// the router's `effort_curve(cap)` times the frontier at `K` members.
+    fn tree_list_size<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        effort: usize,
+        k: usize,
+        ctr: &mut Counters,
+    ) -> usize {
+        let est = self.estimates(plan, ix, None, ctr);
+        ctr.a_hat = est.a as u64;
+        ctr.m_hat = est.m as u64;
+        tree_frontier(plan, &est, effort, k, ix.graph.n_nodes()).0
+    }
+
+    /// `tree_choice = cost`: the tree route's list size when its model cost is below the cost
+    /// of the route the crossover chose (`d`, with the estimates it used): per router
+    /// expansion (the frontier, at most the binding clause's routers) its fan-out of member
+    /// checks, a distance per member expected to match and one for the router.
+    fn tree_option<T: Element>(
+        &self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        effort: usize,
+        k: usize,
+        d: &Decision,
+    ) -> Option<usize> {
+        let costs = plan.costs.as_ref()?;
+        let est = &self.last_estimates;
+        let (l_tree, a, rho) = tree_frontier(plan, est, effort, k, ix.graph.n_nodes());
+        let b = plan.tree_fanout.max(2.0);
+        let expansions = (l_tree as f64).min(a / (b - 1.0) + 1.0);
+        let cost = expansions * (b * costs.graph_pred_ns + (b * rho + 1.0) * costs.graph_dist_ns);
+        let planned = if d.exact { d.est_exact } else { d.est_graph };
+        (cost < planned).then_some(l_tree)
+    }
+
     /// The post-filter route: an unfiltered search with list size `l` from the graph's global
     /// starts (the configured ones with `configured_starts`); the answers of a `heap(K)` collector over the evaluated nodes, found by
     /// checking them in distance order until `K` matches (with the static bitsets when the
@@ -1473,6 +1654,11 @@ impl Searcher {
             &mut self.pos,
             ctr,
         );
+        for &s in &self.extra_starts {
+            if (s as usize) < ix.graph.n_nodes() && !self.visited.test_and_set(s) {
+                self.starts.push(s);
+            }
+        }
     }
 }
 
@@ -1506,6 +1692,36 @@ fn start_count<T: Element>(kernel: &Kernel, ix: &Index<'_, T>, q: &Compiled) -> 
 fn planned_l(l0: usize, est: &Estimates, scale: f64) -> usize {
     let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
     ((l0 as f64) * l_multiplier(rate, scale)).round().max(1.0) as usize
+}
+
+/// The tree route's router frontier for the estimates `est` (see `Searcher::tree_list_size`;
+/// `tree_effort = fixed(F)`: `F`), with the clause size `Â` and the match share `ρ̂` it used.
+fn tree_frontier(
+    plan: &Plan,
+    est: &Estimates,
+    effort: usize,
+    k: usize,
+    n_nodes: usize,
+) -> (usize, f64, f64) {
+    let a = est.a.max(1.0);
+    let rho = (est.m / a).clamp(1.0 / a, 1.0);
+    if let TreeEffort::Fixed(f) = plan.kernel.tree_effort {
+        return ((f as usize).clamp(1, n_nodes.max(1)), a, rho);
+    }
+    let costs = plan.costs.as_ref().expect("validated: a tree effort curve");
+    let kprime = (k.max(1) as f64 / rho).min(a);
+    let r = effort as f64 / 1000.0;
+    let mut l = costs
+        .tree_list(r, kprime, a)
+        .expect("validated: a tree effort curve");
+    if let (TreeEffort::Capped, Terminator::EffortCurve { cap }) =
+        (plan.kernel.tree_effort, plan.kernel.terminator)
+    {
+        if cap.is_finite() {
+            l = l.min(cap * costs.tree_list(r, k.max(1) as f64, a).expect("validated"));
+        }
+    }
+    (l.ceil().clamp(1.0, n_nodes as f64) as usize, a, rho)
 }
 
 /// `effort_curve(cap)`: the calibrated unfiltered list size for the target recall `effort / 1000`
@@ -1652,6 +1868,7 @@ fn dispatch<T: Element>(
         EvalMode::Dense => by_family!(DenseBitmap),
         EvalMode::Sparse => by_family!(SparseList),
         EvalMode::StaticBits => by_family!(StaticBits),
+        EvalMode::NavBitmap => by_family!(NavBitmap),
     }
 }
 
@@ -1759,6 +1976,10 @@ struct Run<'r, 'a, T: Element, P: Eval, S: Score> {
     projected: bool,
     aux_g: f32,
     n_data: u32,
+    /// Expander `aux_only` / `aux_frontier`: data points are never expanded.
+    aux_only: bool,
+    /// Expander `aux_frontier`: data points never enter the list (routers only).
+    router_frontier: bool,
     lazy_ok: bool,
     /// Prefetch the next expansion's adjacency row (the kernel's `row_prefetch`).
     row_prefetch: bool,
@@ -2009,6 +2230,11 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
         c: &mut Counters,
     ) -> Outcome {
         let state = self.collect::<TRACE>(v, d, p, c);
+        if self.router_frontier {
+            // A frontier of routers: members are only collected.
+            self.trace_only::<TRACE>(v, source, Some(d), Some(p), "collected");
+            return Outcome::Navigated;
+        }
         if self.admits(p) {
             let key = self.sc.key(d, p.m, p.g);
             self.insert::<TRACE>(key, d, v, state, source, Some(p), "admitted", c);
@@ -2275,6 +2501,10 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
                     None => break,
                 }
             }
+            if self.aux_only {
+                let n_data = self.n_data;
+                frontier.retain(|&n| n >= n_data);
+            }
             c.n_expand += frontier.len() as u64;
             if self.row_prefetch {
                 // The next step's first node (speculative) loads while this step expands.
@@ -2494,6 +2724,9 @@ fn run<T: Element, P: Eval, S: Score>(
         Materializer::Sparse => {
             mat.build_sparse(ix.labels, compiled, n_data as usize);
         }
+        Materializer::DenseNav => {
+            mat.build_dense_nav(ix.labels, compiled, n_data as usize, ix.bitsets);
+        }
         Materializer::None => {}
     }
     let mut cx = EvalCtx::new(ix.labels, compiled, bits, &mat.dense, &mat.sparse);
@@ -2520,7 +2753,9 @@ fn run<T: Element, P: Eval, S: Score>(
     let two_hop = matches!(kernel.expander, Expander::TwoHop(_));
     let admission = match kernel.admission {
         Admission::All => AdmissionRule::All,
-        Admission::Strict | Admission::Projection(_) => AdmissionRule::Match,
+        Admission::Strict | Admission::Projection(_) | Admission::ProjectionSmallest => {
+            AdmissionRule::Match
+        }
         Admission::Cutoff(t) => AdmissionRule::Cutoff(t),
     };
 
@@ -2538,6 +2773,8 @@ fn run<T: Element, P: Eval, S: Score>(
         projected: compiled.is_projected(),
         aux_g: kernel.aux_g,
         n_data,
+        aux_only: matches!(kernel.expander, Expander::AuxOnly | Expander::AuxFrontier),
+        router_frontier: kernel.expander == Expander::AuxFrontier,
         lazy_ok: !adaptive.sampling(),
         row_prefetch: kernel.row_prefetch,
         beam,

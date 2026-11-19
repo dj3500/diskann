@@ -149,14 +149,14 @@ are navigated, never evaluated against the predicate and never returned.
 | `starts` | `+`-joined sources: `global`, `label(c*)` (the smallest clause's per-label starts), `label(all)` (alias `product`), `sample(k)`, `aux` |
 | `start_admission` | `force`, `obey` (starts must pass admission) |
 | `sample_start` | `intended` (sample points that match fully, via per-label sample postings), `recorded` (the sample ids stored in the start table) |
-| `admission` | `all`, `strict`, `projection(<category>, ...)` (navigate on the clauses of these categories), `cutoff(τ)` (at most `τ` failed clauses) |
+| `admission` | `all`, `strict`, `projection(<category>, ...)` (navigate on the clauses of these categories), `projection(c*)` (navigate on the query's clause with the smallest summed posting size; answers are full matches), `cutoff(τ)` (at most `τ` failed clauses) |
 | `laziness` | `eager`, `deferred` (predicate only at collection), `predicate_first`, `distance_first` (skips nodes that can enter neither the beam nor the answers), `heap_bound` (skips the predicate of every node that cannot be an answer: `heap` collector full and distance beyond its K-th; the node still navigates; needs admission `all` and the `distance` scorer) |
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
 | `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve; `effort_curve(cap)`: at most `cap` × the list size of an unselective query) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
-| `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets) |
+| `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets), `dense_nav` (bitmap of the navigation clauses only — all clauses, or the projected ones such as `c*` — built with the static bitsets when the index has them; the other clauses of a projected query are checked on the row of the bitmap's members) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
 | `exact_plans` | plans `planned` may choose from: `scan+df+gallop+bitmap+rowand+pair` (default) or any subset (`rowand` needs a calibration with the A6 enumeration costs; `pair` needs a `pairs_sidecar`) |
 | `crossover` | `threshold` (the exact path when `min_c U_c ≤ T` of `exact`), `cost` (the planned exact path when its estimated cost is at most the nominal graph cost), `guarded` (`cost`, then a graph trial with online fallback; heap collector), `graph` (graph only, track G: the estimates set the list size and the post-filter route, the exact path is never taken; the hopeless gate does not apply) |
@@ -179,7 +179,7 @@ are navigated, never evaluated against the predicate and never returned.
 
 Illegal combinations are rejected when the configuration is validated (for example `deferred`
 needs `all` / `distance` / `final_beam`; `match_aware` needs `heap`; `bitmap` needs a
-materializer and no projection).
+materializer, and no projection unless the materializer is `dense_nav`).
 
 Presets (`kernel::Preset`): `postfilter`, `upstream-inline`, `upstream-inline-adaptive` /
 `upstream-inline-adaptive(sample, scale)`, `upstream-multihop`, `upstream-beta(β)` (alias
@@ -510,11 +510,25 @@ labels.
 |---|---|
 | `alpha(R, α)` | label-blind RobustPrune to degree `R` (α defaults to 1.2) |
 | `label_containment(R, α)` | FilteredVamana's label-aware occlusion as the C++ library implements it (`Index::occlude_list`): `r` may occlude `c` only if every label of `c` is a label of `r` (`F_c ⊆ F_r`), whatever the labels of `p` |
-| `source_containment(R, α)` | the FilteredVamana paper's rule: only if `F_p ∩ F_c ⊆ F_r` |
+| `source_containment(R, α[, θ\|inf[, B[, rarest\|categories]]])` | the FilteredVamana paper's rule: only if `F_p ∩ F_c ⊆ F_r`; with `θ`, only `p`'s labels with at most `θ` points count, with `B` only the first `B` of them in budget order (the labels a capped, budgeted filtered insertion searches for) |
 | `coverage(R, α, B[, k])` | the first `R − B` neighbors of `alpha(R, α)` are kept; then, for the labels of `p` from the rarest (fewest points) to the most frequent, while a label has fewer than `k` neighbors carrying it and fewer than `B` coverage edges were added, the closest unselected pool candidate carrying it is added; the remaining slots up to `R` take the rest of the RobustPrune selection |
 | `split(R_geo, R_lab[, α])` | `alpha(R_geo, α)`, then up to `R_lab` more neighbors by RobustPrune with the containment rule of `label_containment`, in which the first part's neighbors already occlude |
 
 Label-aware rules read `--labels` (default: the dataset's `labels.flab`).
+
+**Label-aware candidate generation** (`--candidates`; module `build::candidates`):
+
+| Value | The insertion of point `p` |
+|---|---|
+| `blind` (default) | one greedy search from the frozen start (the builder above) |
+| `filtered(<subset>[, B\|R[, L_f\|L[, rarest\|categories]]])` | the blind search plus, for each label `ℓ` of `S(p)`, a greedy search from `ℓ`'s medoid that admits only members of `ℓ` (list size `L_f`, default `--l-build`); `S(p)` = `p`'s labels in the subset (`all`, `<θ>` or `n/<k>`: labels with at most `θ` / `n/k` points), the rarest first (or each category's rarest first), at most `B` (default the degree bound `R`); the pool is the union of every search's expanded nodes. A node that received back-edges before its insertion (a label start) prunes them together with its pool |
+| `penalized(<λ>\|inf[, raw\|penalized])` | one greedy search ordered by `d²(p, c) + λ·m·f(p, c)`: `f` = the number of `p`'s categories in which `c` shares none of `p`'s labels, `m` = the median squared distance to the nearest non-identical point (`--nn-sample` seeded points, exact); `inf` orders by `f` first. The pool carries the raw distances or the keys (`penalized`: the rule sees the key as the distance from `p`, also in back-edge re-prunes) |
+
+**Stitching** (`--stitch <subset> --stitch-into <graph.flab>`; module `build::stitch`): for every label of the
+subset with at least 2 points, a Vamana graph over the label's points alone (`--stitch-r` 32, `--stitch-l` 100,
+α of `--prune`, the label's medoid as start, seeded random order); then the row of every point in some per-label
+graph is re-pruned with `--prune` from its row in the given label-blind graph together with its per-label
+out-neighbors (pool truncated to `--maxc`); other rows are unchanged; no back-edge pass.
 
 **Candidate pools** (`--pools <file>`): the build records, for every node, its search pool and
 every back-edge proposal it received (each with its distance), the insertion order and the

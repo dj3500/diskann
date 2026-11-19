@@ -69,6 +69,10 @@ pub enum Admission {
     /// Nodes satisfying the clauses whose labels all lie in the named categories (only these
     /// clauses are evaluated during the search).
     Projection(Vec<String>),
+    /// Nodes satisfying the query's clause with the smallest `U_c` (`projection(c*)`, the
+    /// binding clause, chosen per query from the posting sizes; only that clause is evaluated
+    /// during the search).
+    ProjectionSmallest,
     /// Nodes failing at most `τ` clauses (unit count).
     Cutoff(u32),
 }
@@ -122,6 +126,12 @@ pub enum Expander {
     /// `cap` (default: half the graph's row width, i.e. upstream's `max_degree_with_slack / 2`
     /// for upstream-built graphs), expand their matching neighbours.
     TwoHop(Option<usize>),
+    /// Only auxiliary nodes (routers) are expanded; data points are evaluated and collected
+    /// but never expanded (a search over router trees: their leaves' members are scanned).
+    AuxOnly,
+    /// As `aux_only`, and data points never enter the list either: the list is a frontier of
+    /// routers only (its size bounds the routers kept; members go to the collector).
+    AuxFrontier,
 }
 
 /// Terminator role.
@@ -485,6 +495,12 @@ pub struct Kernel {
     /// without them: `bitmap` scatters postings, `rowand` gallops); an ablation of the stored
     /// dense rows.
     pub static_bitsets_off: bool,
+    /// The tree route for tree-eligible queries (`off` by default).
+    pub tree_route: TreeRoute,
+    /// The tree route's list size (`list` by default).
+    pub tree_effort: TreeEffort,
+    /// When a tree-eligible query takes the tree route (`always` by default).
+    pub tree_choice: TreeChoice,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -513,6 +529,122 @@ impl fmt::Display for RowReads {
         f.write_str(match self {
             Self::Clause => "clause",
             Self::Reach => "reach",
+        })
+    }
+}
+
+/// The tree route: a query whose binding clause c\* has only labels whose starts are all
+/// auxiliary nodes (router-tree roots, `flab steiner`) — or no points — is *tree-eligible*
+/// and runs a tree search instead of the configured search: starts `label(c*)`, only
+/// auxiliary nodes expanded (`aux_only`), strict admission with predicate-first checks, a
+/// heap of the K best matches, the same list size. Other queries take the configured route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreeRoute {
+    Off,
+    /// Member checks on the label rows.
+    RowScan,
+    /// Member checks on a per-query dense match bitmap built with the static bitsets.
+    Bitmap,
+}
+
+impl TreeRoute {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "off" => Self::Off,
+            "row_scan" => Self::RowScan,
+            "bitmap" => Self::Bitmap,
+            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap)"),
+        })
+    }
+}
+
+impl fmt::Display for TreeRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::RowScan => "row_scan",
+            Self::Bitmap => "bitmap",
+        })
+    }
+}
+
+/// The list size of the tree route's search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreeEffort {
+    /// The configuration's list size (the tree search's list holds routers and matches).
+    List,
+    /// The calibrated tree effort curve (`tree_*` in the unit costs) at the configuration's
+    /// target recall (`effort_curve` efforts) for `K / ρ̂` members, `ρ̂` = the estimated
+    /// share of the binding clause's members that match (`M̂ / A`); the list holds routers
+    /// only.
+    Curve,
+    /// As `curve`, at most the router's `effort_curve(cap)` times the curve's list size at `K`
+    /// members (the graph route's cap on selective queries, applied to the tree route).
+    Capped,
+    /// One router frontier `F` for every query and effort (`fixed(F)`, `F ≥ 1`): the list holds
+    /// routers only. A configuration's grid of efforts then pairs each graph effort with the
+    /// same tree frontier; needs no tree effort curve.
+    Fixed(u32),
+}
+
+impl TreeEffort {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "list" => Self::List,
+            "curve" => Self::Curve,
+            "capped" => Self::Capped,
+            v => match v.strip_prefix("fixed(").and_then(|r| r.strip_suffix(')')) {
+                Some(f) => {
+                    let f: u32 = f
+                        .trim()
+                        .parse()
+                        .with_context(|| format!("tree_effort {v:?}: F must be an integer"))?;
+                    ensure!(f >= 1, "tree_effort {v:?}: F must be at least 1");
+                    Self::Fixed(f)
+                }
+                None => bail!("unknown tree_effort {v:?} (list, curve, capped, fixed(F))"),
+            },
+        })
+    }
+}
+
+impl fmt::Display for TreeEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::List => f.write_str("list"),
+            Self::Curve => f.write_str("curve"),
+            Self::Capped => f.write_str("capped"),
+            Self::Fixed(n) => write!(f, "fixed({n})"),
+        }
+    }
+}
+
+/// When a tree-eligible query takes the tree route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreeChoice {
+    /// Every tree-eligible query.
+    Always,
+    /// When the tree search's model cost (its router frontier's expansions, their member
+    /// checks and the distances of the members expected to match) is below the planned
+    /// route's (the crossover's estimate for the route it chose).
+    Cost,
+}
+
+impl TreeChoice {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "always" => Self::Always,
+            "cost" => Self::Cost,
+            v => bail!("unknown tree_choice {v:?} (always, cost)"),
+        })
+    }
+}
+
+impl fmt::Display for TreeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Always => "always",
+            Self::Cost => "cost",
         })
     }
 }
@@ -555,6 +687,9 @@ impl Default for Kernel {
             df_pipeline: false,
             threshold_estimate: false,
             static_bitsets_off: false,
+            tree_route: TreeRoute::Off,
+            tree_effort: TreeEffort::List,
+            tree_choice: TreeChoice::Always,
         }
     }
 }
@@ -671,6 +806,7 @@ impl Admission {
                 arity(&name, &args, 0)?;
                 Self::Strict
             }
+            "projection" if args.len() == 1 && args[0] == "c*" => Self::ProjectionSmallest,
             "projection" => {
                 ensure!(
                     !args.is_empty(),
@@ -693,6 +829,7 @@ impl fmt::Display for Admission {
             Self::All => write!(f, "all"),
             Self::Strict => write!(f, "strict"),
             Self::Projection(c) => write!(f, "projection({})", c.join(", ")),
+            Self::ProjectionSmallest => write!(f, "projection(c*)"),
             Self::Cutoff(t) => write!(f, "cutoff({t})"),
         }
     }
@@ -822,7 +959,11 @@ impl Expander {
             ("one_hop", []) => Self::OneHop,
             ("two_hop", []) => Self::TwoHop(None),
             ("two_hop", [c]) => Self::TwoHop(Some(num(c, "two-hop cap")?)),
-            _ => bail!("unknown expander {s:?} (one_hop, two_hop, two_hop(cap))"),
+            ("aux_only", []) => Self::AuxOnly,
+            ("aux_frontier", []) => Self::AuxFrontier,
+            _ => bail!(
+                "unknown expander {s:?} (one_hop, two_hop, two_hop(cap), aux_only, aux_frontier)"
+            ),
         })
     }
 }
@@ -833,6 +974,8 @@ impl fmt::Display for Expander {
             Self::OneHop => write!(f, "one_hop"),
             Self::TwoHop(None) => write!(f, "two_hop"),
             Self::TwoHop(Some(c)) => write!(f, "two_hop({c})"),
+            Self::AuxOnly => write!(f, "aux_only"),
+            Self::AuxFrontier => write!(f, "aux_frontier"),
         }
     }
 }
@@ -911,7 +1054,8 @@ fn parse_materializer(s: &str) -> Result<Materializer> {
         "dense" => Materializer::Dense,
         "sparse" => Materializer::Sparse,
         "dense_static" => Materializer::DenseStatic,
-        _ => bail!("unknown materializer {s:?} (none, dense, sparse, dense_static)"),
+        "dense_nav" => Materializer::DenseNav,
+        _ => bail!("unknown materializer {s:?} (none, dense, sparse, dense_static, dense_nav)"),
     })
 }
 
@@ -921,6 +1065,7 @@ fn materializer_name(m: Materializer) -> &'static str {
         Materializer::Dense => "dense",
         Materializer::Sparse => "sparse",
         Materializer::DenseStatic => "dense_static",
+        Materializer::DenseNav => "dense_nav",
     }
 }
 
@@ -1098,6 +1243,9 @@ impl Kernel {
                     v => bail!("unknown df_pipeline {v:?} (on, off)"),
                 }
             }
+            "tree_route" => self.tree_route = TreeRoute::parse(value)?,
+            "tree_effort" => self.tree_effort = TreeEffort::parse(value)?,
+            "tree_choice" => self.tree_choice = TreeChoice::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1163,6 +1311,34 @@ impl Kernel {
         if let Expander::TwoHop(Some(c)) = self.expander {
             ensure!(c >= 1, "two_hop(cap) needs cap >= 1");
         }
+        let aux_expander = matches!(self.expander, Expander::AuxOnly | Expander::AuxFrontier);
+        ensure!(
+            !(aux_expander && self.scorer.needs_pilot()),
+            "aux_only / aux_frontier cannot use a pilot scorer (the pilot expands the global start)"
+        );
+        ensure!(
+            self.expander != Expander::AuxFrontier || self.collector == Collector::Heap,
+            "aux_frontier collects matches in the heap collector only (they never enter the list)"
+        );
+        match self.tree_effort {
+            TreeEffort::List => {}
+            TreeEffort::Fixed(_) => ensure!(
+                self.tree_route != TreeRoute::Off,
+                "tree_effort = fixed(F) needs the tree route"
+            ),
+            TreeEffort::Curve | TreeEffort::Capped => ensure!(
+                self.tree_route != TreeRoute::Off
+                    && matches!(self.terminator, Terminator::EffortCurve { .. }),
+                "tree_effort = curve / capped needs the tree route and effort_curve efforts (a target recall)"
+            ),
+        }
+        ensure!(
+            self.tree_choice == TreeChoice::Always
+                || (self.tree_route != TreeRoute::Off
+                    && self.tree_effort != TreeEffort::List
+                    && matches!(self.crossover, Crossover::Cost | Crossover::Graph)),
+            "tree_choice = cost needs the tree route, a tree effort (curve, capped or fixed) and a cost crossover (cost or graph)"
+        );
         let two_hop = matches!(self.expander, Expander::TwoHop(_));
         match self.laziness {
             Laziness::Deferred => {
@@ -1245,6 +1421,10 @@ impl Kernel {
                     || self.materializer == Materializer::DenseStatic),
             "static_bitsets = \"off\" excludes the static_bits predicate and the dense_static materializer"
         );
+        ensure!(
+            !(self.static_bitsets_off && self.tree_route == TreeRoute::Bitmap),
+            "static_bitsets = \"off\" excludes tree_route = \"bitmap\" (its member checks use the static bitsets)"
+        );
         let bitmap = self.predicate == PredicateMode::Bitmap;
         ensure!(
             bitmap == (self.materializer != Materializer::None),
@@ -1258,8 +1438,13 @@ impl Kernel {
                 self.admission
             );
             ensure!(
-                !matches!(self.admission, Admission::Projection(_)),
-                "a clause projection cannot be evaluated on a materialized match set"
+                self.materializer == Materializer::DenseNav
+                    || !matches!(
+                        self.admission,
+                        Admission::Projection(_) | Admission::ProjectionSmallest
+                    ),
+                "a clause projection cannot be evaluated on a materialized match set (dense_nav \
+                 materializes the projected clauses)"
             );
         }
         if let Admission::Projection(c) = &self.admission {
@@ -1335,7 +1520,44 @@ impl Kernel {
         if self.static_bitsets_off {
             j["static_bitsets"] = json!("off");
         }
+        if self.tree_route != TreeRoute::Off {
+            j["tree_route"] = json!(self.tree_route.to_string());
+        }
+        if self.tree_effort != TreeEffort::List {
+            j["tree_effort"] = json!(self.tree_effort.to_string());
+        }
+        if self.tree_choice != TreeChoice::Always {
+            j["tree_choice"] = json!(self.tree_choice.to_string());
+        }
         j
+    }
+
+    /// The kernel of the tree route's search (`None` when the route is off).
+    pub fn tree_kernel(&self) -> Option<Kernel> {
+        let (predicate, materializer) = match self.tree_route {
+            TreeRoute::Off => return None,
+            TreeRoute::RowScan => (PredicateMode::RowScan, Materializer::None),
+            TreeRoute::Bitmap => (PredicateMode::Bitmap, Materializer::DenseStatic),
+        };
+        Some(Kernel {
+            starts: vec![StartSource::LabelSmallest],
+            start_admission: StartAdmission::Force,
+            admission: Admission::Strict,
+            laziness: Laziness::PredicateFirst,
+            collector: Collector::Heap,
+            expander: match self.tree_effort {
+                TreeEffort::List => Expander::AuxOnly,
+                TreeEffort::Curve | TreeEffort::Capped | TreeEffort::Fixed(_) => {
+                    Expander::AuxFrontier
+                }
+            },
+            terminator: Terminator::Exhaust,
+            predicate,
+            materializer,
+            weights: self.weights,
+            phase_times: self.phase_times,
+            ..Kernel::default()
+        })
     }
 
     /// Whether efforts below `k` are not applicable (the collector returns at most `L`
@@ -1531,7 +1753,13 @@ mod tests {
             StartSource::parse_list("sample(10)+global").unwrap(),
             [StartSource::Sample(10), StartSource::Global]
         );
-        for s in ["all", "strict", "projection(C3, C4)", "cutoff(1)"] {
+        for s in [
+            "all",
+            "strict",
+            "projection(C3, C4)",
+            "projection(c*)",
+            "cutoff(1)",
+        ] {
             assert_eq!(Admission::parse(s).unwrap().to_string(), s);
         }
         for s in [
@@ -1661,6 +1889,17 @@ mod tests {
             ("predicate", "bitmap"),
             ("materializer", "dense"),
             ("admission", "projection(C3)")
+        ]));
+        assert!(!bad(&[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "projection(c*)"),
+            ("collector", "heap")
+        ]));
+        assert!(bad(&[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "cutoff(1)")
         ]));
         assert!(bad(&[("terminator", "adaptive_l(5, 2)")]));
         assert!(bad(&[("beam_width", "0")]));

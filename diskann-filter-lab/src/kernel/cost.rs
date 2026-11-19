@@ -237,6 +237,21 @@ pub struct UnitCosts {
     pub effort_k: Vec<f64>,
     #[serde(default)]
     pub effort_l: Vec<Vec<f64>>,
+    /// Effort curve of the router trees of a Steiner graph (`flab tree-calibrate`, base-derived
+    /// queries): `tree_l[i][j]` is the router frontier (list size of a tree search whose list
+    /// holds routers only) at which the mean recall at `tree_k[j]` members of a label reaches
+    /// `tree_r[i]`; read by `tree_effort = curve`. Empty when not calibrated.
+    #[serde(default)]
+    pub tree_r: Vec<f64>,
+    #[serde(default)]
+    pub tree_k: Vec<f64>,
+    #[serde(default)]
+    pub tree_l: Vec<Vec<f64>>,
+    /// Label-size classes of the tree effort curve (increasing representative sizes; empty =
+    /// one class). With `m` classes `tree_l` holds `m` blocks of `tree_r.len()` rows, class by
+    /// class, and [`Self::tree_list`] interpolates between the classes around a label's size.
+    #[serde(default)]
+    pub tree_a: Vec<f64>,
     /// Planner caches ([`Self::prepare`]).
     #[serde(skip)]
     pub prepared: Prepared,
@@ -286,9 +301,45 @@ impl Default for UnitCosts {
             effort_r: Vec::new(),
             effort_k: Vec::new(),
             effort_l: Vec::new(),
+            tree_r: Vec::new(),
+            tree_k: Vec::new(),
+            tree_l: Vec::new(),
+            tree_a: Vec::new(),
             prepared: Prepared::default(),
         }
     }
+}
+
+/// A list size from a recall × neighbour-count table (`ls[i][j]` for recall `rs[i]` at `ks[j]`):
+/// log-linear interpolation in the recall and log-log in the neighbours, clamped to the table's
+/// recalls; beyond its largest neighbour count it grows in proportion. `None` without a table.
+fn curve_list(rs: &[f64], ks: &[f64], ls: &[Vec<f64>], r: f64, kprime: f64) -> Option<f64> {
+    if rs.is_empty() || ks.is_empty() {
+        return None;
+    }
+    // Bracket and weight of `x` in the increasing grid `g` (clamped).
+    let at = |g: &[f64], x: f64| -> (usize, usize, f64) {
+        if x <= g[0] {
+            return (0, 0, 0.0);
+        }
+        let last = g.len() - 1;
+        if x >= g[last] {
+            return (last, last, 0.0);
+        }
+        let i = g.partition_point(|&v| v <= x);
+        (i - 1, i, (x - g[i - 1]) / (g[i] - g[i - 1]))
+    };
+    let kp = kprime.max(1.0);
+    let lk: Vec<f64> = ks.iter().map(|k| k.ln()).collect();
+    let (j0, j1, u) = at(&lk, kp.ln());
+    let (i0, i1, t) = at(rs, r);
+    let row = |i: usize| {
+        let row = &ls[i];
+        (1.0 - u) * row[j0].ln() + u * row[j1].ln()
+    };
+    let l = ((1.0 - t) * row(i0) + t * row(i1)).exp();
+    let top = ks[ks.len() - 1];
+    Some(if kp > top { l * kp / top } else { l })
 }
 
 /// Log-log interpolation of the positive values `ys` over the increasing positive `xs` at `x`,
@@ -398,6 +449,17 @@ impl UnitCosts {
                 && self.effort_k.iter().all(|&k| k >= 1.0)
                 && self.effort_l.iter().flatten().all(|&l| l.is_finite() && l >= 1.0),
             "the effort curve needs increasing recalls and neighbour counts and one list size (>= 1) each"
+        );
+        anyhow::ensure!(
+            self.tree_l.len() == self.tree_a.len().max(1) * self.tree_r.len()
+                && self.tree_a.windows(2).all(|w| w[0] < w[1])
+                && self.tree_a.iter().all(|&a| a >= 1.0)
+                && self.tree_l.iter().all(|row| row.len() == self.tree_k.len())
+                && self.tree_r.windows(2).all(|w| w[0] < w[1])
+                && self.tree_k.windows(2).all(|w| w[0] < w[1])
+                && self.tree_k.iter().all(|&k| k >= 1.0)
+                && self.tree_l.iter().flatten().all(|&l| l.is_finite() && l >= 1.0),
+            "the tree effort curve needs increasing recalls and member counts and one list size (>= 1) each"
         );
         anyhow::ensure!(
             scalars
@@ -745,33 +807,35 @@ impl UnitCosts {
     /// calibrated recalls; beyond the largest calibrated neighbour count it grows in proportion
     /// to it. `None` without a curve.
     pub fn effort_list(&self, r: f64, kprime: f64) -> Option<f64> {
-        let (rs, ks) = (&self.effort_r, &self.effort_k);
-        if rs.is_empty() || ks.is_empty() {
-            return None;
+        curve_list(&self.effort_r, &self.effort_k, &self.effort_l, r, kprime)
+    }
+
+    /// The calibrated router frontier of a tree search for mean recall `r` at `kprime` members
+    /// of a label (or clause) of `a` points: the same interpolation as [`Self::effort_list`]
+    /// within a size class, log-linear in the size between the classes around `a` (clamped to
+    /// the smallest and largest class). `None` without a curve.
+    pub fn tree_list(&self, r: f64, kprime: f64, a: f64) -> Option<f64> {
+        let nr = self.tree_r.len();
+        let block = |c: usize| {
+            curve_list(
+                &self.tree_r,
+                &self.tree_k,
+                &self.tree_l[c * nr..(c + 1) * nr],
+                r,
+                kprime,
+            )
+        };
+        let g = &self.tree_a;
+        if g.len() <= 1 || a <= g[0] {
+            return block(0);
         }
-        // Bracket and weight of `x` in the increasing grid `g` (clamped).
-        let at = |g: &[f64], x: f64| -> (usize, usize, f64) {
-            if x <= g[0] {
-                return (0, 0, 0.0);
-            }
-            let last = g.len() - 1;
-            if x >= g[last] {
-                return (last, last, 0.0);
-            }
-            let i = g.partition_point(|&v| v <= x);
-            (i - 1, i, (x - g[i - 1]) / (g[i] - g[i - 1]))
-        };
-        let kp = kprime.max(1.0);
-        let lk: Vec<f64> = ks.iter().map(|k| k.ln()).collect();
-        let (j0, j1, u) = at(&lk, kp.ln());
-        let (i0, i1, t) = at(rs, r);
-        let row = |i: usize| {
-            let row = &self.effort_l[i];
-            (1.0 - u) * row[j0].ln() + u * row[j1].ln()
-        };
-        let l = ((1.0 - t) * row(i0) + t * row(i1)).exp();
-        let top = ks[ks.len() - 1];
-        Some(if kp > top { l * kp / top } else { l })
+        let last = g.len() - 1;
+        if a >= g[last] {
+            return block(last);
+        }
+        let i = g.partition_point(|&v| v <= a);
+        let t = (a.ln() - g[i - 1].ln()) / (g[i].ln() - g[i - 1].ln());
+        Some(((1.0 - t) * block(i - 1)?.ln() + t * block(i)?.ln()).exp())
     }
 
     /// The smallest list size whose graph search computes `nodes` distances (the inverse of

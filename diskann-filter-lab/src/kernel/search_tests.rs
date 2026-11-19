@@ -338,6 +338,12 @@ fn configs() -> Vec<(String, Kernel)> {
             ("laziness", "predicate_first"),
         ],
         &[
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
+        ],
+        &[("admission", "projection(c*)"), ("terminator", "exhaust")],
+        &[
             ("predicate", "static_bits(60)"),
             ("scorer", "multiplicative(1)"),
             ("collector", "heap"),
@@ -360,6 +366,13 @@ fn configs() -> Vec<(String, Kernel)> {
             ("predicate", "bitmap"),
             ("materializer", "dense_static"),
             ("collector", "heap"),
+        ],
+        &[
+            ("predicate", "bitmap"),
+            ("materializer", "dense_nav"),
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
         ],
     ];
     for (i, edits) in overrides.iter().enumerate() {
@@ -563,6 +576,7 @@ fn static_bits_do_not_change_answers_or_counters() {
         &[("admission", "cutoff(1)"), ("scorer", "additive(5)")],
         &[("scorer", "shifted(1)"), ("weights", "surprisal")],
         &[("admission", "projection(a)"), ("collector", "heap")],
+        &[("admission", "projection(c*)"), ("collector", "heap")],
         &[("admission", "strict"), ("expander", "two_hop")],
         &[("starts", "sample(3)+global"), ("collector", "all")],
         &[("exact", "scan_smallest_clause(70)")],
@@ -620,6 +634,70 @@ fn static_bits_do_not_change_answers_or_counters() {
     .is_err());
     k.set("predicate", "static_bits(100)").unwrap();
     assert!(Plan::new(&k, &ix_high).is_ok());
+}
+
+#[test]
+fn nav_bitmaps_do_not_change_answers_or_counters() {
+    // `bitmap` + `dense_nav` (the navigation clauses materialized, the others on the row) gives
+    // the default evaluator's answers and counters, with or without static bitsets, also
+    // under clause projections (where `dense` / `dense_static` are not allowed).
+    let f = fixture(300, 17, true);
+    let ix_bits = f.index();
+    let ix_none = Index {
+        bitsets: None,
+        costs: None,
+        sketches: None,
+        ..f.index()
+    };
+    let edits: &[&[(&str, &str)]] = &[
+        &[],
+        &[("admission", "strict"), ("collector", "final_beam")],
+        &[
+            ("admission", "strict"),
+            ("expander", "two_hop(3)"),
+            ("start_admission", "force"),
+        ],
+        &[("admission", "projection(c*)"), ("collector", "heap")],
+        &[
+            ("admission", "projection(c*)"),
+            ("collector", "heap"),
+            ("expander", "two_hop(3)"),
+            ("terminator", "exhaust"),
+        ],
+        &[("admission", "projection(a)"), ("collector", "heap")],
+        &[
+            ("admission", "projection(a, c)"),
+            ("collector", "final_beam"),
+        ],
+        &[("collector", "heap"), ("laziness", "distance_first")],
+    ];
+    let mut checked = 0;
+    for e in edits {
+        let mut base = Kernel::default();
+        for (key, value) in e.iter() {
+            base.set(key, value).unwrap();
+        }
+        let mut k = base.clone();
+        k.set("predicate", "bitmap").unwrap();
+        k.set("materializer", "dense_nav").unwrap();
+        for ix in [&ix_bits, &ix_none] {
+            let pa = Plan::new(&base, ix).unwrap();
+            let pb = Plan::new(&k, ix).unwrap_or_else(|err| panic!("{e:?}: {err}"));
+            let mut st = Searcher::for_index(ix, &[&pa, &pb]);
+            for q in 0..f.preds.len() {
+                for l in [10, 30] {
+                    let (oa, mut ca) = search_ix(&f, ix, &mut st, &pa, q, l, 10);
+                    let (ob, mut cb) = search_ix(&f, ix, &mut st, &pb, q, l, 10);
+                    for c in [&mut ca, &mut cb] {
+                        [c.res_words, c.res_rows, c.c1_words, c.c1_rows] = [0; 4];
+                    }
+                    assert_eq!((oa, ca), (ob, cb), "{e:?} q={q} L={l}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "{checked}");
 }
 
 #[test]
@@ -918,6 +996,490 @@ fn auxiliary_nodes_navigate_but_are_never_answers() {
         assert_eq!(ctr.n_aux_dist, 1, "{edits:?}");
         assert_eq!(ctr.n_aux_expand, 1, "{edits:?}");
     }
+}
+
+#[test]
+fn aux_only_expands_routers_only() {
+    // A router (id 5) over points 0, 2 and 4 is the only start; the matching point 3 is
+    // reachable only through data points, which `aux_only` never expands.
+    let rows: &[&[&str]] = &[&["x=1"], &["x=0"], &["x=1"], &["x=1"], &["x=1"]];
+    let (base, mut g, labels) = line(rows, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    g.set_starts(vec![5]).unwrap();
+    let pred = [vec!["x=1"]];
+    let edits = [
+        ("admission", "strict"),
+        ("laziness", "predicate_first"),
+        ("collector", "heap"),
+    ];
+    let k = kernel(&[&edits[..], &[("expander", "aux_only")]].concat());
+    let (ids, ctr) = run_line(&base, &g, &labels, &[5], &k, &pred, 3.2, 6, 6);
+    assert_eq!(ids, [4, 2, 0]);
+    assert_eq!((ctr.n_expand, ctr.n_aux_expand), (1, 1));
+    assert_eq!((ctr.n_dist, ctr.n_aux_dist), (4, 1));
+    let (ids, _) = run_line(&base, &g, &labels, &[5], &kernel(&edits), &pred, 3.2, 6, 6);
+    assert_eq!(ids, [3, 4, 2, 0]);
+}
+
+#[test]
+fn the_tree_route_serves_tree_eligible_queries() {
+    // A router (id 5) over the members 0, 2 and 4 of `x=1` is that label's only start;
+    // `y=1` (members 1 and 3) starts at its member 1; the global start is point 0.
+    let rows: &[&[&str]] = &[&["x=1"], &["y=1"], &["x=1"], &["y=1"], &["x=1"]];
+    let (base, mut g, labels) = line(rows, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    g.set_starts(vec![0]).unwrap();
+    let id = |s: &str| labels.name_index()[s];
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(id("x=1"), 5), (id("y=1"), 1)])
+        .unwrap();
+    let ix = Index {
+        graph: &g,
+        vectors: g.vectors(&base).unwrap(),
+        labels: &labels,
+        global: &[0],
+        label_starts: Some(&st),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 0.5,
+        bitsets: None,
+        costs: None,
+        sketches: None,
+        pairs: None,
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    pb.push(&[vec!["y=1"]]);
+    let preds = pb.finish();
+    for (route, edits) in [
+        (Route::Tree, &[("tree_route", "row_scan")][..]),
+        (Route::Graph, &[][..]),
+    ] {
+        let k = kernel(
+            &[
+                &[("starts", "label(c*)+global"), ("collector", "heap")][..],
+                edits,
+            ]
+            .concat(),
+        );
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
+        let mut run = |qi: usize, ids: &mut [u32], d: &mut [f32]| {
+            let q = Query {
+                vector: &[3.2f32],
+                cnf: preds.get(qi),
+                view: None,
+            };
+            s.search(&plan, &ix, &q, 4, ids, d, None)
+        };
+        let ctr = run(0, &mut ids, &mut d);
+        assert_eq!(ids, [4, 2, 0], "{route:?}");
+        assert_eq!(ctr.route, route);
+        if route == Route::Tree {
+            // Only the router is expanded; its members are checked, then measured.
+            assert_eq!((ctr.n_expand, ctr.n_aux_expand, ctr.n_dist), (1, 1, 4));
+        }
+        // `y=1` has a data-point start: not tree-eligible, the configured search runs.
+        let ctr = run(1, &mut ids[..2], &mut d[..2]);
+        assert_eq!(ids[..2], [3, 1]);
+        assert_eq!(ctr.route, Route::Graph);
+    }
+}
+
+/// Six points on a line (x = i, all labelled `x=1`), leaf routers 6 (over 0, 1, 2; at 1) and
+/// 7 (over 3, 4, 5; at 4) under a root 8 (at 2.5), the root as the label's only start.
+fn router_tree() -> (Matrix<f32>, Graph, LabelStore, Starts) {
+    let n = 6;
+    let base = Matrix::from_slice(&(0..n).map(|i| i as f32).collect::<Vec<_>>(), n, 1);
+    let aux = AuxNodes::new(
+        vec![AuxKind::Router; 3],
+        &Matrix::from_slice(&[1.0f32, 4.0, 2.5], 3, 1),
+    )
+    .unwrap();
+    let mut g = Graph::new(n, 4, aux).unwrap();
+    for i in 0..n as u32 {
+        let nb: Vec<u32> = [i.checked_sub(1), (i + 1 < n as u32).then_some(i + 1)]
+            .into_iter()
+            .flatten()
+            .collect();
+        g.set_neighbors(i, &nb).unwrap();
+    }
+    g.set_neighbors(6, &[0, 1, 2]).unwrap();
+    g.set_neighbors(7, &[3, 4, 5]).unwrap();
+    g.set_neighbors(8, &[6, 7]).unwrap();
+    g.set_starts(vec![0]).unwrap();
+    let mut b = LabelStoreBuilder::new();
+    for _ in 0..n {
+        b.push_point([("x", "x=1")]).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(labels.name_index()["x=1"], 8)])
+        .unwrap();
+    (base, g, labels, st)
+}
+
+fn tree_index<'a>(
+    base: &'a Matrix<f32>,
+    g: &'a Graph,
+    labels: &'a LabelStore,
+    st: &'a Starts,
+) -> Index<'a, f32> {
+    Index {
+        graph: g,
+        vectors: g.vectors(base).unwrap(),
+        labels,
+        global: &[0],
+        label_starts: Some(st),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 0.5,
+        bitsets: None,
+        costs: None,
+        sketches: None,
+        pairs: None,
+    }
+}
+
+#[test]
+fn aux_frontier_keeps_only_routers_in_the_list() {
+    let (base, g, labels, st) = router_tree();
+    let ix = tree_index(&base, &g, &labels, &st);
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    let run = |expander: &str, l: usize| {
+        let k = kernel(&[
+            ("starts", "label(c*)"),
+            ("admission", "strict"),
+            ("laziness", "predicate_first"),
+            ("collector", "heap"),
+            ("expander", expander),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 6], vec![0f32; 6]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, l, &mut ids, &mut d, None);
+        ids.truncate(ctr.n_out as usize);
+        (ids, ctr)
+    };
+    // A frontier of two routers: both leaves are expanded, every member is collected.
+    let (ids, ctr) = run("aux_frontier", 2);
+    assert_eq!(ids, [5, 4, 3, 2, 1, 0]);
+    assert_eq!(ctr.n_aux_expand, 3);
+    // aux_only: the near leaf's members enter the list of two and evict the far leaf.
+    let (ids, ctr) = run("aux_only", 2);
+    assert_eq!(ids, [5, 4, 3]);
+    assert_eq!(ctr.n_aux_expand, 2);
+    // A frontier of one router keeps only the nearer leaf.
+    let (ids, _) = run("aux_frontier", 1);
+    assert_eq!(ids, [5, 4, 3]);
+    // aux_frontier needs the heap collector.
+    let mut k = Kernel::default();
+    k.set("starts", "label(c*)").unwrap();
+    k.set("expander", "aux_frontier").unwrap();
+    k.collector = super::collect::Collector::FinalBeam;
+    assert!(k.validate().is_err());
+}
+
+#[test]
+fn the_tree_effort_curve_sets_the_tree_list_size() {
+    use super::cost::UnitCosts;
+    let (base, g, labels, st) = router_tree();
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        tree_r: vec![0.5, 0.9],
+        tree_k: vec![1.0, 100.0],
+        tree_l: vec![vec![1.0, 1.0], vec![2.0, 2.0]],
+        ..UnitCosts::default()
+    };
+    assert_eq!(costs.tree_list(0.9, 6.0, 6.0), Some(2.0));
+    // Size classes: log-linear in the label size between the classes, clamped outside them.
+    let classes = UnitCosts {
+        tree_a: vec![10.0, 1000.0],
+        tree_l: vec![
+            vec![1.0, 1.0],
+            vec![2.0, 2.0],
+            vec![100.0, 100.0],
+            vec![200.0, 200.0],
+        ],
+        ..costs.clone()
+    };
+    classes.validate().unwrap();
+    let at = |a: f64| classes.tree_list(0.9, 6.0, a).unwrap();
+    for (a, want) in [(5.0, 2.0), (100.0, 20.0), (5000.0, 200.0)] {
+        assert!((at(a) - want).abs() < 1e-9, "a = {a}: {}", at(a));
+    }
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..tree_index(&base, &g, &labels, &st)
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    let k = kernel(&[
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("terminator", "effort_curve"),
+        ("laziness", "heap_bound"),
+        ("crossover", "graph"),
+        ("exact", "planned"),
+        ("estimates", "sketch"),
+        ("tree_route", "row_scan"),
+        ("tree_effort", "curve"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut s = Searcher::for_index(&ix, &[&plan]);
+    for (effort, want) in [(900, vec![5, 4, 3, 2, 1, 0]), (500, vec![5, 4, 3])] {
+        let (mut ids, mut d) = (vec![0u32; 6], vec![0f32; 6]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, effort, &mut ids, &mut d, None);
+        ids.truncate(ctr.n_out as usize);
+        assert_eq!(ctr.route, Route::Tree);
+        // Every member matches (rho = 1): the frontier for R at K' = K.
+        assert_eq!(ids, want, "effort {effort}");
+        assert_eq!(ctr.m_hat, 6);
+    }
+    // Without a tree curve the plan is rejected.
+    let c0 = UnitCosts {
+        tree_r: Vec::new(),
+        tree_k: Vec::new(),
+        tree_l: Vec::new(),
+        ..costs.clone()
+    };
+    let ix0 = Index {
+        costs: Some(&c0),
+        ..ix
+    };
+    assert!(Plan::new(&k, &ix0).is_err());
+}
+
+#[test]
+fn a_fixed_tree_effort_uses_one_frontier_for_every_effort() {
+    use super::config::TreeEffort;
+    assert_eq!(
+        TreeEffort::parse("fixed(16)").unwrap(),
+        TreeEffort::Fixed(16)
+    );
+    assert_eq!(TreeEffort::Fixed(16).to_string(), "fixed(16)");
+    assert!(TreeEffort::parse("fixed(0)").is_err());
+    assert!(TreeEffort::parse("fixed(x)").is_err());
+    let (base, g, labels, st) = router_tree();
+    // No unit costs: a fixed frontier needs no tree effort curve.
+    let ix = tree_index(&base, &g, &labels, &st);
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    // Frontier 1: the root, then the router nearer the query; frontier 2: both routers.
+    for (frontier, want) in [(1, vec![5u32, 4, 3]), (2, vec![5, 4, 3, 2, 1, 0])] {
+        let fixed = format!("fixed({frontier})");
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("terminator", "exhaust"),
+            ("tree_route", "row_scan"),
+            ("tree_effort", fixed.as_str()),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        for effort in [1, 6, 100] {
+            let (mut ids, mut d) = (vec![0u32; 6], vec![0f32; 6]);
+            let q = Query {
+                vector: &[5.0f32],
+                cnf: preds.get(0),
+                view: None,
+            };
+            let ctr = s.search(&plan, &ix, &q, effort, &mut ids, &mut d, None);
+            ids.truncate(ctr.n_out as usize);
+            assert_eq!(ctr.route, Route::Tree);
+            assert_eq!(ids, want, "frontier {frontier}, effort {effort}");
+        }
+    }
+    // The tree route is required.
+    let mut k = kernel(&[("collector", "heap"), ("terminator", "exhaust")]);
+    k.tree_effort = TreeEffort::Fixed(4);
+    assert!(k.validate().is_err());
+    // The bitmap tree route checks members with the static bitsets: not under `static_bitsets = off`.
+    let mut k = kernel(&[("tree_route", "bitmap"), ("tree_effort", "fixed(4)")]);
+    k.set("static_bitsets", "off").unwrap();
+    assert!(k.validate().is_err());
+    k.set("tree_route", "row_scan").unwrap();
+    k.validate().unwrap();
+}
+
+/// Ten points on a line; label x on 0..=5 under routers 10 = {0, 1, 2}, 11 = {3, 4, 5} and
+/// the root 12; label y on {1, 3, 5, 6, ..., 9}: x AND y keeps half of x (rho = 0.5).
+fn diluted_tree() -> (Matrix<f32>, Graph, LabelStore, Starts) {
+    let n = 10;
+    let base = Matrix::from_slice(&(0..n).map(|i| i as f32).collect::<Vec<_>>(), n, 1);
+    let aux = AuxNodes::new(
+        vec![AuxKind::Router; 3],
+        &Matrix::from_slice(&[1.0f32, 4.0, 2.5], 3, 1),
+    )
+    .unwrap();
+    let mut g = Graph::new(n, 4, aux).unwrap();
+    for i in 0..n as u32 {
+        let nb: Vec<u32> = [i.checked_sub(1), (i + 1 < n as u32).then_some(i + 1)]
+            .into_iter()
+            .flatten()
+            .collect();
+        g.set_neighbors(i, &nb).unwrap();
+    }
+    g.set_neighbors(10, &[0, 1, 2]).unwrap();
+    g.set_neighbors(11, &[3, 4, 5]).unwrap();
+    g.set_neighbors(12, &[10, 11]).unwrap();
+    g.set_starts(vec![0]).unwrap();
+    let mut b = LabelStoreBuilder::new();
+    for i in 0..n {
+        let x = (i <= 5).then_some(("x", "x=1"));
+        let y = (i >= 6 || i % 2 == 1).then_some(("y", "y=1"));
+        b.push_point(x.into_iter().chain(y)).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(labels.name_index()["x=1"], 12)])
+        .unwrap();
+    (base, g, labels, st)
+}
+
+#[test]
+fn the_capped_tree_effort_bounds_diluted_queries() {
+    use super::cost::UnitCosts;
+    let (base, g, labels, st) = diluted_tree();
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    // The tree curve's frontier is 1.2 times the number of members (L(K') = 1.2 K').
+    let costs = UnitCosts {
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        tree_r: vec![0.5, 0.9],
+        tree_k: vec![1.0, 100.0],
+        tree_l: vec![vec![1.2, 120.0], vec![1.2, 120.0]],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        ..tree_index(&base, &g, &labels, &st)
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    let preds = pb.finish();
+    let run = |effort: &str| {
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("terminator", "effort_curve(1.5)"),
+            ("laziness", "heap_bound"),
+            ("crossover", "graph"),
+            ("exact", "planned"),
+            ("estimates", "sketch"),
+            ("tree_route", "row_scan"),
+            ("tree_effort", effort),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 2], vec![0f32; 2]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 900, &mut ids, &mut d, None);
+        assert_eq!(ctr.route, Route::Tree);
+        assert_eq!((ctr.a_hat, ctr.m_hat), (6, 3));
+        ids.truncate(ctr.n_out as usize);
+        (ids, ctr.final_l)
+    };
+    // K = 2 at rho <= 0.5 (sketch estimates): the curve's frontier for K' >= 4 members (the
+    // list's capacity is the frontier plus the start, upstream's padding) ...
+    let (ids, l_curve) = run("curve");
+    assert_eq!(ids, [5, 3]);
+    assert!(l_curve >= 6, "{l_curve}");
+    // ... capped at 1.5 times the frontier for K = 2 (3.6, rounded up).
+    assert_eq!(run("capped"), (vec![5, 3], 4 + 1));
+}
+
+#[test]
+fn tree_choice_cost_takes_the_tree_route_only_when_it_is_cheaper() {
+    use super::cost::UnitCosts;
+    let (base, g, labels, st) = diluted_tree();
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let curves = UnitCosts {
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        tree_r: vec![0.5, 0.9],
+        tree_k: vec![1.0, 100.0],
+        tree_l: vec![vec![1.2, 120.0], vec![1.2, 120.0]],
+        ..UnitCosts::default()
+    };
+    // Graph searches of 10 L + 200 distances, or of about one.
+    let cheap_graph = UnitCosts {
+        graph_alpha: 0.001,
+        graph_beta: 1.0,
+        ..curves.clone()
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    let preds = pb.finish();
+    let run = |costs: &UnitCosts| {
+        let ix = Index {
+            costs: Some(costs),
+            sketches: Some(&sketches),
+            ..tree_index(&base, &g, &labels, &st)
+        };
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("terminator", "effort_curve"),
+            ("laziness", "heap_bound"),
+            ("crossover", "graph"),
+            ("exact", "planned"),
+            ("estimates", "sketch"),
+            ("tree_route", "row_scan"),
+            ("tree_effort", "curve"),
+            ("tree_choice", "cost"),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 2], vec![0f32; 2]);
+        let q = Query {
+            vector: &[5.0f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 900, &mut ids, &mut d, None);
+        ids.truncate(ctr.n_out as usize);
+        (ctr.route, ids, ctr.est_graph_ns)
+    };
+    // A few router expansions against a graph search of hundreds of distances: the tree.
+    let (route, ids, g_ns) = run(&curves);
+    assert_eq!((route, ids), (Route::Tree, vec![5, 3]), "graph {g_ns} ns");
+    // Against a search of about one distance: the planned route.
+    let (route, _, g_ns) = run(&cheap_graph);
+    assert_ne!(route, Route::Tree, "graph {g_ns} ns");
+    // tree_choice = cost needs a tree effort curve.
+    let mut k = Kernel::default();
+    k.set("tree_route", "row_scan").unwrap();
+    k.set("tree_choice", "cost").unwrap();
+    assert!(k.validate().is_err());
 }
 
 #[test]
@@ -2653,4 +3215,76 @@ fn static_bitsets_off_is_an_index_without_them() {
     k.set("predicate", "static_bits(1)").unwrap();
     assert!(k.validate().is_err());
     assert!(Kernel::default().set("static_bitsets", "no").is_err());
+}
+
+#[test]
+fn projection_smallest_navigates_on_the_binding_clause() {
+    // `projection(c*)` equals `projection(<category>)` of the clause with the smallest U_c when
+    // that clause is the only one of its category (every non-empty query of the fixture).
+    let f = fixture(300, 21, false);
+    let ix = f.index();
+    let plan = |admission: &str| {
+        let mut k = Kernel::default();
+        for (key, value) in [
+            ("admission", admission),
+            ("collector", "heap"),
+            ("starts", "label(c*)+global"),
+            ("expander", "two_hop(3)"),
+        ] {
+            k.set(key, value).unwrap();
+        }
+        Plan::new(&k, &ix).unwrap()
+    };
+    let star = plan("projection(c*)");
+    let by_category: Vec<(String, Plan)> = ["a", "b", "c"]
+        .iter()
+        .map(|c| ((*c).to_owned(), plan(&format!("projection({c})"))))
+        .collect();
+    let mut plans = vec![&star];
+    plans.extend(by_category.iter().map(|(_, p)| p));
+    let mut st = Searcher::for_index(&ix, &plans);
+    let (mut checked, mut multi) = (0, 0);
+    for q in 0..f.preds.len() {
+        let cnf = f.preds.get(q);
+        if cnf.n_clauses() == 0 || cnf.clauses().any(|c| c.is_empty()) {
+            continue;
+        }
+        let mut best = (u64::MAX, 0);
+        for (i, clause) in cnf.clauses().enumerate() {
+            let u: u64 = clause.iter().map(|&l| f.labels.posting_len(l) as u64).sum();
+            if u < best.0 {
+                best = (u, i);
+            }
+        }
+        let cat = f
+            .labels
+            .category_name(f.labels.category(cnf.clause(best.1)[0]));
+        let same_category = cnf
+            .clauses()
+            .filter(|c| f.labels.category_name(f.labels.category(c[0])) == cat)
+            .count();
+        assert_eq!(same_category, 1);
+        let pk = &by_category.iter().find(|(c, _)| c == cat).unwrap().1;
+        multi += usize::from(cnf.n_clauses() > 1);
+        for l in [10, 30] {
+            let (oa, ca) = search(&f, &mut st, &star, q, l, 10, None);
+            let (ob, mut cb) = search(&f, &mut st, pk, q, l, 10, None);
+            if cnf.n_clauses() == 1 {
+                // A single clause is the whole predicate: no projection, so no re-check of the
+                // navigation matches (the category projection re-checks them).
+                assert!(ca.n_pred <= cb.n_pred);
+                cb.n_pred = ca.n_pred;
+            }
+            assert_eq!((&oa, &ca), (&ob, &cb), "q={q} L={l} c*={cat}");
+            for &(_, v) in &oa {
+                let row = f.labels.row(v);
+                assert!(
+                    cnf.clauses().all(|c| c.iter().any(|l| row.contains(l))),
+                    "q={q}: {v} is no match"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 40 && multi > 10, "{checked} {multi}");
 }

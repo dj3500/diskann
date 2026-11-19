@@ -18,6 +18,12 @@
 //!    sources are re-pruned to `R` with the same rule (parallel over such targets). This is
 //!    upstream's `multi_insert` with `IntraBatchCandidates::None` and `add_edge_and_prune`.
 //!
+//! With label-aware candidate generation ([`Candidates`], module `candidates`) the pool of step
+//! 1 is the union of the label-blind search's pool and the pools of label-filtered searches, or
+//! the pool of one penalized search. A node can then receive back-edges before its own
+//! insertion (a label's start node is found by filtered searches before it is inserted); its
+//! row at insertion is pruned from its pool together with those neighbors.
+//!
 //! A batch therefore depends only on the graph before it, and the result only on the
 //! insertion order and the batch schedule, not on the number of threads. The start node is
 //! an auxiliary node holding a copy of the medoid (upstream's `StartPointStrategy::Medoid`
@@ -35,10 +41,14 @@ use serde_json::json;
 
 use super::{
     adjacency::Adjacency,
+    candidates::{
+        nn_scale, penalty_weight, test_bit, Candidates, FilterPlan, MemberMarks, Penalty,
+        PenaltyScratch, PruneKey,
+    },
     medoid_index,
     pools::Pools,
     prune::{fresh_sources, normalize_pool, reprune, Candidate, PruneRule, PruneScratch},
-    search::Searcher,
+    search::{Ranking, Searcher},
     thread_pool, BuildElement, LabelInfo, PerThread, Points, SplitMix64,
 };
 use crate::{
@@ -76,6 +86,10 @@ pub struct BuildParams {
     /// Re-prune every row longer than `R` at the end (the C++ library's cleanup pass;
     /// upstream's in-memory build does not).
     pub final_prune: bool,
+    /// Candidate generation of the insertions (label-blind by default).
+    pub candidates: Candidates,
+    /// Sample size of the nearest-neighbor distance scale of penalized insertion.
+    pub nn_sample: usize,
 }
 
 impl Default for BuildParams {
@@ -90,6 +104,8 @@ impl Default for BuildParams {
             threads: 1,
             capture: false,
             final_prune: false,
+            candidates: Candidates::Blind,
+            nn_sample: 256,
         }
     }
 }
@@ -160,6 +176,19 @@ pub struct BuildStats {
     /// Targets re-pruned because a batch's back-edges would overflow the row.
     pub n_reprunes: u64,
     pub n_final_prunes: u64,
+    /// Label-filtered insertion searches, their distance computations and member tests.
+    pub n_filtered_searches: u64,
+    pub n_dist_filtered: u64,
+    pub n_member_tests: u64,
+    /// Label-penalty evaluations (`f(p, c)`) of penalized insertion searches (nodes rejected by
+    /// their distance alone are not evaluated).
+    pub n_penalty_evals: u64,
+    /// Entries of the pools handed to the insertion prunes (after merging and repeats).
+    pub n_pool_entries: u64,
+    /// Insertions whose node already had neighbors (back-edges received before its
+    /// insertion), and those neighbors.
+    pub n_row_merges: u64,
+    pub n_row_merge_entries: u64,
 }
 
 /// A built graph, its candidate pools (when recorded) and the build's counters.
@@ -168,6 +197,8 @@ pub struct BuildOutput {
     pub graph: Graph,
     pub pools: Option<Pools>,
     pub stats: BuildStats,
+    /// Setup of the candidate generation (filtered labels, penalty scale, ...).
+    pub candidates: serde_json::Value,
 }
 
 struct Inserted {
@@ -176,6 +207,52 @@ struct Inserted {
     n_dist: u64,
     n_expanded: u64,
     n_dist_prune: u64,
+    n_filtered: u64,
+    n_dist_filtered: u64,
+    n_member_tests: u64,
+    n_pool: u64,
+    n_merged: u64,
+    n_penalty: u64,
+}
+
+/// Admits the members of one label (a bitset over the nodes).
+struct Members<'b> {
+    bits: &'b [u64],
+}
+
+impl Ranking for Members<'_> {
+    #[inline(always)]
+    fn admit(&mut self, v: u32) -> bool {
+        test_bit(self.bits, v)
+    }
+}
+
+/// Orders by `d² + λ·f(p, c)` for the point `p` marked in `scratch`.
+struct Penalized<'b> {
+    penalty: &'b Penalty<'b>,
+    scratch: &'b PenaltyScratch,
+    evals: u64,
+}
+
+impl Ranking for Penalized<'_> {
+    #[inline(always)]
+    fn prepare(&mut self, v: u32) {
+        self.penalty.prefetch_row(v);
+    }
+
+    #[inline(always)]
+    fn key(&mut self, v: u32, d: f32) -> f32 {
+        self.evals += 1;
+        self.penalty.key(self.scratch, v, d)
+    }
+}
+
+/// Per-thread scratch of a build.
+struct Scratch {
+    searcher: Searcher,
+    prune: PruneScratch,
+    marks: MemberMarks,
+    extra: Vec<Candidate>,
 }
 
 /// Builds a graph over the rows of `base` (see the module documentation). `labels` is needed
@@ -194,18 +271,21 @@ pub fn build<T: BuildElement>(
         "L_build, maxc, the batch size and the thread count must be positive"
     );
     let rule = params.rule;
-    let label_info = match labels {
-        Some(store) if rule.needs_labels() => {
+    let gen = params.candidates;
+    let needs_labels = rule.needs_labels() || gen.needs_labels();
+    let store = match labels {
+        Some(store) if needs_labels => {
             ensure!(
                 store.n_points() == n,
                 "the label store has {} points, the base {n}",
                 store.n_points()
             );
-            Some(LabelInfo::new(store))
+            Some(store)
         }
-        None if rule.needs_labels() => anyhow::bail!("rule {rule} needs labels"),
+        None if needs_labels => anyhow::bail!("rule {rule} with candidates {gen} needs labels"),
         _ => None,
     };
+    let label_info = store.filter(|_| rule.needs_labels()).map(LabelInfo::new);
     let labels = label_info.as_ref();
 
     let mut stats = BuildStats::default();
@@ -220,8 +300,51 @@ pub fn build<T: BuildElement>(
     stats.n_batches = batches.len() - 1;
 
     let pool = thread_pool(params.threads)?;
-    let scratch = PerThread::new(params.threads, || {
-        (Searcher::new(n_nodes), PruneScratch::default())
+    let t_setup = Instant::now();
+    let (plan, penalty, mut gen_info) = match gen {
+        Candidates::Blind => (None, None, json!({"kind": "blind"})),
+        Candidates::Filtered {
+            subset,
+            budget,
+            l_filter,
+            order,
+        } => {
+            let store = store.expect("checked to have labels");
+            let plan = FilterPlan::new(
+                base,
+                store,
+                subset,
+                (budget.unwrap_or(rule.degree()), order),
+                l_filter.unwrap_or(params.l_build),
+                params.threads,
+            )?;
+            let mut info = gen.to_json();
+            info["plan"] = plan.stats.clone();
+            (Some(plan), None, info)
+        }
+        Candidates::Penalized { lambda, key } => {
+            let store = store.expect("checked to have labels");
+            let (scale, quartiles) = nn_scale(base, params.nn_sample, 0, &pool);
+            let weight = penalty_weight(base, lambda, scale);
+            let mut info = gen.to_json();
+            info["nn_d2_median"] = json!(scale);
+            info["nn_d2_quartiles"] = json!(quartiles);
+            info["nn_sample"] = json!(params.nn_sample);
+            info["weight"] = json!(weight);
+            (None, Some(Penalty::new(store, weight, key)), info)
+        }
+    };
+    gen_info["setup_s"] = json!(t_setup.elapsed().as_secs_f64());
+    let filtered = plan.is_some();
+    let scratch = PerThread::new(params.threads, || Scratch {
+        searcher: Searcher::new(n_nodes),
+        prune: PruneScratch::default(),
+        marks: if filtered {
+            MemberMarks::new(n_nodes)
+        } else {
+            MemberMarks::default()
+        },
+        extra: Vec::new(),
     });
     let mut adjacency = Adjacency::new(n_nodes, slots);
     let mut search_pools: Vec<Vec<Candidate>> = Vec::new();
@@ -242,12 +365,98 @@ pub fn build<T: BuildElement>(
             .into_par_iter()
             .map(|i| {
                 let p = order[i];
-                scratch.with(|(searcher, prune_scratch)| {
-                    let n_dist =
-                        searcher.search(graph, &points, points.get(p), start, params.l_build);
+                scratch.with(|s| {
+                    let Scratch {
+                        searcher,
+                        prune: prune_scratch,
+                        marks,
+                        extra,
+                    } = s;
+                    let query = points.get(p);
+                    let penalized_key = penalty.as_ref().is_some_and(|pen| {
+                        pen.begin(&mut prune_scratch.penalty, p);
+                        pen.key == PruneKey::Penalized
+                    });
+                    let (n_dist, n_penalty) = match &penalty {
+                        None => (
+                            searcher.search(graph, &points, query, start, params.l_build),
+                            0,
+                        ),
+                        Some(pen) => {
+                            let mut ranking = Penalized {
+                                penalty: pen,
+                                scratch: &prune_scratch.penalty,
+                                evals: 0,
+                            };
+                            let n = searcher.search_ranked(
+                                graph,
+                                &points,
+                                query,
+                                start,
+                                params.l_build,
+                                &mut ranking,
+                            );
+                            (n, ranking.evals)
+                        }
+                    };
                     let n_expanded = searcher.expanded.len() as u64;
                     let mut candidates = std::mem::take(&mut searcher.expanded);
+                    if penalized_key {
+                        for (c, &k) in candidates.iter_mut().zip(&searcher.expanded_keys) {
+                            c.dist = k;
+                        }
+                    }
                     normalize_pool(&mut candidates, p, params.maxc);
+                    let (mut n_filtered, mut n_dist_filtered, mut n_member_tests) = (0, 0, 0);
+                    extra.clear();
+                    if let Some(plan) = &plan {
+                        let store = store.expect("checked to have labels");
+                        for &l in plan.labels_of(p) {
+                            let s = plan.starts[l as usize];
+                            if s == u32::MAX {
+                                continue;
+                            }
+                            let members = store.postings(l);
+                            let own = plan.static_bits(l).is_none();
+                            if own {
+                                marks.set(members);
+                            }
+                            let bits = plan.static_bits(l).unwrap_or_else(|| marks.bits());
+                            n_dist_filtered += searcher.search_ranked(
+                                graph,
+                                &points,
+                                query,
+                                s,
+                                plan.l_filter,
+                                &mut Members { bits },
+                            );
+                            if own {
+                                marks.clear(members);
+                            }
+                            n_filtered += 1;
+                            n_member_tests += searcher.n_admit;
+                            let found = searcher.expanded.len().min(params.maxc);
+                            extra.extend_from_slice(&searcher.expanded[..found]);
+                        }
+                    }
+                    // Neighbors received before the insertion (filtered builds only).
+                    let n_merged = graph.degree(p) as u64;
+                    for &v in graph.neighbors(p) {
+                        let d = T::squared_l2(query, points.get(v));
+                        let d = match (&penalty, penalized_key) {
+                            (Some(pen), true) => pen.key(&prune_scratch.penalty, v, d),
+                            _ => d,
+                        };
+                        extra.push(Candidate::new(v, d));
+                    }
+                    if !extra.is_empty() {
+                        candidates.extend_from_slice(extra);
+                        normalize_pool(&mut candidates, p, usize::MAX);
+                    }
+                    if let Some(pen) = &penalty {
+                        pen.end(&mut prune_scratch.penalty);
+                    }
+                    let n_pool = candidates.len() as u64;
                     let before = prune_scratch.n_dist;
                     let mut out = Vec::with_capacity(rule.degree());
                     rule.prune(&points, labels, p, &candidates, prune_scratch, &mut out);
@@ -261,9 +470,15 @@ pub fn build<T: BuildElement>(
                     Inserted {
                         out,
                         pool,
-                        n_dist,
+                        n_dist: n_dist + n_merged,
                         n_expanded,
                         n_dist_prune,
+                        n_filtered,
+                        n_dist_filtered,
+                        n_member_tests,
+                        n_pool,
+                        n_merged,
+                        n_penalty,
                     }
                 })
             })
@@ -279,6 +494,13 @@ pub fn build<T: BuildElement>(
             stats.n_dist_search += ins.n_dist;
             stats.n_expanded += ins.n_expanded;
             stats.n_dist_prune += ins.n_dist_prune;
+            stats.n_filtered_searches += ins.n_filtered;
+            stats.n_dist_filtered += ins.n_dist_filtered;
+            stats.n_member_tests += ins.n_member_tests;
+            stats.n_pool_entries += ins.n_pool;
+            stats.n_row_merges += u64::from(ins.n_merged > 0);
+            stats.n_row_merge_entries += ins.n_merged;
+            stats.n_penalty_evals += ins.n_penalty;
         }
         if params.capture {
             for (k, ins) in inserted.into_iter().enumerate() {
@@ -313,7 +535,8 @@ pub fn build<T: BuildElement>(
         let rows: Vec<Vec<u32>> = jobs
             .par_iter()
             .map(|&(t, i, j)| {
-                scratch.with(|(_, prune_scratch)| {
+                scratch.with(|s| {
+                    let prune_scratch = &mut s.prune;
                     let mut fresh = std::mem::take(&mut prune_scratch.fresh);
                     fresh_sources(
                         graph.neighbors(t),
@@ -325,6 +548,7 @@ pub fn build<T: BuildElement>(
                         &rule,
                         &points,
                         labels,
+                        penalty.as_ref(),
                         t,
                         graph.neighbors(t),
                         &fresh,
@@ -351,18 +575,19 @@ pub fn build<T: BuildElement>(
             &rule,
             &points,
             labels,
+            penalty.as_ref(),
             params.maxc,
             &pool,
             &scratch,
-            |s| &mut s.1,
+            |s| &mut s.prune,
         );
         stats.final_prune_s = t_final.elapsed().as_secs_f64();
     }
 
     let t_assemble = Instant::now();
-    for (_, s) in scratch.into_inner() {
-        stats.n_dist_reprune += s.n_dist + s.n_dist_source;
-        stats.n_label_checks += s.n_label_checks;
+    for s in scratch.into_inner() {
+        stats.n_dist_reprune += s.prune.n_dist + s.prune.n_dist_source;
+        stats.n_label_checks += s.prune.n_label_checks;
     }
     stats.n_dist_reprune -= stats.n_dist_prune;
     let dim = base.ncols();
@@ -387,6 +612,7 @@ pub fn build<T: BuildElement>(
             },
             "final_prune": params.final_prune,
             "start": {"node": start, "medoid_of": medoid},
+            "candidates": gen_info.clone(),
         });
         Some(assemble_pools(
             n,
@@ -410,6 +636,7 @@ pub fn build<T: BuildElement>(
         graph,
         pools,
         stats,
+        candidates: gen_info,
     })
 }
 
@@ -424,6 +651,7 @@ pub(crate) fn final_prune<T: Element, S: Send>(
     rule: &PruneRule,
     points: &Points<'_, T>,
     labels: Option<&LabelInfo<'_>>,
+    penalty: Option<&Penalty<'_>>,
     maxc: usize,
     pool: &diskann_providers::utils::RayonThreadPool,
     scratch: &PerThread<S>,
@@ -444,6 +672,7 @@ pub(crate) fn final_prune<T: Element, S: Send>(
                     rule,
                     points,
                     labels,
+                    penalty,
                     t,
                     graph.neighbors(t),
                     &[],
@@ -517,6 +746,7 @@ fn assemble_pools(
 mod tests {
     use super::*;
     use crate::build::test_util::random_points;
+    use crate::labels::LabelStore;
 
     #[test]
     fn schedule_doubles_then_saturates() {
@@ -551,6 +781,194 @@ mod tests {
         assert_eq!(stats.reachable_data, 1500);
         assert_eq!((stats.self_loops, stats.duplicate_edges), (0, 0));
         assert!(one.stats.n_reprunes > 0 && one.stats.n_appends > 0);
+    }
+
+    /// Random 8-d points with two categories: `cg` (8 values spread at random) and `cr`
+    /// (`rare` on every 25th point, else `common`).
+    fn labeled(n: usize, seed: u64) -> (Matrix<u8>, LabelStore) {
+        let base = random_points(n, 8, seed);
+        let mut rng = SplitMix64::new(seed + 1);
+        let mut b = crate::labels::LabelStoreBuilder::new();
+        for i in 0..n {
+            let g = format!("g{}", rng.below(8));
+            let r = if i % 25 == 0 { "rare" } else { "common" };
+            b.push_point([("cg", g.as_str()), ("cr", r)]).unwrap();
+        }
+        (base, b.finish().unwrap())
+    }
+
+    /// Fraction of the members of `label` reachable from its first member's medoid start by
+    /// edges between members.
+    fn label_reach(graph: &Graph, store: &LabelStore, base: &Matrix<u8>, label: u32) -> f64 {
+        let members = store.postings(label);
+        let starts = crate::label_starts::build(
+            base,
+            store,
+            crate::label_starts::Strategy::Medoid,
+            &crate::label_starts::Params::default(),
+        )
+        .unwrap();
+        let start = starts.starts[label as usize][0];
+        let is_member = |v: u32| members.binary_search(&v).is_ok();
+        let mut seen = vec![false; graph.n_nodes()];
+        let mut stack = vec![start];
+        seen[start as usize] = true;
+        let mut reached = 0;
+        while let Some(v) = stack.pop() {
+            reached += 1;
+            for &w in graph.neighbors(v) {
+                if !seen[w as usize] && is_member(w) {
+                    seen[w as usize] = true;
+                    stack.push(w);
+                }
+            }
+        }
+        reached as f64 / members.len() as f64
+    }
+
+    /// Share of the data points' out-edges `p → c` with `c` sharing a label with `p` in every
+    /// category of `p`.
+    fn compatible_edge_share(graph: &Graph, store: &LabelStore) -> f64 {
+        let (mut ok, mut all) = (0u64, 0u64);
+        for p in 0..graph.n_data() as u32 {
+            let fp = store.row(p);
+            for &c in graph.neighbors(p) {
+                if c as usize >= graph.n_data() {
+                    continue;
+                }
+                let fc = store.row(c);
+                let cats: std::collections::BTreeSet<u32> =
+                    fp.iter().map(|&l| store.category(l)).collect();
+                let sat = cats
+                    .iter()
+                    .filter(|&&k| {
+                        fp.iter()
+                            .any(|&l| store.category(l) == k && fc.contains(&l))
+                    })
+                    .count();
+                ok += u64::from(sat == cats.len());
+                all += 1;
+            }
+        }
+        ok as f64 / all as f64
+    }
+
+    fn labeled_params(threads: usize, candidates: Candidates, rule: PruneRule) -> BuildParams {
+        BuildParams {
+            rule,
+            l_build: 32,
+            max_batch: 64,
+            threads,
+            candidates,
+            nn_sample: 64,
+            ..BuildParams::default()
+        }
+    }
+
+    #[test]
+    fn zero_penalty_reproduces_the_label_blind_build() {
+        let (base, store) = labeled(1200, 3);
+        let rule = PruneRule::Alpha { r: 16, alpha: 1.2 };
+        let blind = build(&base, None, &labeled_params(2, Candidates::Blind, rule)).unwrap();
+        for key in [PruneKey::Raw, PruneKey::Penalized] {
+            let gen = Candidates::Penalized {
+                lambda: crate::build::Lambda::Relative(0.0),
+                key,
+            };
+            let pen = build(&base, Some(&store), &labeled_params(2, gen, rule)).unwrap();
+            assert_eq!(pen.graph, blind.graph, "{key}");
+            assert_eq!(pen.stats.n_row_merges, 0);
+        }
+    }
+
+    #[test]
+    fn filtered_insertion_makes_a_rare_label_navigable() {
+        let (base, store) = labeled(2000, 7);
+        let rare = store.name_index()["rare"];
+        assert_eq!(store.posting_len(rare), 80);
+        let r = 24;
+        let alpha = PruneRule::Alpha { r, alpha: 1.2 };
+        let blind = build(
+            &base,
+            Some(&store),
+            &labeled_params(2, Candidates::Blind, alpha),
+        )
+        .unwrap();
+        let gen = Candidates::Filtered {
+            subset: crate::build::LabelSubset::Cap(100),
+            budget: None,
+            l_filter: None,
+            order: crate::build::BudgetOrder::Rarest,
+        };
+        let sc = PruneRule::SourceContainment {
+            r,
+            alpha: 1.2,
+            theta: Some(100),
+            budget: None,
+            order: crate::build::BudgetOrder::Rarest,
+        };
+        let one = build(&base, Some(&store), &labeled_params(1, gen, sc)).unwrap();
+        let three = build(&base, Some(&store), &labeled_params(3, gen, sc)).unwrap();
+        assert_eq!(one.graph, three.graph, "independent of the thread count");
+        // Only the rare label is below the cap: one filtered search per rare point.
+        assert_eq!(one.stats.n_filtered_searches, 80);
+        assert_eq!(one.candidates["plan"]["labels_searched"], 1);
+        let reach_blind = label_reach(&blind.graph, &store, &base, rare);
+        let reach_filtered = label_reach(&one.graph, &store, &base, rare);
+        assert!(
+            reach_filtered >= 0.99 && reach_blind < 0.5,
+            "rare label reach: blind {reach_blind}, filtered {reach_filtered}"
+        );
+        // Plain α-prune on the same pools also keeps some label edges, but fewer.
+        let plain = build(&base, Some(&store), &labeled_params(2, gen, alpha)).unwrap();
+        let reach_plain = label_reach(&plain.graph, &store, &base, rare);
+        assert!(reach_plain <= reach_filtered && reach_plain > reach_blind);
+    }
+
+    #[test]
+    fn lexicographic_penalty_links_label_compatible_points() {
+        let (base, store) = labeled(1500, 11);
+        let rule = PruneRule::Alpha { r: 16, alpha: 1.2 };
+        let blind = build(
+            &base,
+            Some(&store),
+            &labeled_params(2, Candidates::Blind, rule),
+        )
+        .unwrap();
+        let gen = |key| Candidates::Penalized {
+            lambda: crate::build::Lambda::Infinite,
+            key,
+        };
+        let raw = build(
+            &base,
+            Some(&store),
+            &labeled_params(2, gen(PruneKey::Raw), rule),
+        )
+        .unwrap();
+        let pen1 = build(
+            &base,
+            Some(&store),
+            &labeled_params(1, gen(PruneKey::Penalized), rule),
+        )
+        .unwrap();
+        let pen3 = build(
+            &base,
+            Some(&store),
+            &labeled_params(3, gen(PruneKey::Penalized), rule),
+        )
+        .unwrap();
+        assert_eq!(pen1.graph, pen3.graph, "independent of the thread count");
+        let (b, r, p) = (
+            compatible_edge_share(&blind.graph, &store),
+            compatible_edge_share(&raw.graph, &store),
+            compatible_edge_share(&pen1.graph, &store),
+        );
+        assert!(
+            b < r && r < p && p > 0.5,
+            "compatible edges: blind {b}, raw {r}, penalized {p}"
+        );
+        assert!(pen1.stats.n_penalty_evals > 0);
+        assert!(pen1.candidates["weight"].as_f64().unwrap() > 4.0 * 255.0 * 255.0 * 8.0);
     }
 
     #[test]
