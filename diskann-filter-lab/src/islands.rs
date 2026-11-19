@@ -26,11 +26,11 @@
 //! search in can be too large to enter.
 //!
 //! These gains score a label as if queried alone. The `queries` selection ([`QuerySample`])
-//! scores it on *base-derived queries* instead — uniformly random sub-predicates of the label
-//! sets of data points drawn uniformly (each of a point's labels kept with probability ½, the
-//! kept labels of a category forming its clause), so that a label is seen with the other
-//! clauses that dilute it, as often as data points carry it: per query the cost of the best
-//! route without islands
+//! scores it on *base-derived queries* instead — random AND-of-ORs sub-predicates of the label
+//! sets of data points drawn uniformly (each of a point's categories kept with probability ½,
+//! its clause one of the point's labels in it or a random subset of them, with equal
+//! probability), so that a label is seen with the other clauses that dilute it, as often as
+//! data points carry it: per query the cost of the best route without islands
 //! (`min(exact, base)` at the query's match count `M`) and of the island of each of its
 //! single-label clauses (rate `M / s` inside it); labels are taken greedily by expected saving
 //! per query per byte given those already taken (a query keeps its cheapest route), while the
@@ -211,15 +211,20 @@ pub fn select_with(gains: &[Gain], budget_bytes: u64, prior: Prior) -> Vec<u32> 
 }
 
 /// Base-derived queries of the `queries` selection: `n_queries` data points drawn uniformly
-/// (seeded); a point's query is a uniformly random AND-of-ORs sub-predicate of its own labels:
-/// each label kept with probability ½ (one at random if none), the kept labels of a category
-/// forming its clause, categories without kept labels absent. The match count of a query is
-/// counted on its smallest clause's members (every `⌈s / cap⌉`-th one beyond `cap`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// (seeded); a point's query is a random AND-of-ORs sub-predicate of its own labels: each of
+/// its categories kept with probability ½ (one at random if none), the clause of a kept
+/// category either one of the point's labels in it (probability `singleton`: a context the
+/// point would match, one value per category) or a random non-empty subset of them (each kept
+/// with probability ½: an OR list). The match count of a query is counted on its smallest
+/// clause's members (every `⌈s / cap⌉`-th one beyond `cap`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct QueryModel {
     pub n_queries: usize,
     pub seed: u64,
     pub cap: usize,
+    /// Probability that a kept category's clause is a single label of the point (else a random
+    /// non-empty subset of its labels in the category).
+    pub singleton: f64,
 }
 
 impl Default for QueryModel {
@@ -228,6 +233,7 @@ impl Default for QueryModel {
             n_queries: 200_000,
             seed: 1,
             cap: 4096,
+            singleton: 0.5,
         }
     }
 }
@@ -299,9 +305,15 @@ impl QuerySample {
         let nf = n as f64;
         let chunk = 1024usize;
         let n_chunks = model.n_queries.div_ceil(chunk);
-        let init = || (Vec::<u32>::new(), Vec::<(usize, usize)>::new());
+        let init = || {
+            (
+                Vec::<u32>::new(),
+                Vec::<(usize, usize)>::new(),
+                Vec::<(usize, usize, bool)>::new(),
+            )
+        };
         let parts = crate::parallel::par_map(n_chunks, threads, init, |ci, scratch| {
-            let (kl, clauses) = scratch;
+            let (kl, clauses, cats) = scratch;
             let mut base = Vec::new();
             let mut recs = Vec::new();
             for qi in ci * chunk..((ci + 1) * chunk).min(model.n_queries) {
@@ -312,32 +324,58 @@ impl QuerySample {
                     base.push(0.0);
                     continue;
                 }
-                // A uniform sub-predicate of the point's labels: each kept with probability ½
-                // (one at random if none); the kept labels of a category form its clause
-                // (contiguous: rows are sorted and a category's label ids are contiguous).
-                kl.clear();
-                let mut word = mix(h);
-                for (x, &l) in row.iter().enumerate() {
-                    if x > 0 && x % 64 == 0 {
-                        word = mix(word ^ x as u64);
-                    }
-                    if (word >> (x % 64)) & 1 == 1 {
-                        kl.push(l);
-                    }
-                }
-                if kl.is_empty() {
-                    kl.push(row[(mix(word) % row.len() as u64) as usize]);
-                }
-                clauses.clear();
+                // The point's categories (contiguous in its sorted row: a category's label ids
+                // are contiguous); each kept with probability ½ (one at random if none), its
+                // clause one of the point's labels in it (probability `singleton`) or a random
+                // non-empty subset of them (each kept with probability ½).
+                cats.clear();
+                let mut z = mix(h);
+                let mut any = false;
                 let mut a = 0;
-                while a < kl.len() {
-                    let cat = labels.category(kl[a]);
+                while a < row.len() {
+                    let cat = labels.category(row[a]);
                     let mut b = a + 1;
-                    while b < kl.len() && labels.category(kl[b]) == cat {
+                    while b < row.len() && labels.category(row[b]) == cat {
                         b += 1;
                     }
-                    clauses.push((a, b));
+                    z = mix(z);
+                    let keep = z & 1 == 1;
+                    any |= keep;
+                    cats.push((a, b, keep));
                     a = b;
+                }
+                if !any {
+                    z = mix(z);
+                    let f = (z % cats.len() as u64) as usize;
+                    cats[f].2 = true;
+                }
+                kl.clear();
+                clauses.clear();
+                for &(a, b, keep) in cats.iter() {
+                    if !keep {
+                        continue;
+                    }
+                    let start = kl.len();
+                    z = mix(z);
+                    let u = (z >> 11) as f64 / (1u64 << 53) as f64;
+                    if u < model.singleton {
+                        z = mix(z);
+                        kl.push(row[a + (z % (b - a) as u64) as usize]);
+                    } else {
+                        for x in a..b {
+                            if (x - a) % 64 == 0 {
+                                z = mix(z);
+                            }
+                            if (z >> ((x - a) % 64)) & 1 == 1 {
+                                kl.push(row[x]);
+                            }
+                        }
+                        if kl.len() == start {
+                            z = mix(z);
+                            kl.push(row[a + (z % (b - a) as u64) as usize]);
+                        }
+                    }
+                    clauses.push((start, kl.len()));
                 }
                 let (kl, clauses): (&Vec<u32>, &Vec<(usize, usize)>) = (kl, clauses);
                 let size = |&(a, b): &(usize, usize)| -> u64 {
@@ -1053,6 +1091,7 @@ mod tests {
             n_queries: 20_000,
             seed: 7,
             cap: 512,
+            singleton: 0.5,
         };
         let one = QuerySample::build(&s, &c, 10, model, 1);
         let three = QuerySample::build(&s, &c, 10, model, 3);

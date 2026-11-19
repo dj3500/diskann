@@ -446,6 +446,10 @@ enum IslandsCommand {
         /// Seed of the base-derived queries.
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// Probability that a base-derived query's clause is a single label of its point (else
+        /// a random subset of the point's labels in the category).
+        #[arg(long, default_value_t = 0.5)]
+        singleton: f64,
         /// Select only: write the selections (`islands-<prior>-b*.selection.json`) without
         /// building islands.
         #[arg(long)]
@@ -1490,6 +1494,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         prior,
         queries,
         seed,
+        singleton,
         dry_run,
         restrict,
     } = c;
@@ -1532,6 +1537,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         let model = islands::QueryModel {
             n_queries: queries,
             seed,
+            singleton,
             ..Default::default()
         };
         let s = islands::QuerySample::build(&store, &costs, k, model, threads);
