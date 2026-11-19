@@ -652,3 +652,92 @@ efforts = [10]
         assert!((mean - 0.5).abs() < 0.02, "{mean}");
     }
 }
+
+#[test]
+fn view_predicates_replace_the_queries_own() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flab-viewpred-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = write_dataset(&dir);
+    // The view `all`: the same labels, one all-match predicate (no clause) per query.
+    d.labels.write(&d.dir.join("labels.all.flab")).unwrap();
+    let mut pb = PredicateSetBuilder::new(&d.labels);
+    for _ in 0..NQ {
+        pb.push::<String>(&[]);
+    }
+    pb.finish().write(&d.dir.join("qa.all.fpred")).unwrap();
+    let text = format!(
+        r#"
+[experiment]
+name = "driver-viewpred"
+dataset = "{ds}"
+graph = "{ds}/graph"
+panel = "panels/p.tsv"
+k = 5
+efforts = [60]
+reps = 1
+mode = "trace"
+runs_dir = "{ds}/runs"
+ledger = "{ds}/ledger.jsonl"
+
+[[config]]
+name = "own"
+preset = "upstream-inline"
+
+[[config]]
+name = "viewonly"
+preset = "upstream-inline"
+view = "all"
+
+[[config]]
+name = "unf"
+preset = "upstream-inline"
+view = "all"
+predicates = "view"
+"#,
+        ds = d.dir.display()
+    );
+    let p = d.dir.join("viewpred.toml");
+    std::fs::write(&p, text).unwrap();
+    let dirs = run::run(&p, &run::Options::default()).unwrap();
+    let get = |name: &str| {
+        let dir = dirs
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(&format!("-{name}-"))
+            })
+            .unwrap();
+        let run: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("run.json")).unwrap()).unwrap();
+        (read_res(&dir.join("res_60.bin")), run)
+    };
+    let ((nq, k, own, _), own_run) = get("own");
+    let ((_, _, viewonly, _), _) = get("viewonly");
+    let ((_, _, unf, _), unf_run) = get("unf");
+    assert_eq!(own, viewonly, "a view alone does not change the filter");
+    assert!(own_run["config"].get("predicates").is_none());
+    assert_eq!(unf_run["config"]["predicates"], "view");
+    let (mut hits, mut outside) = (0, 0);
+    for r in 0..nq {
+        let mut exact: Vec<(f32, u32)> = (0..N as u32)
+            .map(|i| (u8::squared_l2(d.queries.row(r), d.base.row(i as usize)), i))
+            .collect();
+        exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let kth = exact[k - 1].0;
+        let cnf = d.preds.get(r);
+        for &id in &unf[r * k..(r + 1) * k] {
+            hits += usize::from(u8::squared_l2(d.queries.row(r), d.base.row(id as usize)) <= kth);
+            outside += usize::from(!cnf.matches(d.labels.row(id)));
+        }
+    }
+    assert!(
+        hits * 100 >= nq * k * 95,
+        "unfiltered top-{k}: {hits} of {}",
+        nq * k
+    );
+    assert!(outside > 0, "the queries' own predicates were not applied");
+    let _ = std::fs::remove_dir_all(&dir);
+}

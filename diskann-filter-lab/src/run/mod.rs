@@ -514,7 +514,10 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     let set = &ds.qsets[q];
                     Query {
                         vector: set.vectors.row(*i),
-                        cnf: set.preds.get(*i),
+                        cnf: match (&c.view, c.view_predicates) {
+                            (Some(v), true) => set.views[v].get(*i),
+                            _ => set.preds.get(*i),
+                        },
                         view: c.view.as_ref().map(|v| set.views[v].get(*i)),
                     }
                 })
@@ -586,7 +589,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         for (ci, out) in outcomes.into_iter().enumerate() {
             let c = &exp.configs[ci];
             let g = &graphs[&graph_key(c)];
-            let config_json = json!({
+            let mut config_json = json!({
                 "name": c.name,
                 "preset": c.preset,
                 "overrides": c.overrides,
@@ -599,6 +602,9 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     Mode::Trace | Mode::Reference => FastPath::None.name(),
                 },
             });
+            if c.view_predicates {
+                config_json["predicates"] = json!("view");
+            }
             let mut hash_input = json!({
                 "experiment": exp.name, "config": config_json, "K": k, "efforts": out.efforts,
                 "dataset": exp.dataset, "graph": c.graph, "starts": g.starts_path,
