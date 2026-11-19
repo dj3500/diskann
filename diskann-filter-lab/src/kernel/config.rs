@@ -475,6 +475,11 @@ pub struct Kernel {
     /// prefetches its checks; off: each check reads its row at once. The same checks and
     /// answers, only memory timing.
     pub df_pipeline: bool,
+    /// What the `threshold` crossover compares with `T` of `exact`: `min_c U_c` (off, the
+    /// default: the exact path when `min_c U_c ≤ T`) or, on, the sketch estimate `M̂` of the
+    /// match count (the graph route when `M̂ ≥ T`, else the exact path; an ablation that
+    /// separates better match-count estimates from pricing by the cost model).
+    pub threshold_estimate: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -543,6 +548,7 @@ impl Default for Kernel {
             df_lower: false,
             inline_rank: false,
             df_pipeline: false,
+            threshold_estimate: false,
         }
     }
 }
@@ -1051,6 +1057,13 @@ impl Kernel {
                     v => bail!("unknown packed_beam {v:?} (on, off)"),
                 }
             }
+            "threshold_on" => {
+                self.threshold_estimate = match value.trim() {
+                    "bound" => false,
+                    "estimate" => true,
+                    v => bail!("unknown threshold_on {v:?} (bound, estimate)"),
+                }
+            }
             "df_evals" => {
                 self.df_lower = match value.trim() {
                     "lower" => true,
@@ -1176,6 +1189,14 @@ impl Kernel {
                 self.crossover
             );
         }
+        if self.threshold_estimate {
+            ensure!(
+                self.crossover == Crossover::Threshold
+                    && self.estimates == EstimateSource::Sketch
+                    && self.exact.threshold().is_some(),
+                "threshold_on = \"estimate\" needs the threshold crossover, sketch estimates and an exact path with a threshold"
+            );
+        }
         if self.crossover == Crossover::Guarded {
             ensure!(
                 self.collector == Collector::Heap,
@@ -1277,6 +1298,9 @@ impl Kernel {
         }
         if self.row_reads != RowReads::Clause {
             j["row_reads"] = json!(self.row_reads.to_string());
+        }
+        if self.threshold_estimate {
+            j["threshold_on"] = json!("estimate");
         }
         j
     }

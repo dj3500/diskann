@@ -838,14 +838,25 @@ impl Searcher {
             ctr.route = Route::Empty;
             0
         } else if kernel.crossover == Crossover::Threshold {
-            let routed = kernel
-                .exact
-                .threshold()
-                .is_some_and(|t| self.compiled.min_upper_bound() <= t);
+            // `threshold_on = "estimate"`: route on the sketch estimate of the match count (the
+            // graph route when `M̂ ≥ T`); the estimates are then made once, before routing.
+            let pre = kernel
+                .threshold_estimate
+                .then(|| self.estimates(plan, ix, exact_stat, &mut ctr));
+            if let Some(est) = &pre {
+                ctr.m_hat = est.m.round() as u64;
+            }
+            let routed = kernel.exact.threshold().is_some_and(|t| match &pre {
+                Some(est) => est.m < t as f64,
+                None => self.compiled.min_upper_bound() <= t,
+            });
             if routed && kernel.exact.is_planned() {
                 ctr.route = Route::Exact;
                 let costs = plan.costs.as_ref().expect("validated");
-                let est = self.estimates(plan, ix, exact_stat, &mut ctr);
+                let est = match pre {
+                    Some(est) => est,
+                    None => self.estimates(plan, ix, exact_stat, &mut ctr),
+                };
                 let (p, e) = PlanInputs {
                     q: &self.compiled,
                     labels: ix.labels,
@@ -880,7 +891,10 @@ impl Searcher {
             } else {
                 let mut l_run = l;
                 if let Terminator::PostingL { scale } = kernel.terminator {
-                    let est = self.estimates(plan, ix, exact_stat, &mut ctr);
+                    let est = match pre {
+                        Some(est) => est,
+                        None => self.estimates(plan, ix, exact_stat, &mut ctr),
+                    };
                     l_run = planned_l(l, &est, scale);
                 }
                 let t = tic(&ctr);

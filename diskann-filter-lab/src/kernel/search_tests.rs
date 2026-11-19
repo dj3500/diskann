@@ -2430,3 +2430,97 @@ fn df_pipeline_checks_and_answers_as_the_direct_loop() {
     }
     assert!(multi > 0, "the fixture has queries with residual clauses");
 }
+
+#[test]
+fn threshold_on_estimate_routes_on_the_sketch_estimate() {
+    use super::cost::UnitCosts;
+    // Complete sketches make the estimate exact: the graph route iff M ≥ T, else the exact path.
+    let f = fixture(300, 59, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts::default();
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        pairs: None,
+        ..f.index()
+    };
+    let counts: Vec<usize> = (0..f.preds.len())
+        .map(|q| {
+            (0..300u32)
+                .filter(|&p| f.preds.get(q).matches(f.labels.row(p)))
+                .count()
+        })
+        .collect();
+    let mut sorted = counts.clone();
+    sorted.sort_unstable();
+    let t = sorted[sorted.len() / 2].max(1);
+    let base = [
+        ("exact", "planned(0)"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+    ];
+    let mut est = base.to_vec();
+    let threshold = format!("planned({t})");
+    est[0] = ("exact", threshold.as_str());
+    est.push(("threshold_on", "estimate"));
+    let mut bound = est.clone();
+    bound.pop();
+    let mut bound_explicit = bound.clone();
+    bound_explicit.push(("threshold_on", "bound"));
+    let (ke, kb, kx) = (khpad(&est), khpad(&bound), khpad(&bound_explicit));
+    assert_eq!(ke.to_json()["threshold_on"], "estimate");
+    assert_eq!(kb.to_json(), kx.to_json());
+    assert_eq!(kb.to_json().get("threshold_on"), None);
+    let (pe, pb, px) = (
+        Plan::new(&ke, &ix).unwrap(),
+        Plan::new(&kb, &ix).unwrap(),
+        Plan::new(&kx, &ix).unwrap(),
+    );
+    let mut st = Searcher::for_index(&ix, &[&pe, &pb, &px]);
+    let (mut exact, mut graph) = (0, 0);
+    for (q, &m) in counts.iter().enumerate() {
+        for l in [10, 30] {
+            // Off (the default or explicit `bound`): answers and counters are identical.
+            let (ob, cb) = search_ix(&f, &ix, &mut st, &pb, q, l, 10);
+            let (ox, cx) = search_ix(&f, &ix, &mut st, &px, q, l, 10);
+            assert_eq!((ob, cb), (ox, cx), "q={q} L={l}");
+            let (oe, ce) = search_ix(&f, &ix, &mut st, &pe, q, l, 10);
+            if m == 0 {
+                continue;
+            }
+            assert_eq!(
+                ce.m_hat, m as u64,
+                "q={q}: the estimate of a complete sketch"
+            );
+            if m < t {
+                assert_eq!(ce.route, Route::Exact, "q={q}: M = {m} < T = {t}");
+                assert_eq!(oe, f.truth(q, 10), "q={q}");
+                exact += 1;
+            } else {
+                assert_eq!(ce.route, Route::Graph, "q={q}: M = {m} >= T = {t}");
+                check_properties(&f, q, &oe, "threshold_on = estimate");
+                graph += 1;
+            }
+        }
+    }
+    assert!(exact > 0 && graph > 0, "both routes: {exact} / {graph}");
+    // It needs the threshold crossover, sketch estimates and a threshold.
+    for bad in [
+        &[("threshold_on", "estimate")][..],
+        &[
+            ("threshold_on", "estimate"),
+            ("estimates", "sketch"),
+            ("exact", "planned"),
+            ("crossover", "cost"),
+        ][..],
+        &[("threshold_on", "estimate"), ("exact", "planned(10)")][..],
+    ] {
+        let mut k = Kernel::default();
+        for (key, value) in bad {
+            k.set(key, value).unwrap();
+        }
+        assert!(k.validate().is_err(), "{bad:?}");
+    }
+    assert!(Kernel::default().set("threshold_on", "sum").is_err());
+}
