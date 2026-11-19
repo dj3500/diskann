@@ -435,12 +435,12 @@ impl PairIndex {
             let mut free = vec![0u64; N_BINS];
             let mut used = 0u64;
             for lv in level(tk)..N_LEVELS {
-                for b in 0..N_BINS {
-                    let x = lv * N_BINS + b;
-                    if first[x] != 0 {
-                        used += hist[x];
+                let cells = lv * N_BINS..(lv + 1) * N_BINS;
+                for ((f, &h), &s) in free.iter_mut().zip(&hist[cells.clone()]).zip(&first[cells]) {
+                    if s != 0 {
+                        used += h;
                     } else {
-                        free[b] += hist[x];
+                        *f += h;
                     }
                 }
             }
