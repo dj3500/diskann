@@ -435,10 +435,21 @@ enum IslandsCommand {
         #[arg(long)]
         out_dir: PathBuf,
         /// Which labels queries are assumed to search in: `label` (every label equally likely;
-        /// rank by gain per byte) or `data` (as likely as frequent; rank by gain). Files
-        /// `islands-<prior>-b*` for `data`.
+        /// rank by gain per byte), `data` (as likely as frequent; rank by gain) or `queries`
+        /// (base-derived queries: greedy by expected saving per query per byte; terms in
+        /// `gains-queries.tsv`). Files `islands-<prior>-b*` for `data` and `queries`.
         #[arg(long, default_value = "label")]
         prior: islands::Prior,
+        /// Base-derived queries drawn by `--prior queries`.
+        #[arg(long, default_value_t = 200_000)]
+        queries: usize,
+        /// Seed of the base-derived queries.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Select only: write the selections (`islands-<prior>-b*.selection.json`) without
+        /// building islands.
+        #[arg(long)]
+        dry_run: bool,
         /// Only these labels are candidates (a file of label ids, one per line; e.g. a
         /// counterfactual or oracle selection); output files `islands-restricted-b*`.
         #[arg(long)]
@@ -1477,6 +1488,9 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         threads,
         out_dir,
         prior,
+        queries,
+        seed,
+        dry_run,
         restrict,
     } = c;
     let stem = match (prior, &restrict) {
@@ -1485,7 +1499,6 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         (p, None) => format!("islands-{}", p.as_str()),
     };
     let store = LabelStore::read(&dataset.join("labels.flab"))?;
-    let base = Matrix::<T>::read_bin(&run::data::base_file(&dataset)?)?;
     let costs = run::read_costs(&calibration)?;
     std::fs::create_dir_all(&out_dir)?;
     let gains = islands::gains(&store, &costs, k, r);
@@ -1514,15 +1527,84 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         None => gains,
     };
     let unit = 256 * store.n_points() as u64;
+    let sample = (prior == islands::Prior::Queries).then(|| {
+        let t = Instant::now();
+        let model = islands::QueryModel {
+            n_queries: queries,
+            seed,
+            ..Default::default()
+        };
+        let s = islands::QuerySample::build(&store, &costs, k, model, threads);
+        println!(
+            "{queries} base-derived queries in {:.1} s; mean cost without islands {:.0} ns",
+            secs(t),
+            s.mean_base_ns()
+        );
+        s
+    });
+    let cand_set: std::collections::HashSet<u32> = gains.iter().map(|g| g.label).collect();
+    let candidates = |l: u32| cand_set.contains(&l);
     let sels: Vec<(f64, Vec<u32>)> = budget
         .iter()
         .map(|&f| {
-            (
-                f,
-                islands::select_with(&gains, (f * unit as f64) as u64, prior),
-            )
+            let b = (f * unit as f64) as u64;
+            let sel = match &sample {
+                Some(s) => {
+                    let (sel, terms) =
+                        s.select(&store, b, r, |l| restrict.is_none() || candidates(l));
+                    let mut tsv =
+                        String::from("label\tsize\tqueries\talone_ns\tmarginal_ns\tbytes\torder\n");
+                    for t in &terms {
+                        tsv += &format!(
+                            "{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\n",
+                            t.label,
+                            t.size,
+                            t.queries,
+                            t.alone_ns,
+                            t.marginal_ns,
+                            t.bytes,
+                            t.order.map_or(String::new(), |o| o.to_string())
+                        );
+                    }
+                    let tag = (f * 1000.0).round() as u64;
+                    std::fs::write(out_dir.join(format!("gains-queries-b{tag}.tsv")), tsv)
+                        .expect("writing the selection terms");
+                    sel
+                }
+                None => islands::select_with(&gains, b, prior),
+            };
+            (f, sel)
         })
         .collect();
+    if dry_run {
+        for (f, sel) in &sels {
+            let tag = (f * 1000.0).round() as u64;
+            let sizes: Vec<usize> = sel.iter().map(|&l| store.posting_len(l)).collect();
+            let names: Vec<&str> = sel.iter().map(|&l| store.label_name(l)).collect();
+            let bytes: u64 = sizes.iter().map(|&s| islands::island_bytes(s, r)).sum();
+            std::fs::write(
+                out_dir.join(format!("{stem}-b{tag}.selection.json")),
+                serde_json::to_string_pretty(&json!({
+                    "budget_fraction": f,
+                    "budget_bytes": (f * unit as f64) as u64,
+                    "expected_bytes": bytes,
+                    "prior": prior,
+                    "queries": sample.as_ref().map(|s| s.model),
+                    "labels": sel,
+                    "names": names,
+                    "sizes": sizes,
+                }))? + "\n",
+            )?;
+            println!(
+                "budget {f}: {} labels, {} members, {:.1} MiB expected",
+                sel.len(),
+                sizes.iter().sum::<usize>(),
+                bytes as f64 / (1u64 << 20) as f64
+            );
+        }
+        return Ok(());
+    }
+    let base = Matrix::<T>::read_bin(&run::data::base_file(&dataset)?)?;
     let mut all: Vec<u32> = sels.iter().flat_map(|(_, s)| s.iter().copied()).collect();
     all.sort_unstable();
     all.dedup();
@@ -1566,6 +1648,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
             "dataset": dataset,
             "calibration": calibration,
             "prior": prior,
+            "queries": sample.as_ref().map(|s| s.model),
             "restrict": restrict,
             "n_points": store.n_points(),
             "budget_fraction": f,

@@ -25,6 +25,17 @@
 //! labels win (a large budget fills with many of them); at 40M the labels that diluted queries
 //! search in can be too large to enter.
 //!
+//! These gains score a label as if queried alone. The `queries` selection ([`QuerySample`])
+//! scores it on *base-derived queries* instead — uniformly random sub-predicates of the label
+//! sets of data points drawn uniformly (each of a point's labels kept with probability ½, the
+//! kept labels of a category forming its clause), so that a label is seen with the other
+//! clauses that dilute it, as often as data points carry it: per query the cost of the best
+//! route without islands
+//! (`min(exact, base)` at the query's match count `M`) and of the island of each of its
+//! single-label clauses (rate `M / s` inside it); labels are taken greedily by expected saving
+//! per query per byte given those already taken (a query keeps its cheapest route), while the
+//! budget lasts. No query log and no category name is read.
+//!
 //! Build: the lab's Vamana builder ([`crate::build::build`], label-blind α-RobustPrune) over each
 //! selected label's member vectors, one island per thread. Local ids are positions in the
 //! label's posting list; the builder's auxiliary start node (a copy of the medoid) is merged
@@ -136,6 +147,9 @@ pub enum Prior {
     Label,
     /// A label as likely as it is frequent: rank by gain.
     Data,
+    /// Base-derived queries ([`QuerySample`]): greedy by expected saving per byte over a sample
+    /// of predicates made of data points' own labels.
+    Queries,
 }
 
 impl Prior {
@@ -143,12 +157,13 @@ impl Prior {
         match self {
             Self::Label => "label",
             Self::Data => "data",
+            Self::Queries => "queries",
         }
     }
 
     fn key(self, g: &Gain) -> f64 {
         match self {
-            Self::Label => g.gain_ns / g.bytes as f64,
+            Self::Label | Self::Queries => g.gain_ns / g.bytes as f64,
             Self::Data => g.gain_ns,
         }
     }
@@ -161,7 +176,8 @@ impl std::str::FromStr for Prior {
         match s {
             "label" => Ok(Self::Label),
             "data" => Ok(Self::Data),
-            _ => anyhow::bail!("unknown island prior {s:?} (label, data)"),
+            "queries" => Ok(Self::Queries),
+            _ => anyhow::bail!("unknown island prior {s:?} (label, data, queries)"),
         }
     }
 }
@@ -192,6 +208,332 @@ pub fn select_with(gains: &[Gain], budget_bytes: u64, prior: Prior) -> Vec<u32> 
     }
     out.sort_unstable();
     out
+}
+
+/// Base-derived queries of the `queries` selection: `n_queries` data points drawn uniformly
+/// (seeded); a point's query is a uniformly random AND-of-ORs sub-predicate of its own labels:
+/// each label kept with probability ½ (one at random if none), the kept labels of a category
+/// forming its clause, categories without kept labels absent. The match count of a query is
+/// counted on its smallest clause's members (every `⌈s / cap⌉`-th one beyond `cap`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct QueryModel {
+    pub n_queries: usize,
+    pub seed: u64,
+    pub cap: usize,
+}
+
+impl Default for QueryModel {
+    fn default() -> Self {
+        Self {
+            n_queries: 200_000,
+            seed: 1,
+            cap: 4096,
+        }
+    }
+}
+
+#[inline]
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Whether the sorted `row` holds one of the sorted `clause`'s labels.
+#[inline]
+fn meets(row: &[u32], clause: &[u32]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < row.len() && j < clause.len() {
+        match row[i].cmp(&clause[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+/// The island candidates of a sample of base-derived queries: for every query, the cost of
+/// its best route without islands (`min(exact, base)` of the module documentation, with the
+/// query's match count `M` and smallest clause `s_min`: `exact = s_min · pred + M · dist`,
+/// `base` the post-filter route at rate `M / n`) and, for every single-label clause `ℓ` whose
+/// island would be cheaper, that island's cost (the post-filter route on `|P_ℓ|` points at
+/// rate `M / |P_ℓ|`).
+#[derive(Debug, Clone)]
+pub struct QuerySample {
+    pub model: QueryModel,
+    /// Cost of each query's best route without islands.
+    pub base_ns: Vec<f64>,
+    /// `(label, query, island cost)` of the cheaper islands, by label.
+    recs: Vec<(u32, u32, f32)>,
+}
+
+/// One label of the `queries` selection.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct QueryGain {
+    pub label: u32,
+    pub size: usize,
+    /// Sampled queries with this label as a single-label clause and a cheaper island.
+    pub queries: u32,
+    /// Expected saving per query (ns) of this island alone.
+    pub alone_ns: f64,
+    /// Expected saving per query added when selected (ns; 0 if not selected).
+    pub marginal_ns: f64,
+    pub bytes: u64,
+    /// Position in the greedy order (`None`: not selected).
+    pub order: Option<u32>,
+}
+
+impl QuerySample {
+    /// Draws the queries and computes their cost terms (with up to `threads` threads; the
+    /// result does not depend on the thread count).
+    pub fn build(
+        labels: &LabelStore,
+        c: &UnitCosts,
+        k: usize,
+        model: QueryModel,
+        threads: usize,
+    ) -> Self {
+        let n = labels.n_points();
+        let nf = n as f64;
+        let chunk = 1024usize;
+        let n_chunks = model.n_queries.div_ceil(chunk);
+        let init = || (Vec::<u32>::new(), Vec::<(usize, usize)>::new());
+        let parts = crate::parallel::par_map(n_chunks, threads, init, |ci, scratch| {
+            let (kl, clauses) = scratch;
+            let mut base = Vec::new();
+            let mut recs = Vec::new();
+            for qi in ci * chunk..((ci + 1) * chunk).min(model.n_queries) {
+                let h = mix(model.seed ^ mix(qi as u64));
+                let p = (h % n as u64) as u32;
+                let row = labels.row(p);
+                if row.is_empty() {
+                    base.push(0.0);
+                    continue;
+                }
+                // A uniform sub-predicate of the point's labels: each kept with probability ½
+                // (one at random if none); the kept labels of a category form its clause
+                // (contiguous: rows are sorted and a category's label ids are contiguous).
+                kl.clear();
+                let mut word = mix(h);
+                for (x, &l) in row.iter().enumerate() {
+                    if x > 0 && x % 64 == 0 {
+                        word = mix(word ^ x as u64);
+                    }
+                    if (word >> (x % 64)) & 1 == 1 {
+                        kl.push(l);
+                    }
+                }
+                if kl.is_empty() {
+                    kl.push(row[(mix(word) % row.len() as u64) as usize]);
+                }
+                clauses.clear();
+                let mut a = 0;
+                while a < kl.len() {
+                    let cat = labels.category(kl[a]);
+                    let mut b = a + 1;
+                    while b < kl.len() && labels.category(kl[b]) == cat {
+                        b += 1;
+                    }
+                    clauses.push((a, b));
+                    a = b;
+                }
+                let (kl, clauses): (&Vec<u32>, &Vec<(usize, usize)>) = (kl, clauses);
+                let size = |&(a, b): &(usize, usize)| -> u64 {
+                    kl[a..b].iter().map(|&l| labels.posting_len(l) as u64).sum()
+                };
+                let (jmin, s_min) = clauses
+                    .iter()
+                    .enumerate()
+                    .map(|(j, r)| (j, size(r)))
+                    .min_by_key(|&(_, s)| s)
+                    .expect("a clause");
+                // Match count: every `stride`-th member of the smallest clause (each member
+                // once: counted at the first of the clause's labels in its row) checked
+                // against the other clauses.
+                let m = if clauses.len() == 1 {
+                    s_min as f64
+                } else {
+                    let (a0, b0) = clauses[jmin];
+                    let cl0 = &kl[a0..b0];
+                    let stride = (s_min as usize).div_ceil(model.cap).max(1);
+                    let (mut seen, mut hit, mut pos) = (0u64, 0u64, 0usize);
+                    for (x, &l) in cl0.iter().enumerate() {
+                        let post = labels.postings(l);
+                        let first = (stride - pos % stride) % stride;
+                        for &v in post.iter().skip(first).step_by(stride) {
+                            let vr = labels.row(v);
+                            if cl0[..x].iter().any(|&e| vr.binary_search(&e).is_ok()) {
+                                continue;
+                            }
+                            seen += 1;
+                            if clauses
+                                .iter()
+                                .enumerate()
+                                .all(|(j, &(a, b))| j == jmin || meets(vr, &kl[a..b]))
+                            {
+                                hit += 1;
+                            }
+                        }
+                        pos += post.len();
+                    }
+                    (hit as f64 * s_min as f64 / seen.max(1) as f64).max(1.0)
+                };
+                let rho_min = s_min as f64 / nf;
+                let checks = if clauses.len() > 1 {
+                    s_min as f64 * c.pred(rho_min)
+                } else {
+                    0.0
+                };
+                let exact = checks + m * c.dist(m / nf);
+                let graph = postfilter_nominal(c, k, k, m / nf, n, 1).1;
+                let cur = exact.min(graph);
+                base.push(cur);
+                for &(a, b) in clauses {
+                    let mut nonempty = kl[a..b].iter().filter(|&&l| labels.posting_len(l) > 0);
+                    if let (Some(&l), None) = (nonempty.next(), nonempty.next()) {
+                        let s = labels.posting_len(l);
+                        if s < MIN_SIZE || s >= n {
+                            continue;
+                        }
+                        let isl = postfilter_nominal(c, k, k, (m / s as f64).min(1.0), s, 1).1;
+                        if isl < cur {
+                            recs.push((l, qi as u32, isl as f32));
+                        }
+                    }
+                }
+            }
+            (base, recs)
+        });
+        let mut base_ns = Vec::with_capacity(model.n_queries);
+        let mut recs = Vec::new();
+        for (b, r) in parts {
+            base_ns.extend(b);
+            recs.extend(r);
+        }
+        recs.sort_unstable_by_key(|&(l, q, _)| (l, q));
+        Self {
+            model,
+            base_ns,
+            recs,
+        }
+    }
+
+    /// Greedy selection within `budget_bytes` (islands of degree bound `r`): repeatedly the
+    /// label with the largest expected saving per byte given the labels already taken (a
+    /// query's cost is that of its cheapest route, the selected islands included), skipping
+    /// labels that no longer fit; candidates limited by `keep`. Returns the labels in label-id
+    /// order and every candidate's terms.
+    pub fn select(
+        &self,
+        labels: &LabelStore,
+        budget_bytes: u64,
+        r: usize,
+        keep: impl Fn(u32) -> bool,
+    ) -> (Vec<u32>, Vec<QueryGain>) {
+        let nq = self.base_ns.len().max(1) as f64;
+        let mut cur = self.base_ns.clone();
+        // Candidate ranges of `recs`.
+        let mut cands: Vec<(u32, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < self.recs.len() {
+            let l = self.recs[i].0;
+            let mut j = i;
+            while j < self.recs.len() && self.recs[j].0 == l {
+                j += 1;
+            }
+            if keep(l) {
+                cands.push((l, i, j));
+            }
+            i = j;
+        }
+        let gain = |cur: &[f64], a: usize, b: usize| -> f64 {
+            self.recs[a..b]
+                .iter()
+                .map(|&(_, q, isl)| (cur[q as usize] - f64::from(isl)).max(0.0))
+                .sum()
+        };
+        let mut terms: Vec<QueryGain> = cands
+            .iter()
+            .map(|&(l, a, b)| {
+                let s = labels.posting_len(l);
+                QueryGain {
+                    label: l,
+                    size: s,
+                    queries: (b - a) as u32,
+                    alone_ns: gain(&cur, a, b) / nq,
+                    marginal_ns: 0.0,
+                    bytes: island_bytes(s, r),
+                    order: None,
+                }
+            })
+            .collect();
+        // Lazy greedy on saving per byte (savings only shrink as islands are taken).
+        let mut heap: std::collections::BinaryHeap<(OrdF64, std::cmp::Reverse<u32>, usize)> = terms
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.alone_ns > 0.0)
+            .map(|(x, t)| {
+                (
+                    OrdF64(t.alone_ns / t.bytes as f64),
+                    std::cmp::Reverse(t.label),
+                    x,
+                )
+            })
+            .collect();
+        let mut used = 0u64;
+        let mut order = 0u32;
+        let mut out = Vec::new();
+        while let Some((OrdF64(key), lab, x)) = heap.pop() {
+            let (_, a, b) = cands[x];
+            let g = gain(&cur, a, b) / nq;
+            let now = g / terms[x].bytes as f64;
+            if now < key * (1.0 - 1e-12) {
+                if g > 0.0 {
+                    heap.push((OrdF64(now), lab, x));
+                }
+                continue;
+            }
+            if g <= 0.0 || used + terms[x].bytes > budget_bytes {
+                continue;
+            }
+            used += terms[x].bytes;
+            terms[x].marginal_ns = g;
+            terms[x].order = Some(order);
+            order += 1;
+            out.push(terms[x].label);
+            for &(_, q, isl) in &self.recs[a..b] {
+                let c = &mut cur[q as usize];
+                *c = c.min(f64::from(isl));
+            }
+        }
+        out.sort_unstable();
+        (out, terms)
+    }
+
+    /// Expected cost per query (ns) without islands.
+    pub fn mean_base_ns(&self) -> f64 {
+        self.base_ns.iter().sum::<f64>() / self.base_ns.len().max(1) as f64
+    }
+}
+
+/// `f64` with a total order (for the selection heap).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OrdF64(f64);
+
+impl Eq for OrdF64 {}
+
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for OrdF64 {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&o.0)
+    }
 }
 
 /// Per-label sub-graphs (see the module documentation).
@@ -681,5 +1023,66 @@ mod tests {
             select_with(&big, island_bytes(1000, 32), Prior::Data),
             vec![1]
         );
+    }
+    #[test]
+    fn base_derived_queries_pick_the_diluted_label_and_account_their_savings() {
+        // 20,000 points in three categories: `m` (m0 on 0..2,000 and m1 on 2,000..4,000),
+        // `d` (d0 on even points, d1 on odd ones) and `g` (g0, g1 on two blocks of 200 points
+        // inside m0). Queries with m0 or m1 are diluted by d (and g): the islands of m0 / m1
+        // save more per byte than those of the small g labels, whose exact path is cheap.
+        let n = 20_000u32;
+        let mut b = LabelStoreBuilder::new();
+        for p in 0..n {
+            let mut v = vec![("d", if p % 2 == 0 { "d0" } else { "d1" })];
+            if p < 2000 {
+                v.push(("m", "m0"));
+            } else if p < 4000 {
+                v.push(("m", "m1"));
+            }
+            if (100..300).contains(&p) {
+                v.push(("g", "g0"));
+            } else if (500..700).contains(&p) {
+                v.push(("g", "g1"));
+            }
+            b.push_point(v).unwrap();
+        }
+        let s = b.finish().unwrap();
+        let id = s.name_index();
+        let c = UnitCosts::default();
+        let model = QueryModel {
+            n_queries: 20_000,
+            seed: 7,
+            cap: 512,
+        };
+        let one = QuerySample::build(&s, &c, 10, model, 1);
+        let three = QuerySample::build(&s, &c, 10, model, 3);
+        assert_eq!(
+            one.base_ns, three.base_ns,
+            "independent of the thread count"
+        );
+        assert_eq!(one.recs, three.recs);
+        // Room for one m island: the diluted market wins over the small, exact-cheap g labels.
+        let (sel, terms) = one.select(&s, island_bytes(2000, 32), 32, |_| true);
+        assert_eq!(sel.len(), 1, "{terms:?}");
+        assert!(sel[0] == id["m0"] || sel[0] == id["m1"], "{terms:?}");
+        // Everything fits: the savings add up to the drop in the expected cost per query.
+        let (all, terms) = one.select(&s, u64::MAX, 32, |_| true);
+        assert!(all.contains(&id["m0"]) && all.contains(&id["m1"]));
+        let mut cur = one.base_ns.clone();
+        for &(l, q, isl) in &one.recs {
+            if all.binary_search(&l).is_ok() {
+                cur[q as usize] = cur[q as usize].min(f64::from(isl));
+            }
+        }
+        let drop = (one.base_ns.iter().sum::<f64>() - cur.iter().sum::<f64>()) / 20_000.0;
+        let summed: f64 = terms.iter().map(|t| t.marginal_ns).sum();
+        assert!(
+            (drop - summed).abs() <= 1e-6 * drop.max(1.0),
+            "{drop} vs {summed}"
+        );
+        // Candidates can be limited; the budget is respected.
+        let (none, _) = one.select(&s, u64::MAX, 32, |l| l == id["g0"]);
+        assert!(none.iter().all(|&l| l == id["g0"]));
+        assert!(one.select(&s, 10, 32, |_| true).0.is_empty());
     }
 }

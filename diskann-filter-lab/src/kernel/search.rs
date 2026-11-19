@@ -1221,8 +1221,12 @@ impl Searcher {
             l: l_run,
             postfilter: postfilter && island.is_none(),
             postfilter_configured: postfilter && kernel.postfilter_starts.configured_at(rate),
-            postfilter_late: postfilter && island.is_none() && kernel.postfilter_starts.late_at(rate),
-            postfilter_both: postfilter && island.is_none() && kernel.postfilter_starts.both_at(rate),
+            postfilter_late: postfilter
+                && island.is_none()
+                && kernel.postfilter_starts.late_at(rate),
+            postfilter_both: postfilter
+                && island.is_none()
+                && kernel.postfilter_starts.both_at(rate),
             island: if exact { None } else { island },
         }
     }
