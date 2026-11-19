@@ -115,6 +115,14 @@ fn append_ledger(path: &Path, line: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The draw in [0, 1) of row `row` of a `mix` configuration (splitmix64 of `seed ^ row·φ`).
+pub fn mix_draw(seed: u64, row: usize) -> f64 {
+    let mut z = seed ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// A seeded shuffle (SplitMix64 + Fisher–Yates).
 fn shuffle<T>(items: &mut [T], seed: u64) {
     let mut state = seed;
@@ -825,7 +833,8 @@ fn counter_docs() -> Value {
 
 /// Whether a configuration's exact path or probe uses the static bitsets.
 fn uses_exact_bitsets(c: &ConfigSpec) -> bool {
-    c.kernel.exact.is_planned() || c.kernel.estimates == EstimateSource::Sketch
+    !c.kernel.static_bitsets_off
+        && (c.kernel.exact.is_planned() || c.kernel.estimates == EstimateSource::Sketch)
 }
 
 /// Whether a configuration reads the unit costs.
@@ -942,6 +951,17 @@ fn run_k<T: Element>(
                         let mut phases = [0u64; profile::SLOTS];
                         profile::take();
                         for (row, q) in cx.queries[ci].iter().enumerate() {
+                            let (plan, ix, q, l_run) = match &c.mix {
+                                Some(m) => {
+                                    let (j, lj) = if mix_draw(m.seed, row) < m.p {
+                                        m.a
+                                    } else {
+                                        m.b
+                                    };
+                                    (&cx.plans[j], &cx.indices[j], &cx.queries[j][row], lj)
+                                }
+                                None => (plan, ix, q, l),
+                            };
                             let (ids, dists): (&mut [u32], &mut [f32]) = if rep == 0 {
                                 (
                                     &mut out.ids.get_mut(&l).expect("effort")
@@ -953,12 +973,12 @@ fn run_k<T: Element>(
                                 (&mut tmp_ids, &mut tmp_d)
                             };
                             if exp.hot {
-                                st.search(plan, ix, q, l, &mut hot_ids, &mut hot_d, None);
+                                st.search(plan, ix, q, l_run, &mut hot_ids, &mut hot_d, None);
                                 profile::take();
                             }
                             let cpu0 = sys::thread_cpu_ns();
                             let wall0 = Instant::now();
-                            let ctr = st.search(plan, ix, q, l, ids, dists, None);
+                            let ctr = st.search(plan, ix, q, l_run, ids, dists, None);
                             let wall = wall0.elapsed().as_nanos() as u64;
                             let cpu = sys::thread_cpu_ns() - cpu0;
                             if profile::ENABLED {

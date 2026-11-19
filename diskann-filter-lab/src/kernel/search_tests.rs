@@ -2524,3 +2524,133 @@ fn threshold_on_estimate_routes_on_the_sketch_estimate() {
     }
     assert!(Kernel::default().set("threshold_on", "sum").is_err());
 }
+
+#[test]
+fn postfilter_always_under_threshold_is_the_route_at_the_fixed_list() {
+    use super::cost::UnitCosts;
+    // The threshold router with `postfilter = "always"`: the same exact side, and the graph side
+    // is the post-filter route at the effort's list (heap(K) over the evaluated nodes).
+    let f = fixture(300, 61, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts::default();
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        pairs: None,
+        ..f.index()
+    };
+    let inline = [("exact", "planned(150)"), ("laziness", "heap_bound")];
+    let mut pf = inline.to_vec();
+    pf.push(("postfilter", "always"));
+    let mut conf = pf.clone();
+    conf.push(("postfilter_starts", "configured"));
+    let mut est = pf.clone();
+    est.extend([
+        ("threshold_on", "estimate"),
+        ("estimates", "sketch"),
+        ("postfilter_starts", "by_rate_both_k"),
+    ]);
+    let kernels = [khpad(&inline), khpad(&pf), khpad(&conf), khpad(&est)];
+    let plans: Vec<Plan> = kernels.iter().map(|k| Plan::new(k, &ix).unwrap()).collect();
+    let refs: Vec<&Plan> = plans.iter().collect();
+    let mut st = Searcher::for_index(&ix, &refs);
+    let (mut exact, mut routed, mut second) = (0, 0, 0);
+    for q in 0..f.preds.len() {
+        for l in [20, 300] {
+            let (oi, ci) = search_ix(&f, &ix, &mut st, &plans[0], q, l, 10);
+            let (op, cp) = search_ix(&f, &ix, &mut st, &plans[1], q, l, 10);
+            if ci.route != Route::Graph {
+                assert_eq!((&op, &cp), (&oi, &ci), "q={q} L={l}: the exact side");
+                exact += usize::from(ci.route == Route::Exact);
+                continue;
+            }
+            assert_eq!(ci.route, Route::Graph, "q={q}");
+            assert_eq!(cp.route, Route::Postfilter, "q={q}");
+            check_properties(&f, q, &op, "threshold + postfilter");
+            if l == 300 {
+                // The whole graph evaluated: the K nearest matches.
+                assert_eq!(op, f.truth(q, 10), "q={q}");
+            }
+            routed += 1;
+            let (oc, cc) = search_ix(&f, &ix, &mut st, &plans[2], q, l, 10);
+            assert_eq!(cc.route, Route::Postfilter, "q={q}");
+            check_properties(&f, q, &oc, "configured starts");
+            let (oe, ce) = search_ix(&f, &ix, &mut st, &plans[3], q, l, 10);
+            check_properties(&f, q, &oe, "estimate + by_rate_both_k");
+            second += usize::from(ce.route == Route::Postfilter && ce.n_late > 0);
+        }
+    }
+    assert!(exact > 0 && routed > 0, "both routes: {exact} / {routed}");
+    assert!(second > 0, "no second search");
+    // Only `always`; rate-dependent starts need the estimate.
+    for bad in [
+        &[("exact", "planned(10)"), ("postfilter", "cost")][..],
+        &[
+            ("exact", "planned(10)"),
+            ("postfilter", "always"),
+            ("postfilter_starts", "by_rate"),
+        ][..],
+    ] {
+        let mut k = Kernel::default();
+        for (key, value) in bad {
+            k.set(key, value).unwrap();
+        }
+        assert!(k.validate().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn static_bitsets_off_is_an_index_without_them() {
+    use super::cost::UnitCosts;
+    // The hybrid (exact path, probe, post-filter route) with `static_bitsets = "off"` on an
+    // index with the static bitsets answers and counts as on an index without them.
+    let f = fixture(300, 67, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts::default();
+    let with = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        pairs: None,
+        ..f.index()
+    };
+    let without = Index {
+        bitsets: None,
+        ..with
+    };
+    let base = [
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", "cost"),
+    ];
+    let mut off = base.to_vec();
+    off.push(("static_bitsets", "off"));
+    let (kb, ko) = (khpad(&base), khpad(&off));
+    assert_eq!(ko.to_json()["static_bitsets"], "off");
+    assert_eq!(kb.to_json().get("static_bitsets"), None);
+    let (pb, po, pw) = (
+        Plan::new(&kb, &with).unwrap(),
+        Plan::new(&ko, &with).unwrap(),
+        Plan::new(&kb, &without).unwrap(),
+    );
+    let mut st = Searcher::for_index(&with, &[&pb, &po, &pw]);
+    let mut differ = 0;
+    for q in 0..f.preds.len() {
+        for l in [20, 60] {
+            let (oo, co) = search_ix(&f, &with, &mut st, &po, q, l, 10);
+            let (ow, cw) = search_ix(&f, &without, &mut st, &pw, q, l, 10);
+            assert_eq!((&oo, &co), (&ow, &cw), "q={q} L={l}");
+            let (_, cb) = search_ix(&f, &with, &mut st, &pb, q, l, 10);
+            differ += usize::from(cb != co);
+        }
+    }
+    assert!(differ > 0, "the bitsets were used without the flag");
+    let mut k = Kernel::default();
+    k.set("static_bitsets", "off").unwrap();
+    k.validate().unwrap();
+    k.set("predicate", "static_bits(1)").unwrap();
+    assert!(k.validate().is_err());
+    assert!(Kernel::default().set("static_bitsets", "no").is_err());
+}

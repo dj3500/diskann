@@ -480,6 +480,11 @@ pub struct Kernel {
     /// match count (the graph route when `M̂ ≥ T`, else the exact path; an ablation that
     /// separates better match-count estimates from pricing by the cost model).
     pub threshold_estimate: bool,
+    /// `static_bitsets = "off"`: the exact path, the probe and the post-filter route check
+    /// clauses on the label rows, never with the static bitsets (the plans keep their forms
+    /// without them: `bitmap` scatters postings, `rowand` gallops); an ablation of the stored
+    /// dense rows.
+    pub static_bitsets_off: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -549,6 +554,7 @@ impl Default for Kernel {
             inline_rank: false,
             df_pipeline: false,
             threshold_estimate: false,
+            static_bitsets_off: false,
         }
     }
 }
@@ -1057,6 +1063,13 @@ impl Kernel {
                     v => bail!("unknown packed_beam {v:?} (on, off)"),
                 }
             }
+            "static_bitsets" => {
+                self.static_bitsets_off = match value.trim() {
+                    "on" => false,
+                    "off" => true,
+                    v => bail!("unknown static_bitsets {v:?} (on, off)"),
+                }
+            }
             "threshold_on" => {
                 self.threshold_estimate = match value.trim() {
                     "bound" => false,
@@ -1203,7 +1216,18 @@ impl Kernel {
                 "the guarded crossover needs the heap collector (its answers seed the fallback)"
             );
         }
-        if self.postfilter != PostfilterRoute::Off {
+        if self.postfilter != PostfilterRoute::Off && self.crossover == Crossover::Threshold {
+            // The graph side of the threshold router is the post-filter route at the fixed list.
+            ensure!(
+                self.postfilter == PostfilterRoute::Always
+                    && (self.threshold_estimate
+                        || matches!(
+                            self.postfilter_starts,
+                            PostfilterStarts::Global | PostfilterStarts::Configured
+                        )),
+                "under the threshold crossover the post-filter route is `always`, and its rate-dependent starts need threshold_on = \"estimate\""
+            );
+        } else if self.postfilter != PostfilterRoute::Off {
             ensure!(
                 matches!(
                     self.crossover,
@@ -1215,6 +1239,12 @@ impl Kernel {
         if let PredicateMode::StaticBits(t) = self.predicate {
             ensure!(t >= 1, "static_bits(θ) needs θ >= 1");
         }
+        ensure!(
+            !self.static_bitsets_off
+                || !(matches!(self.predicate, PredicateMode::StaticBits(_))
+                    || self.materializer == Materializer::DenseStatic),
+            "static_bitsets = \"off\" excludes the static_bits predicate and the dense_static materializer"
+        );
         let bitmap = self.predicate == PredicateMode::Bitmap;
         ensure!(
             bitmap == (self.materializer != Materializer::None),
@@ -1301,6 +1331,9 @@ impl Kernel {
         }
         if self.threshold_estimate {
             j["threshold_on"] = json!("estimate");
+        }
+        if self.static_bitsets_off {
+            j["static_bitsets"] = json!("off");
         }
         j
     }

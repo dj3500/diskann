@@ -494,6 +494,7 @@ impl Plan {
             );
         }
         let exact_eval = if ix.bitsets.is_some()
+            && !kernel.static_bitsets_off
             && (kernel.exact.is_planned() || kernel.estimates == EstimateSource::Sketch)
         {
             ExactEval::StaticBits
@@ -888,6 +889,30 @@ impl Searcher {
                     &mut ctr,
                 );
                 self.answers.finish(ids, dists)
+            } else if kernel.postfilter == PostfilterRoute::Always {
+                // The post-filter route at the fixed list `l` (no list planning); rate-dependent
+                // starts on the sketch estimate (`threshold_on = "estimate"`).
+                let rate = pre
+                    .as_ref()
+                    .map_or(1.0, |e| if e.n > 0.0 { e.m / e.n } else { 0.0 });
+                let s = kernel.postfilter_starts;
+                let both = s.both_at(rate);
+                let t = tic(&ctr);
+                let n = self.postfilter(
+                    plan,
+                    ix,
+                    q,
+                    l,
+                    s.configured_at(rate),
+                    s.late_at(rate) || both,
+                    both.then(|| s.second_list(l, k)),
+                    exact_stat,
+                    &mut ctr,
+                    ids,
+                    dists,
+                );
+                toc(t, &mut ctr.t_graph_ns);
+                n
             } else {
                 let mut l_run = l;
                 if let Terminator::PostingL { scale } = kernel.terminator {

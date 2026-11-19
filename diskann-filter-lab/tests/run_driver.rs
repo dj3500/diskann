@@ -569,3 +569,86 @@ efforts = [10]
     assert!(lines.iter().filter(|l| l["status"] == "ok").count() >= 8);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn mix_runs_each_row_with_one_of_its_configurations() {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("flab-mix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = write_dataset(&dir);
+    let text = format!(
+        r#"
+[experiment]
+name = "driver-mix"
+dataset = "{ds}"
+graph = "{ds}/graph"
+panel = "panels/p.tsv"
+k = 5
+efforts = [10, 30]
+reps = 2
+mode = "timed"
+runs_dir = "{ds}/runs"
+ledger = "{ds}/ledger.jsonl"
+
+[[config]]
+name = "post"
+preset = "postfilter"
+
+[[config]]
+name = "inline"
+preset = "upstream-inline"
+
+[[config]]
+name = "mix"
+mix = "post@30 inline@10 0.5 7"
+efforts = [10]
+"#,
+        ds = d.dir.display()
+    );
+    let p = d.dir.join("mix.toml");
+    std::fs::write(&p, text).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: as in `driver_writes_the_run_format` (this thread pinned to its CPU).
+        let dirs = unsafe {
+            let mut old: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut old);
+            let mut one: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(libc::sched_getcpu() as usize, &mut one);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &one);
+            let dirs = run::run(&p, &run::Options::default());
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &old);
+            dirs.unwrap()
+        };
+        let res = |name: &str, l: usize| {
+            let dir = dirs
+                .iter()
+                .find(|p| {
+                    let dir = p.file_name().unwrap().to_string_lossy();
+                    dir.contains(&format!("-{name}-"))
+                })
+                .unwrap();
+            read_res(&dir.join(format!("res_{l}.bin")))
+        };
+        let (nq, k, mix, _) = res("mix", 10);
+        let (_, _, post, _) = res("post", 30);
+        let (_, _, inline, _) = res("inline", 10);
+        let mut first = 0;
+        for r in 0..nq {
+            let a = run::mix_draw(7, r) < 0.5;
+            let want = if a { &post } else { &inline };
+            assert_eq!(
+                &mix[r * k..(r + 1) * k],
+                &want[r * k..(r + 1) * k],
+                "row {r}"
+            );
+            first += usize::from(a);
+        }
+        assert!(
+            first > 0 && first < nq,
+            "both configurations: {first} of {nq}"
+        );
+        let mean = (0..10_000).map(|r| run::mix_draw(3, r)).sum::<f64>() / 1e4;
+        assert!((mean - 0.5).abs() < 0.02, "{mean}");
+    }
+}

@@ -48,6 +48,11 @@
 //! calibration = "<costs.json>"     # per-configuration unit costs (e.g. another calibration)
 //! sketches_sidecar = "<sketches.flab>" # per-configuration sketches (e.g. another priority seed)
 //! pairs_sidecar = "<pairs.flab>"   # per-configuration combination postings (e.g. a budget)
+//!
+//! [[config]]                       # timed mode: a per-query mixture of two earlier configurations
+//! name = "mix"                     # on one graph, each row runs the first at its effort with
+//! mix = "inline@100 inline+label-starts+heap@20 0.25 7" # probability p (seeded draw per row,
+//! efforts = [100]                  # `mix_draw`), else the second; `efforts`: one label effort
 //! ```
 
 use std::{
@@ -149,6 +154,19 @@ pub struct ConfigSpec {
     pub pairs_sidecar: Option<PathBuf>,
     /// The overrides as given (for the record).
     pub overrides: BTreeMap<String, String>,
+    /// A per-query mixture of two earlier configurations (`mix`; this configuration is a copy
+    /// of the first).
+    pub mix: Option<Mix>,
+}
+
+/// `mix = "<a>@<La> <b>@<Lb> <p> <seed>"`: each row runs configuration `a` at effort `La` when
+/// its seeded draw is below `p`, else `b` at `Lb`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mix {
+    pub a: (usize, usize),
+    pub b: (usize, usize),
+    pub p: f64,
+    pub seed: u64,
 }
 
 /// A parsed and validated experiment file.
@@ -314,6 +332,48 @@ impl Experiment {
                 }
                 Some(_) => bail!("config {name:?}: efforts must be a list of integers"),
             };
+            if let Some(m) = text(&mut table, "mix")? {
+                let f: Vec<&str> = m.split_whitespace().collect();
+                ensure!(f.len() == 4 && table.is_empty() && preset.is_none() && efforts.as_ref().is_some_and(|v| v.len() == 1),
+                    "config {name:?}: mix = \"<config>@<effort> <config>@<effort> <p> <seed>\", one label effort, no other keys");
+                let side = |s: &str| -> Result<(usize, usize)> {
+                    let (c, l) = s.split_once('@').context("<config>@<effort>")?;
+                    let l: usize = l.parse()?;
+                    let i = configs
+                        .iter()
+                        .position(|x: &ConfigSpec| x.name == c && x.mix.is_none())
+                        .with_context(|| {
+                            format!("config {name:?}: no earlier configuration {c:?}")
+                        })?;
+                    let runs = configs[i]
+                        .efforts
+                        .as_ref()
+                        .map_or(e.efforts.contains(&l), |v| v.contains(&l));
+                    ensure!(runs, "config {name:?}: {c} does not run at {l}");
+                    Ok((i, l))
+                };
+                let (a, b, p) = (side(f[0])?, side(f[1])?, f[2].parse::<f64>()?);
+                ensure!((0.0..=1.0).contains(&p), "config {name:?}: mix p in [0, 1]");
+                ensure!(
+                    configs[a.0].graph == configs[b.0].graph
+                        && configs[a.0].starts_sidecar == configs[b.0].starts_sidecar,
+                    "config {name:?}: the mixed configurations share one graph and starts"
+                );
+                let mut c = configs[a.0].clone();
+                (c.name, c.efforts, c.overrides) = (
+                    name,
+                    efforts,
+                    BTreeMap::from([("mix".to_owned(), m.clone())]),
+                );
+                c.mix = Some(Mix {
+                    a,
+                    b,
+                    p,
+                    seed: f[3].parse()?,
+                });
+                configs.push(c);
+                continue;
+            }
             let mut kernel = match &preset {
                 Some(p) => Preset::parse(p)
                     .with_context(|| format!("config {name:?}"))?
@@ -351,6 +411,7 @@ impl Experiment {
                 sketches_sidecar: sketches_sidecar.map(|p| resolve(dir, &p)),
                 pairs_sidecar: pairs_sidecar.map(|p| resolve(dir, &p)),
                 overrides,
+                mix: None,
             });
         }
         let panel = e.panel.as_ref().map(|p| {
@@ -361,6 +422,10 @@ impl Experiment {
                 dataset.join(p)
             }
         });
+        ensure!(
+            mode == Mode::Timed || configs.iter().all(|c| c.mix.is_none()),
+            "mix needs the timed mode"
+        );
         Ok(Self {
             name: e.name,
             file: file.to_owned(),
@@ -400,6 +465,73 @@ impl Experiment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mix_copies_its_first_configuration() {
+        let text = |mix: &str, efforts: &str, mode: &str| {
+            format!(
+                r#"
+                [experiment]
+                name = "e"
+                dataset = "ds"
+                graph = "g"
+                queries = "qa"
+                k = 10
+                efforts = [10, 20, 40]
+                mode = "{mode}"
+
+                [[config]]
+                name = "a"
+                preset = "upstream-inline"
+                efforts = [20, 40]
+
+                [[config]]
+                name = "b"
+                preset = "postfilter"
+
+                [[config]]
+                name = "m"
+                mix = "{mix}"
+                efforts = {efforts}
+                "#
+            )
+        };
+        let p = Path::new("x.toml");
+        let e = Experiment::parse(
+            &text("a@40 b@10 0.25 7", "[10]", "timed"),
+            Path::new("."),
+            p,
+        )
+        .unwrap();
+        let m = &e.configs[2];
+        assert_eq!(
+            m.mix,
+            Some(Mix {
+                a: (0, 40),
+                b: (1, 10),
+                p: 0.25,
+                seed: 7
+            })
+        );
+        assert_eq!(
+            (m.kernel.clone(), &m.graph),
+            (e.configs[0].kernel.clone(), &e.configs[0].graph)
+        );
+        assert_eq!(m.efforts, Some(vec![10]));
+        for (mix, efforts, mode) in [
+            ("a@10 b@10 0.25 7", "[10]", "timed"), // a does not run at 10
+            ("a@40 c@10 0.25 7", "[10]", "timed"), // no configuration c
+            ("a@40 b@10 1.5 7", "[10]", "timed"),  // p outside [0, 1]
+            ("a@40 b@10 0.25", "[10]", "timed"),   // no seed
+            ("a@40 b@10 0.25 7", "[10, 20]", "timed"), // one label effort
+            ("a@40 b@10 0.25 7", "[10]", "trace"), // timed only
+        ] {
+            assert!(
+                Experiment::parse(&text(mix, efforts, mode), Path::new("."), p).is_err(),
+                "{mix} {efforts} {mode}"
+            );
+        }
+    }
 
     #[test]
     fn parses_presets_overrides_and_defaults() {
