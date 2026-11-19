@@ -190,6 +190,7 @@ impl Fixture {
             bitsets: Some(&self.bitsets),
             costs: None,
             sketches: None,
+            pairs: None,
         }
     }
 
@@ -600,6 +601,7 @@ fn static_bits_do_not_change_answers_or_counters() {
         bitsets: Some(&high),
         costs: None,
         sketches: None,
+        pairs: None,
         ..f.index()
     };
     let mut k = Kernel::default();
@@ -611,6 +613,7 @@ fn static_bits_do_not_change_answers_or_counters() {
             bitsets: None,
             costs: None,
             sketches: None,
+            pairs: None,
             ..f.index()
         }
     )
@@ -727,6 +730,7 @@ fn run_line(
         bitsets: None,
         costs: None,
         sketches: None,
+        pairs: None,
     };
     let plan = Plan::new(kernel, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -867,6 +871,7 @@ fn exact_duplicates_follow_the_upstream_tie_rule() {
         bitsets: None,
         costs: None,
         sketches: None,
+        pairs: None,
     };
     let plan = Plan::new(&k, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -1034,6 +1039,7 @@ fn the_packed_beam_changes_no_answer() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let route = khpad(&[
@@ -1103,6 +1109,7 @@ fn row_prefetch_changes_no_answer_and_keeps_the_fast_paths() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let route = khpad(&[
@@ -1187,6 +1194,7 @@ fn planned_exact_plans_are_exact() {
             bitsets: with_bits.then_some(&f.bitsets),
             costs: Some(&costs),
             sketches: Some(&sketches),
+            pairs: None,
             ..f.index()
         };
         for plans in [
@@ -1239,6 +1247,7 @@ fn residual_checks_keep_answers_routes_and_estimates() {
             bitsets: with_bits.then_some(&f.bitsets),
             costs: Some(&costs),
             sketches: Some(&sketches),
+            pairs: None,
             ..f.index()
         };
         let exact_v2 = [
@@ -1293,6 +1302,10 @@ fn seeded_exact_paths_exhaust_every_candidate() {
     let mut q = Compiled::new();
     let mut mat = Materialized::new(300, true);
     let mut answers = Answers::new();
+    // Combination postings of the fixture (every useful pair fits), for the `pair` plan.
+    let (px, _) = crate::pairs::PairIndex::build(&f.labels, 1 << 20, 1);
+    let mut cover = crate::pairs::Cover::default();
+    let mut pair_runs = 0usize;
     for qi in 0..f.preds.len() {
         q.compile(&f.labels, f.preds.get(qi), Weights::Unit, None, &mut bits);
         if q.is_empty() {
@@ -1300,6 +1313,12 @@ fn seeded_exact_paths_exhaust_every_candidate() {
             continue;
         }
         q.split_static(&f.labels, &f.bitsets, 1, false);
+        px.cover(
+            q.n_clauses(),
+            |j| q.clause(j),
+            |l| f.labels.posting_len(l),
+            &mut cover,
+        );
         let all = f.truth(qi, 300);
         for k in [1usize, 5, 10] {
             // Seeds: the farthest matches (valid but wrong answers), and a mix with some of the
@@ -1318,11 +1337,18 @@ fn seeded_exact_paths_exhaust_every_candidate() {
                     .map(|p| (p, false))
                     .chain([(ExactPlan::DistanceFirst, true)])
                 {
+                    if plan == ExactPlan::Pair {
+                        if !cover.valid {
+                            continue;
+                        }
+                        pair_runs += 1;
+                    }
                     for eval in [ExactEval::RowScan, ExactEval::StaticBits] {
                         let mut cx = EvalCtx::new(&f.labels, &q, &bits, &[], &[]);
                         if eval == ExactEval::StaticBits {
                             cx = cx.with_static(&f.bitsets);
                         }
+                        cx = cx.with_pairs(&px, &cover);
                         answers.reset(Collector::Heap, k, k);
                         for &(d, id) in seed.iter() {
                             answers.offer_unique(d, id);
@@ -1359,6 +1385,7 @@ fn seeded_exact_paths_exhaust_every_candidate() {
         }
         q.clear_bits(&mut bits);
     }
+    assert!(pair_runs > 0, "the fixture exercises the pair plan");
 }
 
 #[test]
@@ -1428,6 +1455,7 @@ fn crossovers_give_valid_answers_and_exact_fallbacks() {
         let ix = Index {
             costs: Some(costs),
             sketches: Some(&sketches),
+            pairs: None,
             ..f.index()
         };
         let configs: Vec<Kernel> = vec![
@@ -1490,6 +1518,7 @@ fn complete_witnesses_make_the_guarded_trial_exact() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let k = khpad(&[
@@ -1527,6 +1556,7 @@ fn posting_l_fixes_the_list_size_before_navigation() {
     let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
     let ix = Index {
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let k = khpad(&[
@@ -1574,6 +1604,7 @@ fn the_postfilter_route_returns_the_heap_answers_of_a_global_search() {
             bitsets: with_bits.then_some(&f.bitsets),
             costs: Some(&costs),
             sketches: Some(&sketches),
+            pairs: None,
             ..f.index()
         };
         let route = khpad(&[
@@ -1650,6 +1681,7 @@ fn the_cost_rule_prefers_postfilters_for_frequent_matches() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     // The guarded crossover routes the same way (its trial guards only inline graph searches).
@@ -1727,6 +1759,7 @@ fn hopeless_graph_searches_take_the_exact_path() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let s2 = [
@@ -1839,6 +1872,7 @@ fn the_effort_curve_plans_the_list_size_from_the_match_rate() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let k = khpad(&[
@@ -1885,6 +1919,7 @@ fn the_postfilter_route_with_the_configured_starts_keeps_the_heap_answers() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let base = [
@@ -1953,6 +1988,7 @@ fn by_rate_starts_are_the_global_ones_for_broad_predicates() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     let route = |starts: &'static str| {
@@ -2014,6 +2050,7 @@ fn the_graph_crossover_never_takes_the_exact_path() {
     let ix = Index {
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
         ..f.index()
     };
     for (crossover, terminator) in [("cost", "effort_curve"), ("graph", "effort_curve(2)")] {
@@ -2213,6 +2250,7 @@ fn by_rate_late_rescues_a_search_that_missed_the_query() {
         bitsets: Some(&bitsets),
         costs: Some(&costs),
         sketches: Some(&sketches),
+        pairs: None,
     };
     let plans: Vec<Plan> = ["by_rate_late", "by_rate", "by_rate_both", "by_rate_both_k"]
         .into_iter()

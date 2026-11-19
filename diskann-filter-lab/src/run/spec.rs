@@ -31,6 +31,7 @@
 //! calibration = "<costs.json>"     # unit costs of the cost model (`flab calibrate`): needed by
 //!                                  # the planned exact path and the cost crossovers
 //! sketches_sidecar = "<sketches.flab>" # bottom-b sketches (`estimates = "sketch"`)
+//! pairs_sidecar = "<pairs.flab>"   # combination postings (the exact path's `pair` plan)
 //!
 //! [[config]]
 //! name = "inline"
@@ -46,6 +47,7 @@
 //!                                  # for an L-independent exact path)
 //! calibration = "<costs.json>"     # per-configuration unit costs (e.g. another calibration)
 //! sketches_sidecar = "<sketches.flab>" # per-configuration sketches (e.g. another priority seed)
+//! pairs_sidecar = "<pairs.flab>"   # per-configuration combination postings (e.g. a budget)
 //! ```
 
 use std::{
@@ -111,6 +113,7 @@ struct RawExperiment {
     bitsets_sidecar: Option<PathBuf>,
     calibration: Option<PathBuf>,
     sketches_sidecar: Option<PathBuf>,
+    pairs_sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,6 +145,8 @@ pub struct ConfigSpec {
     pub calibration: Option<PathBuf>,
     /// Bottom-b sketches of this configuration (the experiment's unless overridden).
     pub sketches_sidecar: Option<PathBuf>,
+    /// Combination postings of this configuration (the experiment's unless overridden).
+    pub pairs_sidecar: Option<PathBuf>,
     /// The overrides as given (for the record).
     pub overrides: BTreeMap<String, String>,
 }
@@ -184,6 +189,8 @@ pub struct Experiment {
     pub calibration: Option<PathBuf>,
     /// Bottom-`b` sketches of the dataset's labels.
     pub sketches_sidecar: Option<PathBuf>,
+    /// Combination postings of the dataset's labels (`pairs.flab`).
+    pub pairs_sidecar: Option<PathBuf>,
     pub configs: Vec<ConfigSpec>,
 }
 
@@ -286,6 +293,9 @@ impl Experiment {
             let sketches_sidecar = text(&mut table, "sketches_sidecar")?
                 .map(PathBuf::from)
                 .or_else(|| e.sketches_sidecar.clone());
+            let pairs_sidecar = text(&mut table, "pairs_sidecar")?
+                .map(PathBuf::from)
+                .or_else(|| e.pairs_sidecar.clone());
             let efforts = match table.remove("efforts") {
                 None => None,
                 Some(toml::Value::Array(items)) => {
@@ -339,6 +349,7 @@ impl Experiment {
                 efforts,
                 calibration: calibration.map(|p| resolve(dir, &p)),
                 sketches_sidecar: sketches_sidecar.map(|p| resolve(dir, &p)),
+                pairs_sidecar: pairs_sidecar.map(|p| resolve(dir, &p)),
                 overrides,
             });
         }
@@ -380,6 +391,7 @@ impl Experiment {
             bitsets_sidecar: e.bitsets_sidecar.map(|p| resolve(dir, &p)),
             calibration: e.calibration.map(|p| resolve(dir, &p)),
             sketches_sidecar: e.sketches_sidecar.map(|p| resolve(dir, &p)),
+            pairs_sidecar: e.pairs_sidecar.map(|p| resolve(dir, &p)),
             configs,
         })
     }

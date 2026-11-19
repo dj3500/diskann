@@ -59,6 +59,7 @@ use crate::{
         search::{Counters, FastPath, Index, Plan, Query, Searcher},
         trace::Trace,
     },
+    pairs::PairIndex,
     sketches::LabelSketches,
     vectors::{DType, Element},
 };
@@ -424,6 +425,29 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             .as_ref()
             .map_or(Value::Null, |p| sketch_files[p].1.clone())
     };
+    // Combination postings per file (untimed sidecars).
+    let mut pair_files: BTreeMap<PathBuf, (PairIndex, Value)> = BTreeMap::new();
+    for c in &exp.configs {
+        if let Some(path) = &c.pairs_sidecar {
+            if !pair_files.contains_key(path) {
+                let t = Instant::now();
+                let px = PairIndex::read(path)?;
+                px.check_sample(&ds.labels, 997)
+                    .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
+                let doc = json!({
+                    "source": path, "t_big": px.t_big(), "n_big": px.n_big(),
+                    "pairs": px.n_pairs(), "entries": px.n_entries(), "bytes": px.bytes(),
+                    "load_s": t.elapsed().as_secs_f64(),
+                });
+                pair_files.insert(path.clone(), (px, doc));
+            }
+        }
+    }
+    let pairs_doc = |c: &ConfigSpec| -> Value {
+        c.pairs_sidecar
+            .as_ref()
+            .map_or(Value::Null, |p| pair_files[p].1.clone())
+    };
 
     // Indices, plans and per-row queries.
     let mut indices = Vec::new();
@@ -459,6 +483,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             bitsets: bitsets.as_ref(),
             costs: c.calibration.as_ref().map(|p| &cost_files[p].0),
             sketches: c.sketches_sidecar.as_ref().map(|p| &sketch_files[p].0),
+            pairs: c.pairs_sidecar.as_ref().map(|p| &pair_files[p].0),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
         if !exp.fast_paths {
@@ -562,7 +587,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     Mode::Trace | Mode::Reference => FastPath::None.name(),
                 },
             });
-            let hash_input = json!({
+            let mut hash_input = json!({
                 "experiment": exp.name, "config": config_json, "K": k, "efforts": out.efforts,
                 "dataset": exp.dataset, "graph": c.graph, "starts": g.starts_path,
                 "panel": rows.source.as_ref().map(|s| &s.1), "split": exp.split,
@@ -576,6 +601,9 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "sketches": (c.kernel.estimates == EstimateSource::Sketch)
                     .then(|| sketches_doc(c)["source"].clone()),
             });
+            if c.pairs_sidecar.is_some() {
+                hash_input["pairs"] = pairs_doc(c)["source"].clone();
+            }
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));
             let safe: String = c
                 .name
@@ -658,6 +686,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 } else {
                     Value::Null
                 },
+                "pairs": pairs_doc(c),
             });
             let protocol = json!({
                 "reps": if exp.mode == Mode::Timed { exp.reps } else { 1 },
@@ -783,7 +812,8 @@ fn counter_docs() -> Value {
         "n_start": "starts selected (deduplicated)",
         "final_L": "expandable beam size at the end (adaptive L, or the planned posting_l)",
         "n_probe": "predicate evaluations of the sketch probe (also in n_pred)",
-        "plan": "exact plan chosen: 0 none / version-1 path, 1 scan, 2 distance-first, 3 gallop, 4 bitmap",
+        "plan": "exact plan chosen: 0 none / version-1 path, 1 scan, 2 distance-first, 3 gallop, 4 bitmap, 5 rowand, 6 pair",
+        "n_pair_lookups": "directory lookups in the combination postings (the pair plan's clause pair)",
         "fallback": "guarded trial: 0 none, 1 forecast, 2 budget, 3 incomplete heap, 4 witness",
         "est_exact_ns": "estimated exact-path cost (model ns; 0 if not computed)",
         "est_graph_ns": "nominal graph cost at the planned L (model ns; 0 if not computed)",

@@ -32,6 +32,7 @@
 use crate::{
     bitsets::{self, LabelBitsets},
     labels::LabelStore,
+    pairs::{Cover, PairIndex},
     predicate::Cnf,
 };
 
@@ -340,6 +341,12 @@ impl Compiled {
         self.u[j]
     }
 
+    /// Bits of every clause position (the full check), `0` for a query whose clauses do not
+    /// use clause bits (more than 64 clauses).
+    pub fn full_mask(&self) -> u64 {
+        self.full_mask
+    }
+
     /// `min_c U_c` (`u64::MAX` without clauses).
     pub fn min_upper_bound(&self) -> u64 {
         self.u.first().copied().unwrap_or(u64::MAX)
@@ -422,6 +429,8 @@ pub struct EvalCtx<'a> {
     pub(crate) stat: &'a LabelBitsets,
     /// The evaluated points are members of `union(c*)` (see [`Self::cstar_members`]).
     pub(crate) members: bool,
+    /// Combination postings and the query's clause pair from them (the `pair` plan).
+    pub(crate) pairs: Option<(&'a PairIndex, &'a Cover)>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -450,6 +459,7 @@ impl<'a> EvalCtx<'a> {
             sparse,
             stat: &bitsets::EMPTY,
             members: false,
+            pairs: None,
         }
     }
 
@@ -467,6 +477,15 @@ impl<'a> EvalCtx<'a> {
     pub fn cstar_members(self) -> Self {
         Self {
             members: true,
+            ..self
+        }
+    }
+
+    /// The context with combination postings and the query's clause pair (the `pair` plan).
+    #[inline]
+    pub fn with_pairs(self, pairs: &'a PairIndex, cover: &'a Cover) -> Self {
+        Self {
+            pairs: Some((pairs, cover)),
             ..self
         }
     }
@@ -503,10 +522,29 @@ pub trait Eval: Copy + Send + Sync + 'static {
     fn residual(cx: &EvalCtx<'_>, v: u32) -> bool {
         Self::full(cx, v)
     }
+    /// Whether `v` satisfies the clauses of `mask` (bits of positions in the Boolean order;
+    /// the others are known to hold). Evaluators without a mask form check every clause.
+    #[inline(always)]
+    fn masked(cx: &EvalCtx<'_>, v: u32, mask: u64) -> bool {
+        let _ = mask;
+        Self::full(cx, v)
+    }
     /// Prefetches what [`Self::eval`] will read for `v` (second stage: the row itself).
     fn prefetch(cx: &EvalCtx<'_>, v: u32);
     /// First prefetch stage (the row offsets).
     fn prefetch_offsets(cx: &EvalCtx<'_>, v: u32);
+    /// [`Self::prefetch`] for [`Self::masked`] with `mask`.
+    #[inline(always)]
+    fn prefetch_masked(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        let _ = mask;
+        Self::prefetch(cx, v);
+    }
+    /// [`Self::prefetch_offsets`] for [`Self::masked`] with `mask`.
+    #[inline(always)]
+    fn prefetch_masked_offsets(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        let _ = mask;
+        Self::prefetch_offsets(cx, v);
+    }
     /// The failed clauses of data point `v` among all clauses of the query (bit `j` for the
     /// clause at position `j` of the Boolean order; complete evaluation of the first 64
     /// clauses).
@@ -622,6 +660,16 @@ impl Eval for RowScan {
             return ClauseSearch::residual(cx, v);
         }
         scan(cx, row, q.full_mask & !1) == 0
+    }
+
+    #[inline(always)]
+    fn masked(cx: &EvalCtx<'_>, v: u32, mask: u64) -> bool {
+        let q = cx.q;
+        let row = cx.labels.row(v);
+        if !q.use_bits || row.len() > 4 * q.labels.len() {
+            return ClauseSearch::full(cx, v);
+        }
+        scan(cx, row, mask) == 0
     }
 
     #[inline(always)]
@@ -831,6 +879,15 @@ impl Eval for StaticBits {
         static_failed(cx, v, q.full_mask & !1, true) == 0
     }
 
+    #[inline(always)]
+    fn masked(cx: &EvalCtx<'_>, v: u32, mask: u64) -> bool {
+        let q = cx.q;
+        if !q.use_bits {
+            return ClauseSearch::full(cx, v);
+        }
+        static_failed(cx, v, mask, true) == 0
+    }
+
     /// The row, when it is likely to be read (see [`Compiled::split_static`]; for members of
     /// `union(c*)`, when a residual clause has row labels).
     #[inline(always)]
@@ -851,6 +908,22 @@ impl Eval for StaticBits {
             return ClauseSearch::failed_all(cx, v);
         }
         static_failed(cx, v, check_mask(cx), false)
+    }
+
+    /// The row, when a clause of `mask` has row labels.
+    #[inline(always)]
+    fn prefetch_masked(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        if !cx.q.use_bits || cx.q.small_mask & mask != 0 {
+            RowScan::prefetch(cx, v);
+        }
+    }
+
+    /// The row offsets, when a clause of `mask` has row labels.
+    #[inline(always)]
+    fn prefetch_masked_offsets(cx: &EvalCtx<'_>, v: u32, mask: u64) {
+        if !cx.q.use_bits || cx.q.small_mask & mask != 0 {
+            RowScan::prefetch_offsets(cx, v);
+        }
     }
 
     /// The row offsets (when the row is likely to be read) and the bitset word of the most

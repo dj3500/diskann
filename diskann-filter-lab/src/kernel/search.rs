@@ -41,6 +41,7 @@ use crate::{
     bitsets::LabelBitsets,
     graph::{Graph, NodeVectors},
     labels::LabelStore,
+    pairs::{Cover, PairIndex},
     predicate::Cnf,
     sketches::LabelSketches,
     starts::Starts,
@@ -83,6 +84,8 @@ pub struct Index<'a, T> {
     pub costs: Option<&'a UnitCosts>,
     /// Bottom-`b` sketches of `labels` (the `sketch` estimates).
     pub sketches: Option<&'a LabelSketches>,
+    /// Combination postings of `labels` (the exact path's `pair` plan).
+    pub pairs: Option<&'a PairIndex>,
 }
 
 /// One query: its vector, predicate and, with a label view, the view's predicate.
@@ -195,6 +198,8 @@ pub struct Counters {
     pub t_graph_ns: u64,
     /// Wall-clock time of the cost crossover's decision, the probe included (phase timers).
     pub t_decide_ns: u64,
+    /// Directory lookups in the combination postings (the `pair` plan's clause pair).
+    pub n_pair_lookups: u64,
     /// The phase timers are on (set per query; not a counter).
     pub timing: bool,
 }
@@ -233,7 +238,7 @@ impl Counters {
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 38] = [
+    pub const NAMES: [&'static str; 39] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -272,10 +277,11 @@ impl Counters {
         "m_hi",
         "t_decide_ns",
         "n_late",
+        "n_pair_lookups",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 38] {
+    pub fn values(&self) -> [u64; 39] {
         [
             self.n_dist,
             self.n_pred,
@@ -315,6 +321,7 @@ impl Counters {
             self.m_hi,
             self.t_decide_ns,
             self.n_late,
+            self.n_pair_lookups,
         ]
     }
 }
@@ -675,6 +682,8 @@ pub struct Searcher {
     pos: Vec<usize>,
     probe: Probe,
     last_estimates: Estimates,
+    /// The query's clause pair with the fewest candidates in the combination postings.
+    pair_cover: Cover,
     /// Every node a post-filter route evaluated, as packed (distance, id).
     log: Vec<u64>,
     /// The current plan's `row_prefetch` (set at the start of every search).
@@ -718,6 +727,7 @@ impl Searcher {
             pos: Vec::new(),
             probe: Probe::new(),
             last_estimates: Estimates::default(),
+            pair_cover: Cover::default(),
             log: Vec::new(),
             row_prefetch: false,
             packed_beam: false,
@@ -802,6 +812,28 @@ impl Searcher {
         ctr.n_clauses = self.compiled.n_clauses() as u64;
         [ctr.res_words, ctr.res_rows, ctr.c1_words, ctr.c1_rows] =
             self.compiled.residual_shape(exact_stat.is_some());
+        // The clause pair of the combination postings (only where the exact path's smallest
+        // clause is at least a big label: smaller unions are cheap to enumerate anyway).
+        self.pair_cover.clear();
+        if let Some(px) = ix.pairs {
+            let compiled = &self.compiled;
+            if kernel.exact.is_planned()
+                && kernel.exact_plans.contains(ExactPlan::Pair)
+                && !compiled.is_empty()
+                && compiled.n_clauses() >= 2
+                && compiled.min_upper_bound() >= px.t_big()
+            {
+                let t = tic(&ctr);
+                px.cover(
+                    compiled.n_clauses(),
+                    |j| compiled.clause(j),
+                    |l| ix.labels.posting_len(l),
+                    &mut self.pair_cover,
+                );
+                ctr.n_pair_lookups = self.pair_cover.lookups;
+                toc(t, &mut ctr.t_decide_ns);
+            }
+        }
         let n = if self.compiled.is_empty() {
             ctr.route = Route::Empty;
             0
@@ -820,6 +852,7 @@ impl Searcher {
                     bitsets: exact_stat,
                     k,
                     df_lower: kernel.df_lower,
+                    pair: self.pair_cover.valid.then_some(&self.pair_cover),
                 }
                 .best(costs, kernel.exact_plans, &est, false, false);
                 record(&mut ctr, p, e, 0.0, &est);
@@ -930,6 +963,7 @@ impl Searcher {
                             bitsets: exact_stat,
                             k,
                             df_lower: kernel.df_lower,
+                            pair: self.pair_cover.valid.then_some(&self.pair_cover),
                         }
                         .best(costs, kernel.exact_plans, &est, true, false);
                         ctr.plan = p as u64;
@@ -1038,6 +1072,7 @@ impl Searcher {
             bitsets: exact_stat,
             k,
             df_lower: kernel.df_lower,
+            pair: self.pair_cover.valid.then_some(&self.pair_cover),
         };
         // Obviously cheap exact queries: the exact path's upper cost is below the cheapest
         // graph search, which needs the probe first (its list size and estimates come from
@@ -1088,6 +1123,7 @@ impl Searcher {
             bitsets: exact_stat,
             k,
             df_lower: kernel.df_lower,
+            pair: self.pair_cover.valid.then_some(&self.pair_cover),
         };
         let (p, e) = pi.best(costs, kernel.exact_plans, &est, false, false);
         let scale = match kernel.terminator {
@@ -1282,6 +1318,9 @@ impl Searcher {
             }
             None => ExactEval::RowScan,
         };
+        if let Some(px) = ix.pairs {
+            cx = cx.with_pairs(px, &self.pair_cover);
+        }
         debug_assert!(plan.kernel.exact.is_planned());
         let t = tic(ctr);
         exact::run_planned(

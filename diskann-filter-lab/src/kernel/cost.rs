@@ -27,6 +27,13 @@
 //! rowand          words(c*) + Σ_{j≥1} W·reach_j·(base(ρ) + hot_j·word(ρ))
 //!                 + Σ_{j≥1} Σ_{ℓ rare in c_j} probes(min(W·reach_j, P_j), |post ℓ|) + M·enum_bit
 //!                 + M·dist(M/n)
+//! pair            lists·gallop_cold + E·merge·log2(lists) + E·pred_mask(E/n) + min(M, E)·dist(M/n)
+//!                 (combination postings, B3a: the `E` entries of the stored joint postings —
+//!                 and of the smaller label posting of every pair not stored — of the clause
+//!                 pair with the fewest; the checks cover the other clauses, all clauses when a
+//!                 label posting is among the lists, at the worst-case work of those clauses
+//!                 (`MemberWork::of_mask`: every bitset word, the row if one has row labels);
+//!                 `M = E` for two clauses)
 //! ```
 //!
 //! with `merge(c*) = P*·merge·log2 k` for a clause of `k ≥ 2` labels (a single posting list is
@@ -74,7 +81,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{config::Laziness, eval::Compiled};
-use crate::{bitsets::LabelBitsets, labels::LabelStore};
+use crate::{bitsets::LabelBitsets, labels::LabelStore, pairs::Cover};
 
 /// Planner caches of [`UnitCosts`], filled by [`UnitCosts::prepare`]: the logarithms of the
 /// calibrated grids (empty until then: taken per call, with the same values), the cheapest
@@ -809,15 +816,19 @@ pub enum ExactPlan {
     /// The words of `c*`'s union ANDed with the residual clauses' rows word by word (bitset
     /// words; galloping cursors in the postings of labels without a bitset), then distances.
     RowAnd = 5,
+    /// The candidate lists of a clause pair from the combination postings (`pairs.flab`):
+    /// merged, checked on the other clauses, then distances.
+    Pair = 6,
 }
 
 impl ExactPlan {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Scan,
         Self::DistanceFirst,
         Self::Gallop,
         Self::Bitmap,
         Self::RowAnd,
+        Self::Pair,
     ];
 
     pub fn name(self) -> &'static str {
@@ -827,6 +838,7 @@ impl ExactPlan {
             Self::Gallop => "gallop",
             Self::Bitmap => "bitmap",
             Self::RowAnd => "rowand",
+            Self::Pair => "pair",
         }
     }
 
@@ -837,7 +849,8 @@ impl ExactPlan {
             "gallop" => Self::Gallop,
             "bitmap" => Self::Bitmap,
             "rowand" => Self::RowAnd,
-            _ => anyhow::bail!("unknown exact plan {s:?} (scan, df, gallop, bitmap, rowand)"),
+            "pair" => Self::Pair,
+            _ => anyhow::bail!("unknown exact plan {s:?} (scan, df, gallop, bitmap, rowand, pair)"),
         })
     }
 }
@@ -847,7 +860,7 @@ impl ExactPlan {
 pub struct PlanSet(u8);
 
 impl PlanSet {
-    pub const ALL: Self = Self(0b1_1111);
+    pub const ALL: Self = Self(0b11_1111);
 
     pub fn contains(self, p: ExactPlan) -> bool {
         self.0 & (1 << (p as u8 - 1)) != 0
@@ -857,7 +870,7 @@ impl PlanSet {
         self.0 == 0
     }
 
-    /// Parses `scan+df+gallop+bitmap+rowand` (any non-empty subset).
+    /// Parses `scan+df+gallop+bitmap+rowand+pair` (any non-empty subset).
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         let mut m = 0u8;
         for p in s.split('+') {
@@ -1122,6 +1135,38 @@ impl MemberWork {
     }
 }
 
+impl MemberWork {
+    /// Worst-case work of checking the clauses in `mask` (bit `j`: clause `j`): every bitset
+    /// word of those clauses probed, and the row read once if one of them has row labels. The
+    /// `pair` plan's checks: its candidates come from joint or single postings, without the
+    /// survival estimates of `union(c*)`, and its mask may include `c*`.
+    pub fn of_mask(q: &Compiled, split: bool, mask: u64) -> Self {
+        if mask == 0 || q.is_empty() {
+            return Self::default();
+        }
+        if !split {
+            return Self {
+                words: 0.0,
+                prefetch: 1.0,
+                rows: 1.0,
+                class_rows: true,
+            };
+        }
+        let (mut words, mut row) = (0.0, false);
+        for j in (0..q.n_clauses()).filter(|&j| mask >> j & 1 == 1) {
+            words += q.static_slots(j).len() as f64;
+            row |= !q.row_labels(j).is_empty();
+        }
+        let r = if row { 1.0 } else { 0.0 };
+        Self {
+            words,
+            prefetch: r,
+            rows: r,
+            class_rows: row,
+        }
+    }
+}
+
 /// Inputs of the exact plan costs of one query.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanInputs<'a> {
@@ -1132,6 +1177,9 @@ pub struct PlanInputs<'a> {
     /// `df` counts its evaluations at the lower confidence bound of the match count
     /// ([`Kernel::df_lower`](super::config::Kernel::df_lower)).
     pub df_lower: bool,
+    /// The query's clause pair with the fewest candidates in the combination postings (the
+    /// `pair` plan; `None` without them).
+    pub pair: Option<&'a Cover>,
 }
 
 /// Per-estimate terms shared by the plan costs of a query (computed once per
@@ -1159,7 +1207,8 @@ const SKIP_MARGIN: f64 = 1e-9;
 
 /// Order in which [`PlanInputs::best`] evaluates the plans: the cheap evaluations first, so
 /// that the per-clause sums of `rowand` and `gallop` stop early against their cost.
-const EVAL_ORDER: [ExactPlan; 5] = [
+const EVAL_ORDER: [ExactPlan; 6] = [
+    ExactPlan::Pair,
     ExactPlan::Scan,
     ExactPlan::DistanceFirst,
     ExactPlan::Bitmap,
@@ -1331,7 +1380,38 @@ impl PlanInputs<'_> {
                 let tail = c.enumerate(0.0, m);
                 self.row_and(c, e, upper, x, |cost| cost + tail + dist_m > bound) + tail + dist_m
             }
+            ExactPlan::Pair => self.pair_cost(c, x),
         }
+    }
+
+    /// Cost of the `pair` plan (see the module documentation); infinite without a cover.
+    fn pair_cost(&self, c: &UnitCosts, x: &Ctx) -> f64 {
+        let Some(cv) = self.pair.filter(|cv| cv.valid) else {
+            return f64::INFINITY;
+        };
+        let (lists, e) = (cv.lists.len() as f64, cv.entries as f64);
+        let mut cost = lists * c.gallop_cold();
+        if lists > 1.0 {
+            cost += e * c.merge_ns * lists.log2();
+        }
+        // The check mask of `exact::planned`: every clause but the covered pair's (exact
+        // cover), else every clause.
+        let full = self.q.full_mask();
+        let mask = if cv.exact {
+            full & !(1u64 << cv.i) & !(1u64 << cv.j)
+        } else {
+            full
+        };
+        if mask != 0 {
+            let w = MemberWork::of_mask(self.q, self.bitsets.is_some(), mask);
+            cost += e * c.member_at(&w, c.pos(e / x.n));
+        }
+        let m = if cv.exact && self.q.n_clauses() <= 2 {
+            e
+        } else {
+            x.m.min(e)
+        };
+        cost + m * c.dist(m / x.n)
     }
 
     /// A lower bound of the cost of `plan` that is cheaper to evaluate (`None`: none), valid
@@ -1906,6 +1986,7 @@ mod tests {
             labels: &s,
             bitsets: Some(&bs),
             k: 10,
+            pair: None,
         };
         let mut prepared = c.clone();
         prepared.prepare();
@@ -2075,6 +2156,7 @@ mod tests {
                 labels: &s,
                 bitsets: split.then_some(&bs),
                 k: if t % 2 == 0 { 10 } else { 100 },
+                pair: None,
             };
             let bounds = Estimates::from_bounds(&q, n as usize);
             let mut est = bounds.clone();
@@ -2181,8 +2263,10 @@ mod tests {
             labels: &s,
             bitsets: None,
             k: 10,
+            pair: None,
         };
-        for p in ExactPlan::ALL {
+        // (`pair` needs combination postings: infinite here.)
+        for p in ExactPlan::ALL.into_iter().filter(|&p| p != ExactPlan::Pair) {
             let x = pi.cost(&c, p, &e, false, false);
             assert!(x.is_finite() && x > 0.0, "{p:?}");
             assert!(pi.cost(&c, p, &up, false, true) >= x, "{p:?}: upper bound");
@@ -2212,7 +2296,7 @@ mod tests {
         assert!(best <= pi.best(&c, only_scan, &e, false, false).1);
         assert_eq!(only_scan.to_string(), "scan");
         assert_eq!(
-            PlanSet::parse("scan+df+gallop+bitmap+rowand").unwrap(),
+            PlanSet::parse("scan+df+gallop+bitmap+rowand+pair").unwrap(),
             PlanSet::ALL
         );
         q.clear_bits(&mut bits);
@@ -2246,6 +2330,7 @@ mod tests {
             bitsets: None,
             k: 10,
             df_lower: false,
+            pair: None,
         };
         let lower = PlanInputs {
             df_lower: true,
