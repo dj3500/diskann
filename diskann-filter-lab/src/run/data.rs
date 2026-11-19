@@ -7,8 +7,9 @@
 //! views), the query rows (a panel or a whole query set), graphs and their start tables.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -341,11 +342,11 @@ impl Rows {
     }
 }
 
-/// A loaded graph with its start table.
+/// A loaded graph with its start table (the graph is shared by the tables of one graph file).
 #[derive(Debug)]
 pub struct LoadedGraph {
     pub path: PathBuf,
-    pub graph: Graph,
+    pub graph: Arc<Graph>,
     pub starts_path: Option<PathBuf>,
     pub starts: Option<Starts>,
     /// Global starts used by searches.
@@ -356,6 +357,17 @@ pub struct LoadedGraph {
 /// Loads a graph: a directory with `graph.flab` (and `starts.flab`), a `graph.flab`, or a
 /// DiskANN index prefix (vectors in `<prefix>.data`).
 pub fn load_graph(path: &Path, sidecar: Option<&Path>, dtype: DType) -> Result<LoadedGraph> {
+    load_graph_shared(path, sidecar, dtype, &mut HashMap::new())
+}
+
+/// [`load_graph`], reading each graph file once: `shared` holds the graphs loaded so far by path,
+/// so that start tables of one graph (several `starts_sidecar`s) share its memory.
+pub fn load_graph_shared(
+    path: &Path,
+    sidecar: Option<&Path>,
+    dtype: DType,
+    shared: &mut HashMap<PathBuf, Arc<Graph>>,
+) -> Result<LoadedGraph> {
     let (graph_path, default_sidecar) = if path.is_dir() {
         let s = path.join("starts.flab");
         (path.join("graph.flab"), s.exists().then_some(s))
@@ -364,15 +376,23 @@ pub fn load_graph(path: &Path, sidecar: Option<&Path>, dtype: DType) -> Result<L
         let flab = container::peek_magic(path).ok().as_ref() == Some(graph::MAGIC);
         (path.to_owned(), (flab && s.exists()).then_some(s))
     };
-    let graph = if graph_path.exists()
-        && container::peek_magic(&graph_path).ok().as_ref() == Some(graph::MAGIC)
-    {
-        Graph::read(&graph_path)?
-    } else {
-        let mut data = graph_path.clone().into_os_string();
-        data.push(".data");
-        let data = PathBuf::from(data);
-        diskann_io::open(&graph_path, Some((&data, dtype)))?
+    let graph = match shared.get(&graph_path) {
+        Some(g) => Arc::clone(g),
+        None => {
+            let g = if graph_path.exists()
+                && container::peek_magic(&graph_path).ok().as_ref() == Some(graph::MAGIC)
+            {
+                Graph::read(&graph_path)?
+            } else {
+                let mut data = graph_path.clone().into_os_string();
+                data.push(".data");
+                let data = PathBuf::from(data);
+                diskann_io::open(&graph_path, Some((&data, dtype)))?
+            };
+            let g = Arc::new(g);
+            shared.insert(graph_path.clone(), Arc::clone(&g));
+            g
+        }
     };
     let starts_path = sidecar.map(Path::to_owned).or(default_sidecar);
     let starts = starts_path.as_deref().map(Starts::read).transpose()?;

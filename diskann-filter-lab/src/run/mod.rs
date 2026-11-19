@@ -302,11 +302,17 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
 
     // Graphs, start tables and sample indices.
     let mut graphs: HashMap<GraphKey, LoadedGraph> = HashMap::new();
+    let mut graph_files = std::collections::HashMap::new();
     for c in &exp.configs {
         let key = graph_key(c);
         if !graphs.contains_key(&key) {
-            let g = data::load_graph(&c.graph, c.starts_sidecar.as_deref(), T::DTYPE)
-                .with_context(|| format!("config {:?}", c.name))?;
+            let g = data::load_graph_shared(
+                &c.graph,
+                c.starts_sidecar.as_deref(),
+                T::DTYPE,
+                &mut graph_files,
+            )
+            .with_context(|| format!("config {:?}", c.name))?;
             ensure!(
                 g.graph.n_data() == ds.base.nrows(),
                 "{}: {} data points, the dataset has {}",
