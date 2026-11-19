@@ -12,6 +12,7 @@
 //! graph = "<graph dir or file>"    # graph.flab (+ starts.flab) or a DiskANN index prefix
 //! starts_sidecar = "<starts.flab>" # optional; default: starts.flab next to the graph
 //! view = "<name>"                  # optional label view: labels.<name>.flab, q<set>.<name>.fpred
+//!                                  # (its predicates feed the presets that use a view: sfmarket, cp)
 //! queries = "q2Khard"              # without a panel: every query of q2Khard.*
 //! panel = "panels/screen.tsv"      # or a panel (relative to the dataset dir), with filters:
 //! split = "discovery"              #   keep rows of this split,
@@ -43,6 +44,8 @@
 //! starts = "label(c*)"             # any role override of `Kernel::set`
 //! collector = "heap"
 //! graph = "<other graph>"          # per-configuration graph, starts sidecar and view
+//! predicates = "view"              # the view's predicates replace the queries' own (default
+//!                                  # "own"); e.g. an all-match view: the filter-less problem
 //! efforts = [100]                  # per-configuration subset of the efforts (e.g. one effort
 //!                                  # for an L-independent exact path)
 //! calibration = "<costs.json>"     # per-configuration unit costs (e.g. another calibration)
@@ -144,6 +147,8 @@ pub struct ConfigSpec {
     pub graph: PathBuf,
     pub starts_sidecar: Option<PathBuf>,
     pub view: Option<String>,
+    /// `predicates = "view"`: the view's predicates are the queries' predicates.
+    pub view_predicates: bool,
     /// The efforts of this configuration (a subset of the experiment's; all if `None`).
     pub efforts: Option<Vec<usize>>,
     /// Unit costs of this configuration (the experiment's unless overridden).
@@ -374,6 +379,17 @@ impl Experiment {
                 configs.push(c);
                 continue;
             }
+            let view_predicates = match text(&mut table, "predicates")?.as_deref() {
+                None | Some("own") => false,
+                Some("view") => {
+                    ensure!(
+                        view.is_some(),
+                        "config {name:?}: predicates = \"view\" needs a `view`"
+                    );
+                    true
+                }
+                Some(v) => bail!("config {name:?}: unknown predicates {v:?} (own, view)"),
+            };
             let mut kernel = match &preset {
                 Some(p) => Preset::parse(p)
                     .with_context(|| format!("config {name:?}"))?
@@ -406,6 +422,7 @@ impl Experiment {
                 graph: resolve(dir, &graph),
                 starts_sidecar: starts_sidecar.map(|p| resolve(dir, &p)),
                 view,
+                view_predicates,
                 efforts,
                 calibration: calibration.map(|p| resolve(dir, &p)),
                 sketches_sidecar: sketches_sidecar.map(|p| resolve(dir, &p)),
@@ -567,6 +584,7 @@ mod tests {
         assert_eq!(e.configs[1].graph, Path::new("/abs/other"));
         assert_eq!(e.configs[1].kernel.beam_width, 2);
         assert_eq!(e.configs[1].overrides["starts"], "label(c*)+global");
+        assert!(!e.configs[1].view_predicates);
 
         let bad = |cfg: &str| {
             let t = format!(
@@ -582,6 +600,12 @@ mod tests {
         ));
         assert!(bad("[[config]]\nname='a'\n[[config]]\nname='a'"));
         assert!(bad("[[config]]\nname='a'\npreset='cp'"), "cp needs a view");
+        assert!(
+            bad("[[config]]\nname='a'\npredicates='view'"),
+            "predicates = view needs a view"
+        );
+        assert!(bad("[[config]]\nname='a'\nview='v'\npredicates='both'"));
+        assert!(!bad("[[config]]\nname='a'\nview='v'\npredicates='own'"));
         assert!(bad(""), "no configs");
         assert!(!bad("[[config]]\nname='a'\nefforts=[10]"));
         assert!(

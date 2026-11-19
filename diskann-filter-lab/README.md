@@ -345,7 +345,8 @@ graph = "/path/to/graph"         # default graph: a directory with graph.flab, a
 # calibration = "/path/to/costs.json"       # unit costs (flab calibrate) of the planned exact path
 # sketches_sidecar = "/path/to/sketches.flab" # bottom-b sketches (estimates = "sketch")
 # pairs_sidecar = "/path/to/pairs.flab"     # combination postings (the exact path's `pair` plan)
-# view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred
+# view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred (its
+#                                # predicates feed the presets that use a view: sfmarket, cp)
 queries = "q10K"                 # a whole query set, or:
 # panel = "panels/screen.tsv"    # TSV with columns qset, qidx (optional split); relative to the dataset
 # split = "discovery"            # panel filters
@@ -375,6 +376,8 @@ name = "inline-w4"
 preset = "upstream-inline"
 beam_width = 4                   # any role key of the table above
 # graph / starts_sidecar / view / calibration override the experiment's
+# predicates = "view"            # the view's predicates replace the queries' own (default "own"),
+#                                # e.g. an all-match view: the filter-less problem, same invocation
 # efforts = [100]                # a subset of the experiment's efforts (e.g. an L-independent
 #                                # exact path)
 
