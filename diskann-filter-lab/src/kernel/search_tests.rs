@@ -1088,6 +1088,112 @@ fn the_tree_route_serves_tree_eligible_queries() {
     }
 }
 
+#[test]
+fn the_static_bits_tree_route_checks_only_the_other_clauses() {
+    // A router (id 5) over the members 0, 2 and 4 of `x=1` (c*: 3 points vs `y=1`'s 4) is
+    // that label's only start; the members 0 and 4 also carry `y=1`.
+    let rows: &[&[&str]] = &[
+        &["x=1", "y=1"],
+        &["y=1"],
+        &["x=1", "y=2"],
+        &["y=1"],
+        &["x=1", "y=1"],
+    ];
+    let (base, mut g, labels) = line(rows, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    let id = |s: &str| labels.name_index()[s];
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(id("x=1"), 5), (id("y=1"), 1), (id("y=2"), 2)])
+        .unwrap();
+    let bitsets = LabelBitsets::build(&labels, 1);
+    let ix = Index {
+        graph: &g,
+        vectors: g.vectors(&base).unwrap(),
+        labels: &labels,
+        global: &[0],
+        label_starts: Some(&st),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 0.5,
+        bitsets: Some(&bitsets),
+        costs: None,
+        sketches: None,
+        pairs: None,
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    let mut out = Vec::new();
+    for route in ["row_scan", "static_bits"] {
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("tree_route", route),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        for (qi, want) in [(0, &[4u32, 0, u32::MAX][..]), (1, &[4, 2, 0][..])] {
+            let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
+            let q = Query {
+                vector: &[3.2f32],
+                cnf: preds.get(qi),
+                view: None,
+            };
+            let ctr = s.search(&plan, &ix, &q, 4, &mut ids, &mut d, None);
+            assert_eq!(ids, want, "{route} {qi}");
+            assert_eq!(ctr.route, Route::Tree);
+            out.push((ctr.n_expand, ctr.n_aux_expand, ctr.n_dist, ctr.n_pred));
+        }
+    }
+    // The same members checked and measured either way (the router, then the matches).
+    assert_eq!(out[..2], out[2..]);
+    assert_eq!(out[0], (1, 1, 3, 3));
+    // Under `cstar_members` a node is judged by the clauses other than c* alone: point 1
+    // (`y=1`, not `x=1`) passes, which only members of c*'s trees ever meet in the search.
+    let mut compiled = super::eval::Compiled::new();
+    let mut bits = vec![0u64; labels.n_labels()];
+    compiled.compile(
+        &labels,
+        preds.get(0),
+        super::eval::Weights::Unit,
+        None,
+        &mut bits,
+    );
+    compiled.residual_nav();
+    compiled.split_static(&labels, &bitsets, 1, false);
+    let cx = super::eval::EvalCtx::new(&labels, &compiled, &bits, &[], &[])
+        .with_static(&bitsets)
+        .cstar_members();
+    let pass = |v: u32| {
+        use super::eval::Eval;
+        super::eval::StaticBits::eval(&cx, v, false).m
+    };
+    assert_eq!(
+        (0..5).map(pass).collect::<Vec<_>>(),
+        [true, true, false, true, true]
+    );
+    // The route's checks need the static bitsets and a tree search from c*.
+    let mut k = kernel(&[("tree_route", "static_bits")]);
+    k.set("static_bitsets", "off").unwrap();
+    assert!(k.validate().is_err());
+    let mut k = kernel(&[]);
+    k.set("cstar_members", "on").unwrap();
+    assert!(k.validate().is_err());
+    kernel(&[
+        ("starts", "label(c*)"),
+        ("start_admission", "force"),
+        ("admission", "strict"),
+        ("expander", "aux_frontier"),
+        ("collector", "heap"),
+        ("terminator", "exhaust"),
+        ("laziness", "predicate_first"),
+        ("predicate", "static_bits(1)"),
+        ("cstar_members", "on"),
+    ]);
+}
+
 /// Six points on a line (x = i, all labelled `x=1`), leaf routers 6 (over 0, 1, 2; at 1) and
 /// 7 (over 3, 4, 5; at 4) under a root 8 (at 2.5), the root as the label's only start.
 fn router_tree() -> (Matrix<f32>, Graph, LabelStore, Starts) {

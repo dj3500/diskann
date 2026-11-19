@@ -501,6 +501,10 @@ pub struct Kernel {
     pub tree_effort: TreeEffort,
     /// When a tree-eligible query takes the tree route (`always` by default).
     pub tree_choice: TreeChoice,
+    /// `cstar_members = "on"`: every node the search evaluates is a member of `union(c*)` (a
+    /// router-tree search from c\*'s starts: `starts = "label(c*)"`, forced starts, only
+    /// routers expanded), so checks cover the other clauses only (off by default).
+    pub cstar_members: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -545,6 +549,10 @@ pub enum TreeRoute {
     RowScan,
     /// Member checks on a per-query dense match bitmap built with the static bitsets.
     Bitmap,
+    /// Member checks of the clauses other than c\* (which every member of c\*'s trees
+    /// satisfies; `cstar_members`) with the static bitsets, the row only for labels without
+    /// a bitset.
+    StaticBits,
 }
 
 impl TreeRoute {
@@ -553,7 +561,8 @@ impl TreeRoute {
             "off" => Self::Off,
             "row_scan" => Self::RowScan,
             "bitmap" => Self::Bitmap,
-            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap)"),
+            "static_bits" => Self::StaticBits,
+            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap, static_bits)"),
         })
     }
 }
@@ -564,6 +573,7 @@ impl fmt::Display for TreeRoute {
             Self::Off => "off",
             Self::RowScan => "row_scan",
             Self::Bitmap => "bitmap",
+            Self::StaticBits => "static_bits",
         })
     }
 }
@@ -690,6 +700,7 @@ impl Default for Kernel {
             tree_route: TreeRoute::Off,
             tree_effort: TreeEffort::List,
             tree_choice: TreeChoice::Always,
+            cstar_members: false,
         }
     }
 }
@@ -1246,6 +1257,13 @@ impl Kernel {
             "tree_route" => self.tree_route = TreeRoute::parse(value)?,
             "tree_effort" => self.tree_effort = TreeEffort::parse(value)?,
             "tree_choice" => self.tree_choice = TreeChoice::parse(value)?,
+            "cstar_members" => {
+                self.cstar_members = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown cstar_members {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1422,8 +1440,21 @@ impl Kernel {
             "static_bitsets = \"off\" excludes the static_bits predicate and the dense_static materializer"
         );
         ensure!(
-            !(self.static_bitsets_off && self.tree_route == TreeRoute::Bitmap),
-            "static_bitsets = \"off\" excludes tree_route = \"bitmap\" (its member checks use the static bitsets)"
+            !(self.static_bitsets_off
+                && matches!(self.tree_route, TreeRoute::Bitmap | TreeRoute::StaticBits)),
+            "static_bitsets = \"off\" excludes tree_route = \"bitmap\" and \"static_bits\" (their member checks use the static bitsets)"
+        );
+        ensure!(
+            !self.cstar_members
+                || (self.starts == [StartSource::LabelSmallest]
+                    && self.start_admission == StartAdmission::Force
+                    && self.admission == Admission::Strict
+                    && matches!(self.expander, Expander::AuxOnly | Expander::AuxFrontier)
+                    && matches!(
+                        self.predicate,
+                        PredicateMode::RowScan | PredicateMode::StaticBits(_)
+                    )),
+            "cstar_members = \"on\" needs a router-tree search from c*: starts = \"label(c*)\", start_admission = \"force\", admission = \"strict\", expander aux_only or aux_frontier, predicate row_scan or static_bits(θ)"
         );
         let bitmap = self.predicate == PredicateMode::Bitmap;
         ensure!(
@@ -1529,6 +1560,9 @@ impl Kernel {
         if self.tree_choice != TreeChoice::Always {
             j["tree_choice"] = json!(self.tree_choice.to_string());
         }
+        if self.cstar_members {
+            j["cstar_members"] = json!("on");
+        }
         j
     }
 
@@ -1538,6 +1572,8 @@ impl Kernel {
             TreeRoute::Off => return None,
             TreeRoute::RowScan => (PredicateMode::RowScan, Materializer::None),
             TreeRoute::Bitmap => (PredicateMode::Bitmap, Materializer::DenseStatic),
+            // θ = 0: the index's bitsets' θ (set by `Plan::new`).
+            TreeRoute::StaticBits => (PredicateMode::StaticBits(0), Materializer::None),
         };
         Some(Kernel {
             starts: vec![StartSource::LabelSmallest],
@@ -1556,6 +1592,7 @@ impl Kernel {
             materializer,
             weights: self.weights,
             phase_times: self.phase_times,
+            cstar_members: self.tree_route == TreeRoute::StaticBits,
             ..Kernel::default()
         })
     }

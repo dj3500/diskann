@@ -368,6 +368,27 @@ impl Compiled {
     /// Restricts navigation to the clause with the smallest `U_c` (position 0 of the Boolean
     /// order; admission `projection(c*)`). Called right after [`Self::compile`] without a
     /// projection; a no-op for queries with an empty clause or a single clause.
+    /// Navigation evaluates the residual clauses only (positions `1..`, not projected: the
+    /// navigation verdict is the answer verdict). For searches whose every evaluated node is a
+    /// member of `union(c*)` (`cstar_members`: clause 0 holds). Call before
+    /// [`Self::split_static`].
+    pub fn residual_nav(&mut self) {
+        if self.empty || self.n_clauses == 0 {
+            return;
+        }
+        self.nav.clear();
+        self.nav.extend(1..self.n_clauses as u32);
+        self.nav_weight = self.nav.iter().map(|&j| self.w[j as usize]).sum();
+        self.max_nav_weight = self
+            .nav
+            .iter()
+            .map(|&j| self.w[j as usize])
+            .fold(0.0, f32::max);
+        if self.use_bits {
+            self.nav_mask = self.full_mask & !1;
+        }
+    }
+
     pub fn project_smallest(&mut self) {
         if self.empty || self.n_clauses <= 1 {
             return;

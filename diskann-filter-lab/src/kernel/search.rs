@@ -348,6 +348,8 @@ pub struct Plan {
     projection: Option<Vec<u32>>,
     /// Admission `projection(c*)`: navigation evaluates only the query's binding clause.
     project_smallest: bool,
+    /// `cstar_members`: every evaluated node is a member of `union(c*)`; checks skip clause 0.
+    cstar_members: bool,
     two_hop_cap: usize,
     eval: EvalMode,
     /// `θ` of the `static_bits(θ)` mode.
@@ -546,6 +548,7 @@ impl Plan {
             kernel: kernel.clone(),
             projection,
             project_smallest: kernel.admission == Admission::ProjectionSmallest,
+            cstar_members: kernel.cstar_members,
             two_hop_cap,
             eval,
             static_theta,
@@ -558,7 +561,18 @@ impl Plan {
             exact_eval,
             tree: kernel
                 .tree_kernel()
-                .map(|k| Plan::new(&k, ix).map(Box::new))
+                .map(|mut k| {
+                    // The `static_bits` tree route checks with the index's bitsets at their θ.
+                    if k.predicate == PredicateMode::StaticBits(0) {
+                        let b = ix.bitsets.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "tree_route = static_bits needs static per-label bitsets"
+                            )
+                        })?;
+                        k.predicate = PredicateMode::StaticBits(b.theta());
+                    }
+                    Plan::new(&k, ix).map(Box::new)
+                })
                 .transpose()?,
             tree_fanout: if kernel.tree_choice == TreeChoice::Cost {
                 let (n, a) = (ix.graph.n_data() as u32, ix.graph.n_aux() as u32);
@@ -871,6 +885,9 @@ impl Searcher {
         );
         if plan.project_smallest {
             self.compiled.project_smallest();
+        }
+        if plan.cstar_members {
+            self.compiled.residual_nav();
         }
         let stat = (plan.eval == EvalMode::StaticBits).then(|| {
             let b = ix
@@ -2732,6 +2749,9 @@ fn run<T: Element, P: Eval, S: Score>(
     let mut cx = EvalCtx::new(ix.labels, compiled, bits, &mat.dense, &mat.sparse);
     if let (EvalMode::StaticBits, Some(b)) = (plan.eval, ix.bitsets) {
         cx = cx.with_static(b);
+    }
+    if plan.cstar_members {
+        cx = cx.cstar_members();
     }
     let sc = S::new(&plan.score_params(compiled, &scales));
     let mut beam = std::mem::take(S::beam(beam32, beam64));
