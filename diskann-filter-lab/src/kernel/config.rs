@@ -571,6 +571,10 @@ pub enum TreeEffort {
     /// As `curve`, at most the router's `effort_curve(cap)` times the curve's list size at `K`
     /// members (the graph route's cap on selective queries, applied to the tree route).
     Capped,
+    /// One router frontier `F` for every query and effort (`fixed(F)`, `F ≥ 1`): the list holds
+    /// routers only. A configuration's grid of efforts then pairs each graph effort with the
+    /// same tree frontier; needs no tree effort curve.
+    Fixed(u32),
 }
 
 impl TreeEffort {
@@ -579,18 +583,29 @@ impl TreeEffort {
             "list" => Self::List,
             "curve" => Self::Curve,
             "capped" => Self::Capped,
-            v => bail!("unknown tree_effort {v:?} (list, curve, capped)"),
+            v => match v.strip_prefix("fixed(").and_then(|r| r.strip_suffix(')')) {
+                Some(f) => {
+                    let f: u32 = f
+                        .trim()
+                        .parse()
+                        .with_context(|| format!("tree_effort {v:?}: F must be an integer"))?;
+                    ensure!(f >= 1, "tree_effort {v:?}: F must be at least 1");
+                    Self::Fixed(f)
+                }
+                None => bail!("unknown tree_effort {v:?} (list, curve, capped, fixed(F))"),
+            },
         })
     }
 }
 
 impl fmt::Display for TreeEffort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::List => "list",
-            Self::Curve => "curve",
-            Self::Capped => "capped",
-        })
+        match self {
+            Self::List => f.write_str("list"),
+            Self::Curve => f.write_str("curve"),
+            Self::Capped => f.write_str("capped"),
+            Self::Fixed(n) => write!(f, "fixed({n})"),
+        }
     }
 }
 
@@ -1279,18 +1294,24 @@ impl Kernel {
             self.expander != Expander::AuxFrontier || self.collector == Collector::Heap,
             "aux_frontier collects matches in the heap collector only (they never enter the list)"
         );
-        ensure!(
-            self.tree_effort == TreeEffort::List
-                || (self.tree_route != TreeRoute::Off
-                    && matches!(self.terminator, Terminator::EffortCurve { .. })),
-            "tree_effort = curve / capped needs the tree route and effort_curve efforts (a target recall)"
-        );
+        match self.tree_effort {
+            TreeEffort::List => {}
+            TreeEffort::Fixed(_) => ensure!(
+                self.tree_route != TreeRoute::Off,
+                "tree_effort = fixed(F) needs the tree route"
+            ),
+            TreeEffort::Curve | TreeEffort::Capped => ensure!(
+                self.tree_route != TreeRoute::Off
+                    && matches!(self.terminator, Terminator::EffortCurve { .. }),
+                "tree_effort = curve / capped needs the tree route and effort_curve efforts (a target recall)"
+            ),
+        }
         ensure!(
             self.tree_choice == TreeChoice::Always
                 || (self.tree_route != TreeRoute::Off
                     && self.tree_effort != TreeEffort::List
                     && matches!(self.crossover, Crossover::Cost | Crossover::Graph)),
-            "tree_choice = cost needs the tree route, a tree effort curve and a cost crossover (cost or graph)"
+            "tree_choice = cost needs the tree route, a tree effort (curve, capped or fixed) and a cost crossover (cost or graph)"
         );
         let two_hop = matches!(self.expander, Expander::TwoHop(_));
         match self.laziness {
@@ -1465,7 +1486,9 @@ impl Kernel {
             collector: Collector::Heap,
             expander: match self.tree_effort {
                 TreeEffort::List => Expander::AuxOnly,
-                TreeEffort::Curve | TreeEffort::Capped => Expander::AuxFrontier,
+                TreeEffort::Curve | TreeEffort::Capped | TreeEffort::Fixed(_) => {
+                    Expander::AuxFrontier
+                }
             },
             terminator: Terminator::Exhaust,
             predicate,

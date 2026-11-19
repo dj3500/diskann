@@ -490,7 +490,7 @@ impl Plan {
                 "effort_curve needs unit costs with an effort curve (effort_r, effort_k, effort_l)"
             );
         }
-        if kernel.tree_effort != TreeEffort::List {
+        if matches!(kernel.tree_effort, TreeEffort::Curve | TreeEffort::Capped) {
             ensure!(
                 costs.as_ref().is_some_and(|c| !c.tree_r.is_empty()),
                 "tree_effort = curve / capped needs unit costs with a tree effort curve (flab tree-calibrate)"
@@ -828,6 +828,7 @@ impl Searcher {
                 };
                 let l_tree = match plan.kernel.tree_effort {
                     TreeEffort::List => l,
+                    TreeEffort::Fixed(f) => f as usize,
                     TreeEffort::Curve | TreeEffort::Capped => {
                         self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
                     }
@@ -1615,8 +1616,8 @@ fn planned_l(l0: usize, est: &Estimates, scale: f64) -> usize {
     ((l0 as f64) * l_multiplier(rate, scale)).round().max(1.0) as usize
 }
 
-/// The tree route's router frontier for the estimates `est` (see `Searcher::tree_list_size`),
-/// with the clause size `Â` and the match share `ρ̂` it used.
+/// The tree route's router frontier for the estimates `est` (see `Searcher::tree_list_size`;
+/// `tree_effort = fixed(F)`: `F`), with the clause size `Â` and the match share `ρ̂` it used.
 fn tree_frontier(
     plan: &Plan,
     est: &Estimates,
@@ -1624,9 +1625,12 @@ fn tree_frontier(
     k: usize,
     n_nodes: usize,
 ) -> (usize, f64, f64) {
-    let costs = plan.costs.as_ref().expect("validated: a tree effort curve");
     let a = est.a.max(1.0);
     let rho = (est.m / a).clamp(1.0 / a, 1.0);
+    if let TreeEffort::Fixed(f) = plan.kernel.tree_effort {
+        return ((f as usize).clamp(1, n_nodes.max(1)), a, rho);
+    }
+    let costs = plan.costs.as_ref().expect("validated: a tree effort curve");
     let kprime = (k.max(1) as f64 / rho).min(a);
     let r = effort as f64 / 1000.0;
     let mut l = costs

@@ -1263,6 +1263,53 @@ fn the_tree_effort_curve_sets_the_tree_list_size() {
     assert!(Plan::new(&k, &ix0).is_err());
 }
 
+#[test]
+fn a_fixed_tree_effort_uses_one_frontier_for_every_effort() {
+    use super::config::TreeEffort;
+    assert_eq!(
+        TreeEffort::parse("fixed(16)").unwrap(),
+        TreeEffort::Fixed(16)
+    );
+    assert_eq!(TreeEffort::Fixed(16).to_string(), "fixed(16)");
+    assert!(TreeEffort::parse("fixed(0)").is_err());
+    assert!(TreeEffort::parse("fixed(x)").is_err());
+    let (base, g, labels, st) = router_tree();
+    // No unit costs: a fixed frontier needs no tree effort curve.
+    let ix = tree_index(&base, &g, &labels, &st);
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"]]);
+    let preds = pb.finish();
+    // Frontier 1: the root, then the router nearer the query; frontier 2: both routers.
+    for (frontier, want) in [(1, vec![5u32, 4, 3]), (2, vec![5, 4, 3, 2, 1, 0])] {
+        let fixed = format!("fixed({frontier})");
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("terminator", "exhaust"),
+            ("tree_route", "row_scan"),
+            ("tree_effort", fixed.as_str()),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        for effort in [1, 6, 100] {
+            let (mut ids, mut d) = (vec![0u32; 6], vec![0f32; 6]);
+            let q = Query {
+                vector: &[5.0f32],
+                cnf: preds.get(0),
+                view: None,
+            };
+            let ctr = s.search(&plan, &ix, &q, effort, &mut ids, &mut d, None);
+            ids.truncate(ctr.n_out as usize);
+            assert_eq!(ctr.route, Route::Tree);
+            assert_eq!(ids, want, "frontier {frontier}, effort {effort}");
+        }
+    }
+    // The tree route is required.
+    let mut k = kernel(&[("collector", "heap"), ("terminator", "exhaust")]);
+    k.tree_effort = TreeEffort::Fixed(4);
+    assert!(k.validate().is_err());
+}
+
 /// Ten points on a line; label x on 0..=5 under routers 10 = {0, 1, 2}, 11 = {3, 4, 5} and
 /// the root 12; label y on {1, 3, 5, 6, ..., 9}: x AND y keeps half of x (rho = 0.5).
 fn diluted_tree() -> (Matrix<f32>, Graph, LabelStore, Starts) {
