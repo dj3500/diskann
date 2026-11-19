@@ -363,9 +363,10 @@ enum SketchesCommand {
 
 #[derive(Subcommand)]
 enum PairsCommand {
-    /// Select and build the combination postings for each budget: writes `pairs-b<per-mille>.flab`
-    /// and `pairs-b<per-mille>.json` (sizes, build time, and the coverage of the `--report`
-    /// queries); `pairs-<prior>-b<per-mille>.*` under a prior other than `uniform`.
+    /// Select and build the combination postings for each budget: writes
+    /// `pairs-nested-b<per-mille>.flab` and `.json` (sizes, build time, and the coverage of the
+    /// `--report` queries); `pairs-<prior>-nested-b<per-mille>.*` under a prior other than
+    /// `uniform`, and without `-nested` for `--plain` selections.
     Build {
         /// The label store.
         #[arg(long)]
@@ -386,10 +387,14 @@ enum PairsCommand {
         /// gain per entry) or `rare` (as likely as the smaller label is frequent).
         #[arg(long, default_value = "uniform")]
         prior: diskann_filter_lab::pairs::Prior,
-        /// Nested selections: the budgets in increasing order, each keeping every pair of the
-        /// previous one (monotone in the budget); files `pairs[-<prior>]-nested-b*`.
-        #[arg(long)]
+        /// Nested selections (the default): a budget's selection keeps every pair of the
+        /// smaller budgets of its chain (the 1-2-5 ladder from 5 % below it), so that the
+        /// selections are monotone in the budget; budgets of one chain are built together.
+        #[arg(long, conflicts_with = "plain")]
         nested: bool,
+        /// Independent selections per budget (no smaller budget's pairs kept).
+        #[arg(long)]
+        plain: bool,
     },
 }
 
@@ -1414,7 +1419,8 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
             out_dir,
             report,
             prior,
-            nested,
+            nested: _,
+            plain,
         } => {
             let store = LabelStore::read(&labels)?;
             std::fs::create_dir_all(&out_dir)?;
@@ -1423,12 +1429,13 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
                 diskann_filter_lab::pairs::Prior::Uniform => "pairs".to_owned(),
                 p => format!("pairs-{}", p.as_str()),
             };
-            let mut budget = budget;
-            if nested {
+            if !plain {
                 stem += "-nested";
-                budget.sort_by(f64::total_cmp);
             }
-            let mut prev: Option<PairIndex> = None;
+            ensure!(
+                budget.iter().all(|&f| f > 0.0 && f.is_finite()),
+                "budgets must be positive"
+            );
             let preds = report
                 .iter()
                 .map(|p| {
@@ -1437,62 +1444,73 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
                     Ok((p.clone(), ps))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            for f in budget {
-                ensure!(f > 0.0, "budgets must be positive");
+            // Builds: one chain per remaining largest budget, writing every requested budget
+            // that is a step of it (plain: one budget per build).
+            let mut todo = budget;
+            todo.sort_by(f64::total_cmp);
+            todo.dedup();
+            while let Some(&top) = todo.last() {
+                let chain = if plain {
+                    vec![top]
+                } else {
+                    diskann_filter_lab::pairs::nested_chain(top)
+                };
+                let want: Vec<bool> = chain.iter().map(|f| todo.contains(f)).collect();
+                todo.retain(|f| !chain.contains(f));
+                let bytes: Vec<u64> = chain.iter().map(|f| (f * postings as f64) as u64).collect();
                 let t = Instant::now();
-                let (ix, stats) = PairIndex::build_nested(
-                    &store,
-                    (f * postings as f64) as u64,
-                    threads,
-                    prior,
-                    prev.as_ref().filter(|_| nested),
-                );
+                let built = PairIndex::build_chain(&store, &bytes, threads, prior, &want);
                 let build_s = secs(t);
-                let tag = format!("{}", (f * 1000.0).round() as u64);
-                let out = out_dir.join(format!("{stem}-b{tag}.flab"));
-                ix.write(&out)?;
-                ensure!(
-                    PairIndex::read(&out)? == ix,
-                    "{} does not read back identically",
-                    out.display()
-                );
-                ix.check_sample(&store, 97)?;
-                let mut cov = Vec::new();
-                for (path, ps) in &preds {
-                    cov.push(pair_coverage(&ix, &store, ps, path));
+                for (f, step) in chain.iter().zip(built) {
+                    let Some((ix, stats)) = step else { continue };
+                    let f = *f;
+                    let tag = format!("{}", (f * 1000.0).round() as u64);
+                    let out = out_dir.join(format!("{stem}-b{tag}.flab"));
+                    ix.write(&out)?;
+                    ensure!(
+                        PairIndex::read(&out)? == ix,
+                        "{} does not read back identically",
+                        out.display()
+                    );
+                    ix.check_sample(&store, 97)?;
+                    let mut cov = Vec::new();
+                    for (path, ps) in &preds {
+                        cov.push(pair_coverage(&ix, &store, ps, path));
+                    }
+                    let report = json!({
+                        "labels": labels,
+                        "n_points": store.n_points(),
+                        "n_labels": store.n_labels(),
+                        "budget_fraction": f,
+                        "nested": !plain,
+                        "chain": chain,
+                        "stats": stats,
+                        "build_s": build_s,
+                        "build_note": "build_s: the whole chain's build (shared by its outputs)",
+                        "threads": threads,
+                        "coverage": cov,
+                        "output": out,
+                    });
+                    std::fs::write(
+                        out_dir.join(format!("{stem}-b{tag}.json")),
+                        serde_json::to_string_pretty(&report)? + "\n",
+                    )?;
+                    println!(
+                        "budget {f}: T {} ({} big labels, matrix {:.1} MiB), {} co-occurring big pairs, {} stored ({} entries), {:.1} MiB = {:.1} % of the postings; {build_s:.1} s (chain {chain:?}) -> {}",
+                        stats.t_big,
+                        stats.n_big,
+                        stats.matrix_bytes as f64 / (1u64 << 20) as f64,
+                        stats.cooc_pairs,
+                        stats.stored_pairs,
+                        stats.stored_entries,
+                        stats.bytes as f64 / (1u64 << 20) as f64,
+                        100.0 * stats.bytes as f64 / postings.max(1) as f64,
+                        out.display()
+                    );
+                    for c in &cov {
+                        println!("  {c}");
+                    }
                 }
-                let report = json!({
-                    "labels": labels,
-                    "n_points": store.n_points(),
-                    "n_labels": store.n_labels(),
-                    "budget_fraction": f,
-                    "nested": nested,
-                    "stats": stats,
-                    "build_s": build_s,
-                    "threads": threads,
-                    "coverage": cov,
-                    "output": out,
-                });
-                std::fs::write(
-                    out_dir.join(format!("{stem}-b{tag}.json")),
-                    serde_json::to_string_pretty(&report)? + "\n",
-                )?;
-                println!(
-                    "budget {f}: T {} ({} big labels, matrix {:.1} MiB), {} co-occurring big pairs, {} stored ({} entries), {:.1} MiB = {:.1} % of the postings; {build_s:.1} s -> {}",
-                    stats.t_big,
-                    stats.n_big,
-                    stats.matrix_bytes as f64 / (1u64 << 20) as f64,
-                    stats.cooc_pairs,
-                    stats.stored_pairs,
-                    stats.stored_entries,
-                    stats.bytes as f64 / (1u64 << 20) as f64,
-                    100.0 * stats.bytes as f64 / postings.max(1) as f64,
-                    out.display()
-                );
-                for c in &cov {
-                    println!("  {c}");
-                }
-                prev = Some(ix);
             }
         }
     }
@@ -1513,10 +1531,20 @@ fn pair_coverage(ix: &PairIndex, store: &LabelStore, ps: &PredicateSet, path: &P
         }
         multi += 1;
         let bound = (0..cnf.n_clauses())
-            .map(|i| cnf.clause(i).iter().map(|&l| store.posting_len(l) as u64).sum::<u64>())
+            .map(|i| {
+                cnf.clause(i)
+                    .iter()
+                    .map(|&l| store.posting_len(l) as u64)
+                    .sum::<u64>()
+            })
             .min()
             .unwrap_or(0);
-        if ix.cover(cnf.n_clauses(), |i| cnf.clause(i), |l| store.posting_len(l), &mut cov) {
+        if ix.cover(
+            cnf.n_clauses(),
+            |i| cnf.clause(i),
+            |l| store.posting_len(l),
+            &mut cov,
+        ) {
             exact += usize::from(cov.exact);
             let r = bound as f64 / (cov.entries.max(1)) as f64;
             x2 += usize::from(r >= 2.0);
@@ -1527,7 +1555,12 @@ fn pair_coverage(ix: &PairIndex, store: &LabelStore, ps: &PredicateSet, path: &P
         }
     }
     ratios.sort_unstable_by(f64::total_cmp);
-    let q = |f: f64| ratios.get(((ratios.len() as f64 - 1.0) * f) as usize).copied().unwrap_or(1.0);
+    let q = |f: f64| {
+        ratios
+            .get(((ratios.len() as f64 - 1.0) * f) as usize)
+            .copied()
+            .unwrap_or(1.0)
+    };
     json!({
         "predicates": path,
         "multi_clause": multi,

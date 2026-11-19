@@ -22,9 +22,11 @@
 //!   as likely as its smaller label is frequent (`rare`: a query's rarest label drawn like a
 //!   data point's label). Under `uniform` a larger budget, which lowers `T`, admits many pairs of
 //!   small labels with tiny joints (high gain per entry, small saving per query) that can
-//!   displace pairs of large labels; `rare` ranks those below; a *nested* build
-//!   ([`PairIndex::build_nested`]) keeps every pair of a smaller budget's selection, so that a
-//!   ladder of budgets is monotone;
+//!   displace pairs of large labels; `rare` ranks those below. A *nested* selection
+//!   ([`PairIndex::build_chain`]) is made along a chain of increasing budgets, each keeping every
+//!   pair of the previous one, so that it is monotone in the budget: a budget's chain is the
+//!   1-2-5 ladder from 5 % of the label postings below it, then the budget itself
+//!   ([`nested_chain`]);
 //! - the co-occurrence matrix tells which big pairs are empty: they need no list.
 //!
 //! A lookup of labels `(a, b)` answers [`Joint::Stored`] (the list), [`Joint::Empty`] (both big,
@@ -35,9 +37,11 @@
 //!
 //! Build: two passes over the postings of the big labels; for each big label `a` and member
 //! `p`, the labels of `p` after `a` in its row (two parallel passes: counts and histogram, then
-//! counts and lists). Memory: 4 bytes per label (big index), `N_big · ⌈N_big / 64⌉ · 8` bytes of
-//! matrix, `8 (N_big + 1)` bytes of row offsets, 12 bytes per stored pair and 4 bytes per
-//! stored entry.
+//! counts and lists). A chain is built in the same two passes at its last budget's `T` (the
+//! histogram is kept by key bin and by the size level of the pair's smaller label, from which
+//! every step's threshold follows). Memory: 4 bytes per label (big index),
+//! `N_big · ⌈N_big / 64⌉ · 8` bytes of matrix, `8 (N_big + 1)` bytes of row offsets, 12 bytes per
+//! stored pair and 4 bytes per stored entry.
 
 use std::{
     io::{Read, Seek, Write},
@@ -238,6 +242,42 @@ fn bin_floor(prior: Prior, b: usize) -> f64 {
     (prior.key_min_log2() + b as f64 / BINS_PER_OCTAVE).exp2()
 }
 
+/// Smallest step of the nested ladder, in per-mille of the label postings' bytes.
+pub const LADDER_FIRST_PERMILLE: u64 = 50;
+
+/// The nested chain of the budget fraction `f` (of the label postings' bytes): the steps of the
+/// 1-2-5 ladder from [`LADDER_FIRST_PERMILLE`] (5 %, 10 %, 20 %, 50 %, 100 %, 200 %, …) below
+/// `f`, then `f`. A budget's nested selection is that of its chain, whatever other budgets are
+/// built.
+pub fn nested_chain(f: f64) -> Vec<f64> {
+    let mut chain = Vec::new();
+    let mut decade = 1u64;
+    'ladder: loop {
+        for m in [1u64, 2, 5] {
+            let permille = m * decade;
+            if permille < LADDER_FIRST_PERMILLE {
+                continue;
+            }
+            let step = permille as f64 / 1000.0;
+            if step >= f || permille > 1 << 40 {
+                break 'ladder;
+            }
+            chain.push(step);
+        }
+        decade *= 10;
+    }
+    chain.push(f);
+    chain
+}
+
+/// Histogram levels: `⌊log2⌋` of the smaller label's size.
+const N_LEVELS: usize = 64;
+
+#[inline]
+fn level(size: u64) -> usize {
+    63 - size.max(1).leading_zeros() as usize
+}
+
 impl PairIndex {
     /// Selects and builds the combination postings of `labels` within `budget_bytes` under the
     /// `uniform` prior (with up to `threads` threads; the result does not depend on the thread
@@ -246,39 +286,56 @@ impl PairIndex {
         Self::build_with(labels, budget_bytes, threads, Prior::Uniform)
     }
 
-    /// [`Self::build`] under `prior`.
+    /// [`Self::build`] under `prior` (a single selection: no smaller budget's pairs kept).
     pub fn build_with(
         labels: &LabelStore,
         budget_bytes: u64,
         threads: usize,
         prior: Prior,
     ) -> (Self, PairStats) {
-        Self::build_nested(labels, budget_bytes, threads, prior, None)
+        let mut out = Self::build_chain(labels, &[budget_bytes], threads, prior, &[true]);
+        out.pop().flatten().expect("the only step is built")
     }
 
-    /// [`Self::build_with`] keeping every pair stored by `keep` (a selection at a smaller budget
-    /// of the same labels, whose big labels are then big here too): those are stored first and
-    /// the rest of the budget goes to the best other pairs, so that a ladder of budgets stores
-    /// nested selections (monotone in the budget although `T` falls with it).
-    pub fn build_nested(
+    /// Nested selections along the non-decreasing budgets `budgets` (bytes): step `k` (with its
+    /// own `T`, which falls as the budget grows) stores every pair of step `k − 1` first and
+    /// gives the rest of its budget to the best other pairs, so that the selections are
+    /// monotone in the budget. One build at the last step's `T`: the first pass histograms the
+    /// candidate pairs by key bin and by the level `⌊log2 min(|P_a|, |P_b|)⌋` (a pair is a
+    /// candidate of step `k` iff its level is at least `log2 T_k`), every step's threshold is
+    /// read from it in turn, and the second pass stores the pairs of the last step. Returns the
+    /// index and statistics of every step `k` with `want[k]` (the earlier steps' indices are
+    /// subsets of the last one: its big labels at their `T`, their stored pairs).
+    pub fn build_chain(
         labels: &LabelStore,
-        budget_bytes: u64,
+        budgets: &[u64],
         threads: usize,
         prior: Prior,
-        keep: Option<&PairIndex>,
-    ) -> (Self, PairStats) {
+        want: &[bool],
+    ) -> Vec<Option<(Self, PairStats)>> {
+        assert!(!budgets.is_empty() && want.len() == budgets.len());
+        assert!(
+            budgets.windows(2).all(|w| w[0] <= w[1]),
+            "the budgets of a chain must not decrease"
+        );
         let nl = labels.n_labels();
         let n = labels.n_points() as u64;
         let sizes: Vec<u64> = (0..nl as u32)
             .map(|l| labels.posting_len(l) as u64)
             .collect();
-        // Size threshold: the smallest power of two ≥ T_MIN whose matrix fits a quarter.
+        // Size threshold of a budget: the smallest power of two ≥ T_MIN whose matrix fits a
+        // quarter of it.
         let matrix_bytes = |nb: usize| (nb * nb.div_ceil(64) * 8) as u64;
         let n_big_at = |t: u64| sizes.iter().filter(|&&s| s >= t).count();
-        let mut t = T_MIN;
-        while matrix_bytes(n_big_at(t)) > budget_bytes / 4 && t < (1 << 40) {
-            t *= 2;
-        }
+        let t_of = |budget: u64| {
+            let mut t = T_MIN;
+            while matrix_bytes(n_big_at(t)) > budget / 4 && t < (1 << 40) {
+                t *= 2;
+            }
+            t
+        };
+        let ts: Vec<u64> = budgets.iter().map(|&b| t_of(b)).collect();
+        let t = ts[ts.len() - 1];
         let mut big = vec![NONE; nl];
         let mut big_labels = Vec::new();
         for l in 0..nl {
@@ -289,27 +346,21 @@ impl PairIndex {
         }
         let nb = big_labels.len();
         let words = nb.div_ceil(64);
-        let mut stats = PairStats {
-            budget_bytes,
-            prior,
-            t_big: t,
-            n_big: nb,
-            big_entries: big_labels.iter().map(|&l| sizes[l as usize]).sum(),
-            matrix_bytes: matrix_bytes(nb),
-            postings_bytes: 4 * labels.n_entries() as u64,
-            ..PairStats::default()
-        };
 
-        // Pass 1: co-occurrence rows and the histogram of gain/cost, weighted by cost.
+        // Pass 1: co-occurrence rows and the histogram of the pairs' cost by (level, key bin).
         struct Scratch {
             count: Vec<u32>,
             touched: Vec<u32>,
             slot: Vec<u32>,
+            hist: Vec<u64>,
+            cells: Vec<u32>,
         }
         let init = || Scratch {
             count: vec![0; nb],
             touched: Vec::new(),
             slot: vec![NONE; nb],
+            hist: Vec::new(),
+            cells: Vec::new(),
         };
         let count_row = |r: usize, s: &mut Scratch| {
             let a = big_labels[r];
@@ -331,90 +382,115 @@ impl PairIndex {
             s.touched.sort_unstable();
         };
         let size_of = |c: u32| sizes[big_labels[c as usize] as usize];
-        let kept = |r: u32, c: u32| {
-            keep.is_some_and(|k| {
-                matches!(
-                    k.joint(big_labels[r as usize], big_labels[c as usize]),
-                    Joint::Stored(..)
-                )
-            })
+        // Histogram cell of a pair: its level and key bin.
+        let cell = |sa: u64, c: u32, j: u64| {
+            let min = sa.min(size_of(c));
+            level(min) * N_BINS + key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n)
         };
         let pass1 = parallel::par_map(nb, threads, init, |r, s| {
             count_row(r, s);
+            if s.hist.is_empty() {
+                s.hist = vec![0; N_LEVELS * N_BINS];
+            }
             let sa = size_of(r as u32);
             let mut bits = vec![0u64; words];
-            let mut row_hist = [0u64; N_BINS];
-            let mut forced = 0u64;
+            s.cells.clear();
             for &c in &s.touched {
                 let j = u64::from(s.count[c as usize]);
                 s.count[c as usize] = 0;
                 bits[c as usize / 64] |= 1u64 << (c % 64);
-                if kept(r as u32, c) {
-                    forced += j + PAIR_OVERHEAD;
-                    continue;
+                let x = cell(sa, c, j);
+                if s.hist[x] == 0 {
+                    s.cells.push(x as u32);
                 }
-                let min = sa.min(size_of(c));
-                row_hist[key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n)] += j + PAIR_OVERHEAD;
+                s.hist[x] += j + PAIR_OVERHEAD;
             }
-            let hist: Vec<(u16, u64)> = row_hist
+            let hist: Vec<(u32, u64)> = s
+                .cells
                 .iter()
-                .enumerate()
-                .filter(|&(_, &v)| v > 0)
-                .map(|(b, &v)| (b as u16, v))
+                .map(|&x| (x, std::mem::take(&mut s.hist[x as usize])))
                 .collect();
-            (bits, hist, s.touched.len() as u64, forced)
+            (bits, hist, s.touched.len() as u64)
         });
         let mut cooc = vec![0u64; nb * words];
-        let mut hist = vec![0u64; N_BINS];
-        let mut forced = 0u64;
-        for (r, (bits, h, n, f)) in pass1.into_iter().enumerate() {
+        let mut hist = vec![0u64; N_LEVELS * N_BINS];
+        let mut cooc_pairs = 0u64;
+        for (r, (bits, h, n)) in pass1.into_iter().enumerate() {
             cooc[r * words..(r + 1) * words].copy_from_slice(&bits);
-            for (b, cost) in h {
-                hist[b as usize] += cost;
+            for (x, cost) in h {
+                hist[x as usize] += cost;
             }
-            stats.cooc_pairs += n;
-            forced += f;
+            cooc_pairs += n;
         }
-        // Threshold: whole bins from the highest ratio down while the budget lasts.
-        let fixed = 4 * nl as u64 + stats.matrix_bytes + 8 * (nb as u64 + 2);
-        let avail = budget_bytes.saturating_sub(fixed) / 4;
-        let mut used = forced;
-        let mut cut = N_BINS;
-        for b in (1..N_BINS).rev() {
-            if used + hist[b] > avail {
-                break;
-            }
-            used += hist[b];
-            cut = b;
-        }
-        let ratio = if cut >= N_BINS {
-            f64::INFINITY
-        } else {
-            bin_floor(prior, cut)
-        };
-        stats.ratio = ratio;
 
-        // Pass 2: the lists of the selected pairs.
+        // The steps' thresholds: step k's candidates are the cells at levels ≥ log2 T_k; the
+        // cells of earlier steps are kept (forced), the others are taken by whole key bins from
+        // the highest down while the budget lasts. `first[cell]`: the first step storing it.
+        let mut first = vec![0u8; N_LEVELS * N_BINS];
+        let mut ratios = Vec::with_capacity(budgets.len());
+        for (k, (&budget, &tk)) in budgets.iter().zip(&ts).enumerate() {
+            let nbk = n_big_at(tk);
+            let fixed = 4 * nl as u64 + matrix_bytes(nbk) + 8 * (nbk as u64 + 2);
+            let avail = budget.saturating_sub(fixed) / 4;
+            let mut free = vec![0u64; N_BINS];
+            let mut used = 0u64;
+            for lv in level(tk)..N_LEVELS {
+                for b in 0..N_BINS {
+                    let x = lv * N_BINS + b;
+                    if first[x] != 0 {
+                        used += hist[x];
+                    } else {
+                        free[b] += hist[x];
+                    }
+                }
+            }
+            let mut cut = N_BINS;
+            for b in (1..N_BINS).rev() {
+                if used + free[b] > avail {
+                    break;
+                }
+                used += free[b];
+                cut = b;
+            }
+            for lv in level(tk)..N_LEVELS {
+                for b in cut..N_BINS {
+                    let x = lv * N_BINS + b;
+                    if first[x] == 0 {
+                        first[x] = u8::try_from(k + 1).expect("at most 255 steps");
+                    }
+                }
+            }
+            ratios.push(if cut >= N_BINS {
+                f64::INFINITY
+            } else {
+                bin_floor(prior, cut)
+            });
+        }
+
+        // Pass 2: the lists of the last step's pairs (with the first step storing each).
+        let any = first.iter().any(|&f| f != 0);
         let pass2 = parallel::par_map(nb, threads, init, |r, s| {
             let mut partners = Vec::new();
+            let mut steps = Vec::new();
             let mut lens = Vec::new();
             let mut points = Vec::new();
-            if cut >= N_BINS && forced == 0 {
-                return (partners, lens, points);
+            if !any {
+                return (partners, steps, lens, points);
             }
             count_row(r, s);
             let sa = size_of(r as u32);
             for &c in &s.touched {
                 let j = u64::from(s.count[c as usize]);
                 s.count[c as usize] = 0;
-                let min = sa.min(size_of(c));
-                if kept(r as u32, c) || key_bin(prior, min, min - j, j + PAIR_OVERHEAD, n) >= cut {
+                let f = first[cell(sa, c, j)];
+                if f != 0 {
                     s.slot[c as usize] = partners.len() as u32;
                     partners.push(c);
+                    steps.push(f);
                 }
             }
             if partners.is_empty() {
-                return (partners, lens, points);
+                return (partners, steps, lens, points);
             }
             let mut lists: Vec<Vec<u32>> = vec![Vec::new(); partners.len()];
             let a = big_labels[r];
@@ -436,22 +512,123 @@ impl PairIndex {
                 lens.push(list.len() as u64);
                 points.extend_from_slice(list);
             }
-            (partners, lens, points)
+            (partners, steps, lens, points)
         });
         let mut row_offsets = Vec::with_capacity(nb + 1);
         row_offsets.push(0u64);
-        let (mut partners, mut list_offsets, mut points) = (Vec::new(), vec![0u64], Vec::new());
-        for (ps, lens, pts) in pass2 {
+        let (mut partners, mut steps) = (Vec::new(), Vec::new());
+        let (mut list_offsets, mut points) = (vec![0u64], Vec::new());
+        for (ps, st, lens, pts) in pass2 {
             partners.extend_from_slice(&ps);
+            steps.extend_from_slice(&st);
             row_offsets.push(partners.len() as u64);
             for len in lens {
                 list_offsets.push(list_offsets.last().copied().unwrap_or(0) + len);
             }
             points.extend_from_slice(&pts);
         }
-        let ix = Self {
+        let last = Self {
             n_points: labels.n_points(),
             dict_hash: labels.dict_hash(),
+            t_big: t,
+            ratio: ratios[ratios.len() - 1],
+            big,
+            n_big: nb,
+            words,
+            cooc,
+            row_offsets,
+            partners,
+            list_offsets,
+            points,
+        };
+        let stats_of = |ix: &Self, k: usize, cooc_pairs: u64| PairStats {
+            budget_bytes: budgets[k],
+            prior,
+            t_big: ix.t_big,
+            n_big: ix.n_big,
+            big_entries: sizes.iter().filter(|&&s| s >= ix.t_big).sum(),
+            cooc_pairs,
+            stored_pairs: ix.partners.len() as u64,
+            stored_entries: ix.points.len() as u64,
+            ratio: ix.ratio,
+            matrix_bytes: matrix_bytes(ix.n_big),
+            bytes: ix.bytes(),
+            postings_bytes: 4 * labels.n_entries() as u64,
+        };
+        let m = budgets.len() - 1;
+        let mut out: Vec<Option<(Self, PairStats)>> = (0..m)
+            .map(|k| {
+                want[k].then(|| {
+                    let (ix, cooc_pairs) = last.step(&sizes, ts[k], ratios[k], &steps, k + 1);
+                    let st = stats_of(&ix, k, cooc_pairs);
+                    (ix, st)
+                })
+            })
+            .collect();
+        out.push(want[m].then(|| {
+            let st = stats_of(&last, m, cooc_pairs);
+            (last, st)
+        }));
+        out
+    }
+
+    /// The index of an earlier step of a chain built at this index's `T` (see
+    /// [`Self::build_chain`]): the labels of at least `t` members are big, the pairs whose
+    /// first step (`first`, by stored pair) is at most `step` are stored. Also returns the
+    /// number of co-occurring big pairs.
+    fn step(&self, sizes: &[u64], t: u64, ratio: f64, first: &[u8], step: usize) -> (Self, u64) {
+        let mut map = vec![NONE; self.n_big];
+        let mut big = vec![NONE; self.big.len()];
+        let mut nb = 0u32;
+        for (l, &b) in self.big.iter().enumerate() {
+            if b != NONE && sizes[l] >= t {
+                map[b as usize] = nb;
+                big[l] = nb;
+                nb += 1;
+            }
+        }
+        let nb = nb as usize;
+        let words = nb.div_ceil(64);
+        let mut cooc = vec![0u64; nb * words];
+        let mut cooc_pairs = 0u64;
+        let mut row_offsets = Vec::with_capacity(nb + 1);
+        row_offsets.push(0u64);
+        let (mut partners, mut list_offsets, mut points) = (Vec::new(), vec![0u64], Vec::new());
+        for (r, &rk) in map.iter().enumerate() {
+            if rk == NONE {
+                continue;
+            }
+            let rk = rk as usize;
+            for (w, &word) in self.cooc[r * self.words..(r + 1) * self.words]
+                .iter()
+                .enumerate()
+            {
+                let mut bits = word;
+                while bits != 0 {
+                    let c = map[w * 64 + bits.trailing_zeros() as usize];
+                    bits &= bits - 1;
+                    if c != NONE {
+                        cooc[rk * words + c as usize / 64] |= 1u64 << (c % 64);
+                        cooc_pairs += 1;
+                    }
+                }
+            }
+            for s in self.row_offsets[r] as usize..self.row_offsets[r + 1] as usize {
+                if usize::from(first[s]) <= step {
+                    let c = map[self.partners[s] as usize];
+                    debug_assert!(c != NONE, "a stored pair's labels are big at its step");
+                    partners.push(c);
+                    points.extend_from_slice(
+                        self.list(self.list_offsets[s], self.list_offsets[s + 1]),
+                    );
+                    list_offsets.push(points.len() as u64);
+                }
+            }
+            row_offsets.push(partners.len() as u64);
+        }
+        let ix = Self {
+            n_points: self.n_points,
+            dict_hash: self.dict_hash,
             t_big: t,
             ratio,
             big,
@@ -463,10 +640,7 @@ impl PairIndex {
             list_offsets,
             points,
         };
-        stats.stored_pairs = ix.partners.len() as u64;
-        stats.stored_entries = ix.points.len() as u64;
-        stats.bytes = ix.bytes();
-        (ix, stats)
+        (ix, cooc_pairs)
     }
 
     pub fn n_points(&self) -> usize {
@@ -887,37 +1061,87 @@ mod tests {
         r.check_sample(&s, 1).unwrap();
     }
 
-    #[test]
-    fn nested_builds_keep_the_smaller_budgets_pairs() {
-        let s = store();
-        let id = s.name_index();
-        let (a, b, c, e, x) = (id["a"], id["b"], id["c"], id["e"], id["x"]);
-        let labels = [a, b, c, e, x];
-        let stored = |ix: &PairIndex| -> Vec<(u32, u32)> {
-            let mut v = Vec::new();
-            for &p in &labels {
-                for &q in &labels {
-                    if p < q && matches!(ix.joint(p, q), Joint::Stored(..)) {
-                        v.push((p, q));
-                    }
+    /// Stored label pairs of `ix` among `labels`.
+    fn stored(ix: &PairIndex, labels: &[u32]) -> Vec<(u32, u32)> {
+        let mut v = Vec::new();
+        for &p in labels {
+            for &q in labels {
+                if p < q && matches!(ix.joint(p, q), Joint::Stored(..)) {
+                    v.push((p, q));
                 }
             }
-            v
-        };
-        let mut prev: Option<PairIndex> = None;
-        let mut last = Vec::new();
-        for budget in [200u64, 400, 800, 1 << 20] {
-            let (ix, st) = PairIndex::build_nested(&s, budget, 1, Prior::Uniform, prev.as_ref());
-            let now = stored(&ix);
-            assert!(
-                last.iter().all(|p| now.contains(p)),
-                "{last:?} not in {now:?} ({st:?})"
-            );
-            ix.check_sample(&s, 1).unwrap();
-            last = now;
-            prev = Some(ix);
         }
-        assert!(!last.is_empty());
+        v
+    }
+
+    #[test]
+    fn nested_chains_are_monotone_and_their_steps_match_shorter_chains() {
+        // 3,000 points, 150 labels of varied sizes (pseudo-random members), so that `T` falls
+        // along the chain and the steps store different pairs.
+        let mut rng = 12345u64;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as u32
+        };
+        let n = 3000u32;
+        let names: Vec<String> = (0..150).map(|l| format!("l{l}")).collect();
+        let mut rows: Vec<Vec<usize>> = vec![Vec::new(); n as usize];
+        for l in 0..150usize {
+            let size = 40 + (next() % 1500) * (next() % 2 + 1) / ((l as u32 % 7) + 1);
+            let start = next() % n;
+            for i in 0..size {
+                // Clustered members: overlaps between labels with nearby starts.
+                let p = (start + i * (1 + l as u32 % 3)) % n;
+                rows[p as usize].push(l);
+            }
+        }
+        let mut b = LabelStoreBuilder::new();
+        for row in &rows {
+            let mut v: Vec<(&str, &str)> = row.iter().map(|&l| ("k", names[l].as_str())).collect();
+            v.dedup();
+            b.push_point(v).unwrap();
+        }
+        let s = b.finish().unwrap();
+        let labels: Vec<u32> = (0..s.n_labels() as u32).collect();
+        let postings = 4 * s.n_entries() as u64;
+        let budgets: Vec<u64> = [0.01, 0.03, 0.1, 0.3]
+            .iter()
+            .map(|f| (f * postings as f64) as u64)
+            .collect();
+        for prior in [Prior::Uniform, Prior::Rare] {
+            let all = PairIndex::build_chain(&s, &budgets, 2, prior, &[true; 4]);
+            let mut ts = Vec::new();
+            let mut last: Vec<(u32, u32)> = Vec::new();
+            for (k, step) in all.iter().enumerate() {
+                let (ix, st) = step.as_ref().unwrap();
+                ix.check_sample(&s, 1).unwrap();
+                assert!(st.bytes <= st.budget_bytes, "{st:?}");
+                // A step equals the last step of the shorter chain (built at its own `T`).
+                let alone =
+                    PairIndex::build_chain(&s, &budgets[..=k], 1, prior, &vec![true; k + 1]);
+                let (ix1, st1) = alone[k].as_ref().unwrap();
+                assert_eq!(ix, ix1, "step {k} ({prior:?})");
+                assert_eq!(st.cooc_pairs, st1.cooc_pairs);
+                let now = stored(ix, &labels);
+                assert!(last.iter().all(|p| now.contains(p)), "step {k} drops pairs");
+                ts.push(st.t_big);
+                last = now;
+            }
+            assert!(ts[0] > ts[3], "T falls along the chain: {ts:?}");
+            assert!(!last.is_empty());
+            // The first step is a plain selection.
+            let (plain, _) = PairIndex::build_with(&s, budgets[0], 3, prior);
+            assert_eq!(&plain, &all[0].as_ref().unwrap().0);
+        }
+        // The ladder: steps below the budget, then the budget.
+        assert_eq!(nested_chain(0.2), vec![0.05, 0.1, 0.2]);
+        assert_eq!(nested_chain(0.5), vec![0.05, 0.1, 0.2, 0.5]);
+        assert_eq!(nested_chain(0.3), vec![0.05, 0.1, 0.2, 0.3]);
+        assert_eq!(nested_chain(0.05), vec![0.05]);
+        assert_eq!(nested_chain(0.01), vec![0.01]);
+        assert_eq!(nested_chain(2.5), vec![0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 2.5]);
     }
 
     #[test]

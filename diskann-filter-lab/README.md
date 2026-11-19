@@ -87,8 +87,9 @@ flab sketches build --labels labels.flab -b 64,128,256 -t 4 --out-dir <dir>
 flab sketches stats --labels labels.flab -b 64,128,256
 
 # Combination postings (joint postings of label pairs; budgets as fractions of the label postings'
-# bytes; one pairs-b<per-mille>.flab per budget, with the coverage of the --report predicate sets)
-flab pairs build --labels labels.flab --budget 0.05,0.2 -t 2 --out-dir <dir> --report q10K.fpred
+# bytes; one pairs-nested-b<per-mille>.flab per budget, with the coverage of the --report predicate
+# sets; nested selections by default, --plain for independent ones)
+flab pairs build --labels labels.flab --budget 0.2,0.5 -t 2 --out-dir <dir> --report q10K.fpred
 
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
@@ -237,7 +238,11 @@ A sixth plan, `pair` (batch B3a), needs combination postings (`pairs.flab`, modu
 the joint postings `P_a ∩ P_b` of label pairs selected from the label store alone under a
 budget (big labels of at least `T` points, `T` from the budget; pairs by decreasing saved
 candidates per stored entry, `(min(|P_a|, |P_b|) − |P_ab|) / (|P_ab| + 3)`; `--prior rare`
-weights that by `min(|P_a|, |P_b|) / n`). Per query the cover takes the clause pair whose
+weights that by `min(|P_a|, |P_b|) / n`). Selections are nested by default: a budget's
+selection keeps every pair of the smaller budgets of its chain (the 1-2-5 ladder from 5 % of the
+postings below it: 5 %, 10 %, 20 %, …), so that a larger budget stores a superset although its
+`T` is lower; a chain is built in the passes of a single build at its last `T`
+(`--plain`: one independent selection per budget). Per query the cover takes the clause pair whose
 lists (stored joint postings, nothing for empty pairs, the smaller posting otherwise) hold the
 fewest entries; the plan merges them, checks the other clauses (all of them when a label
 posting is among the lists; priced at that mask's worst-case work) and computes distances.
