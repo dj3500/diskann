@@ -10,7 +10,7 @@
 //! configurable loop costs a few percent more than these loops (`examples/kernel_overhead.rs`).
 
 use super::{Counters, Index, Query, Searcher, LOOKAHEAD};
-use crate::kernel::planner::Fallback;
+use crate::kernel::{config::LocalRate, planner::Fallback};
 use crate::{
     bitsets::LabelBitsets,
     kernel::{
@@ -237,6 +237,20 @@ impl Searcher {
                 if deferred && found == k {
                     bound = e.d;
                 }
+            }
+        }
+        if self.local_rate != LocalRate::Off && ctr.lr_t == 0 {
+            // `local_rate` (the first search of the route only): the matches among the list's
+            // entries up to the `K`-th one; `observe` also counts them among the first
+            // `⌈10 / r̂⌉` evaluated nodes (evaluation order, before the log is sorted).
+            (ctr.lr_m, ctr.lr_t) = (found as u64, taken as u64);
+            if self.local_rate == LocalRate::Observe && deferred && self.lr_rate > 0.0 {
+                let e = ((10.0 / self.lr_rate).ceil() as usize).min(log.len());
+                ctr.lr_e = e as u64;
+                ctr.lr_me = log[..e]
+                    .iter()
+                    .filter(|&&p| P::full(&cx, unpack(p).1))
+                    .count() as u64;
             }
         }
         if deferred && !stopped && k > 0 {

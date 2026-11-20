@@ -299,6 +299,50 @@ impl fmt::Display for PostfilterStarts {
     }
 }
 
+/// `local_rate`: the planned graph search's final list as evidence of the match rate around
+/// the query (A11). The planner sizes a graph search by the estimated global match rate `r̂`;
+/// a predicate that matches many points overall but few near the query ("broad but locally
+/// selective") leaves the list with far fewer matches than `t · r̂` among its `t` entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalRate {
+    /// Nothing (the default).
+    Off,
+    /// Counts the matches `m` among the `t` data entries of the final list of a post-filter or
+    /// inline graph search up to its `K`-th answer (the whole list when it holds fewer than
+    /// `K`; counters `lr_m`, `lr_t`), and, for the post-filter route, among the first
+    /// `⌈10 / r̂⌉` evaluated nodes in evaluation order (`lr_me`, `lr_e`; checks not counted);
+    /// answers unchanged.
+    Observe,
+    /// Counts `m` and `t` (not the first evaluated nodes) and re-plans a search whose list holds
+    /// fewer than `K` matches and significantly fewer than predicted (`t · r̂ − m > Z √(t · r̂)`)
+    /// with the observed rate `(m + 1) / (t + 2)`: the cheaper, by the cost model, of the exact
+    /// path seeded with the answers found (not under the graph crossover) and a new
+    /// post-filter search whose list reaches the `K`-th match's rank at that rate (counter
+    /// `lr_route`).
+    Replan,
+}
+
+impl LocalRate {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "off" => Self::Off,
+            "observe" => Self::Observe,
+            "replan" => Self::Replan,
+            _ => bail!("unknown local_rate {s:?} (off, observe, replan)"),
+        })
+    }
+}
+
+impl fmt::Display for LocalRate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Observe => "observe",
+            Self::Replan => "replan",
+        })
+    }
+}
+
 impl PostfilterRoute {
     pub fn parse(s: &str) -> Result<Self> {
         Ok(match s.trim() {
@@ -505,6 +549,9 @@ pub struct Kernel {
     /// router-tree search from c\*'s starts: `starts = "label(c*)"`, forced starts, only
     /// routers expanded), so checks cover the other clauses only (off by default).
     pub cstar_members: bool,
+    /// The final list of a graph search as evidence of the local match rate (`off` by
+    /// default).
+    pub local_rate: LocalRate,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -701,6 +748,7 @@ impl Default for Kernel {
             tree_effort: TreeEffort::List,
             tree_choice: TreeChoice::Always,
             cstar_members: false,
+            local_rate: LocalRate::Off,
         }
     }
 }
@@ -1264,6 +1312,7 @@ impl Kernel {
                     v => bail!("unknown cstar_members {v:?} (on, off)"),
                 }
             }
+            "local_rate" => self.local_rate = LocalRate::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1430,6 +1479,12 @@ impl Kernel {
                 "the post-filter route needs a cost crossover (its estimates and costs)"
             );
         }
+        ensure!(
+            self.local_rate == LocalRate::Off
+                || (matches!(self.crossover, Crossover::Cost | Crossover::Graph)
+                    && self.estimates == EstimateSource::Sketch),
+            "local_rate needs the cost or graph crossover with sketch estimates (the planned rate, the costs)"
+        );
         if let PredicateMode::StaticBits(t) = self.predicate {
             ensure!(t >= 1, "static_bits(θ) needs θ >= 1");
         }
@@ -1562,6 +1617,9 @@ impl Kernel {
         }
         if self.cstar_members {
             j["cstar_members"] = json!("on");
+        }
+        if self.local_rate != LocalRate::Off {
+            j["local_rate"] = json!(self.local_rate.to_string());
         }
         j
     }

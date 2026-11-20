@@ -53,6 +53,13 @@ struct Fixture {
 const DIM: usize = 6;
 
 fn fixture(n: usize, seed: u64, aux: bool) -> Fixture {
+    fixture_with(n, seed, aux, false)
+}
+
+/// [`fixture`]; `spatial`: the first `a` label of a point is its first coordinate's bin (six
+/// bins), so that a predicate on `a` matches a slab of the space (many points overall, none
+/// near a query outside the slab).
+fn fixture_with(n: usize, seed: u64, aux: bool, spatial: bool) -> Fixture {
     let mut rng = Lcg(seed);
     let mut data: Vec<u8> = (0..n * DIM).map(|_| rng.below(32) as u8).collect();
     // A few exact duplicates (with different labels below).
@@ -121,6 +128,11 @@ fn fixture(n: usize, seed: u64, aux: bool) -> Fixture {
     for i in 0..n {
         let mut row = Vec::new();
         let a = format!("a={}", rng.below(6));
+        let a = if spatial {
+            format!("a={}", u32::from(base.row(i)[0]) * 6 / 32)
+        } else {
+            a
+        };
         let a2 = format!("a={}", rng.below(6));
         let bb = format!("b={}", rng.below(3));
         let c = format!("c={}", i % 2);
@@ -3393,4 +3405,294 @@ fn projection_smallest_navigates_on_the_binding_clause() {
         }
     }
     assert!(checked > 40 && multi > 10, "{checked} {multi}");
+}
+
+/// v2's graph routes under the cost crossover (inline `posting_l`, the post-filter route with
+/// `by_rate_both_k` starts) with `local_rate`.
+fn local_rate_kernel(postfilter: &str, local_rate: &str) -> Kernel {
+    khpad(&[
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("terminator", "posting_l(4)"),
+        ("laziness", "heap_bound"),
+        ("postfilter", postfilter),
+        ("postfilter_starts", "by_rate_both_k"),
+        ("local_rate", local_rate),
+    ])
+}
+
+/// The counters other than `local_rate`'s.
+fn without_local_rate(c: &Counters) -> Vec<u64> {
+    Counters::NAMES
+        .iter()
+        .zip(c.values())
+        .filter(|(n, _)| !n.starts_with("lr_"))
+        .map(|(_, v)| v)
+        .collect()
+}
+
+#[test]
+fn local_rate_observe_changes_no_answer_or_counter() {
+    // `observe` counts the matches of a graph search's final list up to its K-th answer (the
+    // whole list when it holds fewer) and leaves the answers and every other counter as `off`;
+    // so does `replan` where it does not re-plan.
+    let f = fixture(300, 37, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let (mut inline, mut postfilter) = (0, 0);
+    for alpha in [0.25, 1.0, 4.0] {
+        let costs = super::cost::UnitCosts {
+            graph_alpha: alpha,
+            graph_beta: 10.0,
+            pred_ns: vec![50.0; 6],
+            dist_ns: vec![50.0; 6],
+            ..super::cost::UnitCosts::default()
+        };
+        let ix = Index {
+            costs: Some(&costs),
+            sketches: Some(&sketches),
+            ..f.index()
+        };
+        for pf in ["off", "cost"] {
+            let plans: Vec<Plan> = ["off", "observe", "replan"]
+                .into_iter()
+                .map(|lr| Plan::new(&local_rate_kernel(pf, lr), &ix).unwrap())
+                .collect();
+            let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+            for q in 0..f.preds.len() {
+                for kk in [1, 5, 10, 40] {
+                    let what = format!("alpha={alpha} postfilter={pf} q={q} K={kk}");
+                    let (off, octr) = search_ix(&f, &ix, &mut st, &plans[0], q, 8, kk);
+                    let (obs, nctr) = search_ix(&f, &ix, &mut st, &plans[1], q, 8, kk);
+                    let (rep, rctr) = search_ix(&f, &ix, &mut st, &plans[2], q, 8, kk);
+                    assert_eq!(obs, off, "{what}");
+                    assert_eq!(
+                        without_local_rate(&nctr),
+                        without_local_rate(&octr),
+                        "{what}"
+                    );
+                    assert_eq!((octr.lr_m, octr.lr_t, octr.lr_e), (0, 0, 0), "{what}");
+                    match octr.route {
+                        Route::Graph | Route::Postfilter => {
+                            assert!(nctr.lr_t > 0, "{what}");
+                            assert!(nctr.lr_m <= nctr.lr_t.min(kk as u64), "{what}");
+                            assert!(nctr.lr_e == 0 || octr.route == Route::Postfilter, "{what}");
+                            assert!(nctr.lr_me <= nctr.lr_e, "{what}");
+                            if octr.route == Route::Graph {
+                                inline += 1;
+                            } else {
+                                postfilter += 1;
+                            }
+                        }
+                        _ => assert_eq!((nctr.lr_m, nctr.lr_t), (0, 0), "{what}"),
+                    }
+                    assert_eq!((rctr.lr_m, rctr.lr_t), (nctr.lr_m, nctr.lr_t), "{what}");
+                    if rctr.lr_route == 0 {
+                        assert_eq!(rep, off, "{what}");
+                        assert_eq!(rctr.lr_e, 0, "{what}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        inline > 0 && postfilter > 0,
+        "{inline} inline, {postfilter} post-filter"
+    );
+    let mut k = local_rate_kernel("cost", "replan");
+    k.set("crossover", "threshold").unwrap();
+    k.set("postfilter", "off").unwrap();
+    assert!(k.validate().is_err());
+}
+
+#[test]
+fn local_rate_replan_never_loses_true_answers() {
+    // Where `replan` re-plans, its answers hold at least the true answers of the search it
+    // completes (the new post-filter search's are merged with them), and the exact path's
+    // answers are the true ones.
+    let f = fixture_with(300, 41, true, true);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let (mut exact, mut second) = (0, 0);
+    for unit in [1.0, 4.0, 20.0, 100.0, 400.0] {
+        let costs = super::cost::UnitCosts {
+            graph_alpha: 1.0,
+            graph_beta: 10.0,
+            pred_ns: vec![unit; 6],
+            dist_ns: vec![unit; 6],
+            ..super::cost::UnitCosts::default()
+        };
+        let ix = Index {
+            costs: Some(&costs),
+            sketches: Some(&sketches),
+            ..f.index()
+        };
+        for (pf, crossover) in [("off", "cost"), ("cost", "cost"), ("cost", "graph")] {
+            let plans: Vec<Plan> = ["off", "replan"]
+                .into_iter()
+                .map(|lr| {
+                    let mut k = local_rate_kernel(pf, lr);
+                    k.set("crossover", crossover).unwrap();
+                    Plan::new(&k, &ix).unwrap()
+                })
+                .collect();
+            let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+            for q in 0..f.preds.len() {
+                for kk in [5, 10, 40] {
+                    // Lists long enough to expect a few matches at the planned rate (a shortfall
+                    // is significant only beyond Z² ≈ 6.6 expected matches).
+                    for l in [32, 96] {
+                        let what = format!("unit={unit} {pf}/{crossover} q={q} K={kk} L={l}");
+                        let (off, _) = search_ix(&f, &ix, &mut st, &plans[0], q, l, kk);
+                        let (on, ctr) = search_ix(&f, &ix, &mut st, &plans[1], q, l, kk);
+                        check_properties(&f, q, &on, &what);
+                        let truth = f.truth(q, kk);
+                        let hits =
+                            |a: &[(f32, u32)]| a.iter().filter(|x| truth.contains(x)).count();
+                        assert!(hits(&on) >= hits(&off), "{what}");
+                        match ctr.lr_route {
+                            0 => assert_eq!(on, off, "{what}"),
+                            1 => {
+                                assert_eq!(crossover, "cost", "{what}: no exact path under graph");
+                                assert_eq!(on, truth, "{what}");
+                                exact += 1;
+                            }
+                            _ => {
+                                assert!(ctr.lr_m < kk as u64, "{what}");
+                                second += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        exact > 0 && second > 0,
+        "{exact} exact, {second} new searches"
+    );
+}
+
+#[test]
+fn local_rate_replan_answers_a_broad_predicate_without_matches_near_the_query() {
+    // Points on a line (coordinate 0 = the position), each linked to its 6 nearest along it;
+    // the predicate matches 40 % of the points, all at the far end. A query at the near end:
+    // the planned search (from the middle) ends with a list of points next to the query and
+    // no match among them, far fewer than the 40 % it was planned for. `replan` takes the
+    // exact path (seeded) where the cost model prices it below a longer list: the true answers;
+    // `off` returns the few matches the search evaluated on its way.
+    use super::cost::UnitCosts;
+    let n = 1000usize;
+    let mut rng = Lcg(5);
+    let data: Vec<u8> = (0..n * DIM)
+        .map(|i| {
+            if i % DIM == 0 {
+                (i / DIM / 4) as u8
+            } else {
+                rng.below(2) as u8
+            }
+        })
+        .collect();
+    let base = Matrix::from_slice(&data, n, DIM);
+    let queries = Matrix::from_slice(&[0u8; DIM], 1, DIM);
+    let mut graph = Graph::new(
+        n,
+        8,
+        AuxNodes::new(Vec::new(), &Matrix::<u8>::zeros(0, DIM)).unwrap(),
+    )
+    .unwrap();
+    for v in 0..n {
+        let nbrs: Vec<u32> = (v.saturating_sub(3)..(v + 4).min(n))
+            .filter(|&u| u != v)
+            .map(|u| u as u32)
+            .collect();
+        graph.set_neighbors(v as u32, &nbrs).unwrap();
+    }
+    graph.set_starts(vec![(n / 2) as u32]).unwrap();
+    let mut b = LabelStoreBuilder::new();
+    for i in 0..n {
+        let y = if i >= n * 6 / 10 { "y=1" } else { "y=0" };
+        b.push_point([("x", "x=1"), ("y", y)]).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["y=1"]]);
+    let preds = pb.finish();
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let q = Query {
+        vector: queries.row(0),
+        cnf: preds.get(0),
+        view: None,
+    };
+    let mut truth: Vec<(f32, u32)> = (0..n as u32)
+        .filter(|&p| preds.get(0).matches(labels.row(p)))
+        .map(|p| (u8::squared_l2(queries.row(0), base.row(p as usize)), p))
+        .collect();
+    truth.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut exact = 0;
+    for unit in [2.0, 8.0, 32.0, 128.0] {
+        let costs = UnitCosts {
+            graph_alpha: 2.0,
+            graph_beta: 10.0,
+            pred_ns: vec![unit; 6],
+            dist_ns: vec![unit; 6],
+            ..UnitCosts::default()
+        };
+        let ix = Index {
+            graph: &graph,
+            vectors: graph.vectors(&base).unwrap(),
+            labels: &labels,
+            global: graph.starts(),
+            label_starts: None,
+            sample: None,
+            label_view: false,
+            view_postings: None,
+            eps_min: 1.0,
+            bitsets: None,
+            costs: Some(&costs),
+            sketches: Some(&sketches),
+            pairs: None,
+        };
+        for pf in ["off", "cost"] {
+            let plans: Vec<Plan> = ["off", "replan"]
+                .into_iter()
+                .map(|lr| {
+                    let mut k = local_rate_kernel(pf, lr);
+                    k.set("starts", "global").unwrap();
+                    Plan::new(&k, &ix).unwrap()
+                })
+                .collect();
+            let mut st = Searcher::for_index(&ix, &plans.iter().collect::<Vec<_>>());
+            for kk in [5, 10] {
+                let mut run = |p: &Plan| {
+                    let mut ids = vec![0u32; kk];
+                    let mut d = vec![0f32; kk];
+                    let ctr = st.search(p, &ix, &q, 32, &mut ids, &mut d, None);
+                    let n_out = ctr.n_out as usize;
+                    let out: Vec<(f32, u32)> = d[..n_out]
+                        .iter()
+                        .copied()
+                        .zip(ids[..n_out].iter().copied())
+                        .collect();
+                    (out, ctr)
+                };
+                let (off, octr) = run(&plans[0]);
+                let (on, nctr) = run(&plans[1]);
+                let what = format!("unit={unit} postfilter={pf} K={kk}");
+                if octr.route == Route::Exact {
+                    continue;
+                }
+                assert_ne!(
+                    off,
+                    truth[..kk].to_vec(),
+                    "{what}: the planned search succeeds"
+                );
+                assert_eq!(nctr.lr_m, 0, "{what}");
+                if nctr.lr_route == 1 {
+                    assert_eq!(on, truth[..kk].to_vec(), "{what}");
+                    exact += 1;
+                }
+            }
+        }
+    }
+    assert!(exact > 0, "the exact re-plan never ran");
 }

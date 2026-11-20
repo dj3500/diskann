@@ -288,6 +288,9 @@ pub struct Decision {
     /// A post-filter search from the global starts is followed by a second search from the
     /// configured starts (`postfilter_starts = by_rate_both`).
     pub postfilter_both: bool,
+    /// The estimated match rate `M̂ / n` the graph search was planned with (0 for the decisions
+    /// made on the posting bounds without a probe).
+    pub rate: f64,
 }
 
 #[cfg(test)]

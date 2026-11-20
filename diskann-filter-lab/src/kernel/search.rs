@@ -16,8 +16,8 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{
-        Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator, TreeChoice, TreeEffort,
+        Crossover, EstimateSource, ExactChecks, LocalRate, PostfilterRoute, RowReads,
+        StartAdmission, StartSource, Terminator, TreeChoice, TreeEffort,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -203,6 +203,17 @@ pub struct Counters {
     pub t_decide_ns: u64,
     /// Directory lookups in the combination postings (the `pair` plan's clause pair).
     pub n_pair_lookups: u64,
+    /// `local_rate`: matches among the final list's data entries up to the `K`-th answer (the
+    /// whole list when it holds fewer).
+    pub lr_m: u64,
+    /// `local_rate`: those data entries.
+    pub lr_t: u64,
+    /// `local_rate = observe`: matches among the post-filter search's first evaluated nodes.
+    pub lr_me: u64,
+    /// `local_rate = observe`: those evaluated nodes (`⌈10 / r̂⌉`, at most all).
+    pub lr_e: u64,
+    /// `local_rate = replan`: 0 none, 1 the exact path, 2 a new post-filter search.
+    pub lr_route: u64,
     /// The phase timers are on (set per query; not a counter).
     pub timing: bool,
 }
@@ -241,7 +252,7 @@ impl Counters {
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 39] = [
+    pub const NAMES: [&'static str; 44] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -281,10 +292,15 @@ impl Counters {
         "t_decide_ns",
         "n_late",
         "n_pair_lookups",
+        "lr_m",
+        "lr_t",
+        "lr_me",
+        "lr_e",
+        "lr_route",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 39] {
+    pub fn values(&self) -> [u64; 44] {
         [
             self.n_dist,
             self.n_pred,
@@ -325,6 +341,11 @@ impl Counters {
             self.t_decide_ns,
             self.n_late,
             self.n_pair_lookups,
+            self.lr_m,
+            self.lr_t,
+            self.lr_me,
+            self.lr_e,
+            self.lr_route,
         ]
     }
 }
@@ -747,6 +768,10 @@ pub struct Searcher {
     packed_beam: bool,
     /// The post-filter loop's beam with `packed_beam`.
     pbeam: PackedBeam,
+    /// The current plan's `local_rate` (set at the start of every search).
+    local_rate: LocalRate,
+    /// The estimated match rate the current graph search was planned with (`local_rate`).
+    lr_rate: f64,
     /// When set, the next searches record their events here (untimed diagnostics).
     pub trace: Option<Trace>,
     /// Start nodes appended to the configured starts of every graph search (untimed
@@ -790,6 +815,8 @@ impl Searcher {
             row_prefetch: false,
             packed_beam: false,
             pbeam: PackedBeam::default(),
+            local_rate: LocalRate::Off,
+            lr_rate: 0.0,
             trace: None,
             extra_starts: Vec::new(),
         }
@@ -872,6 +899,7 @@ impl Searcher {
         let kernel = &plan.kernel;
         self.row_prefetch = kernel.row_prefetch;
         self.packed_beam = kernel.packed_beam;
+        self.local_rate = kernel.local_rate;
         let mut ctr = Counters {
             timing: kernel.phase_times,
             ..Counters::default()
@@ -1069,7 +1097,8 @@ impl Searcher {
                 let second_l = d
                     .postfilter_both
                     .then(|| kernel.postfilter_starts.second_list(d.l, k));
-                let n = self.postfilter(
+                self.lr_rate = d.rate;
+                let mut n = self.postfilter(
                     plan,
                     ix,
                     q,
@@ -1083,6 +1112,9 @@ impl Searcher {
                     dists,
                 );
                 toc(t, &mut ctr.t_graph_ns);
+                if kernel.local_rate == LocalRate::Replan {
+                    n = self.local_replan(plan, ix, q, k, &d, n, exact_stat, &mut ctr, ids, dists);
+                }
                 n
             } else {
                 let costs = plan.costs.as_ref().expect("validated");
@@ -1110,9 +1142,21 @@ impl Searcher {
                 );
                 toc(t, &mut ctr.t_graph_ns);
                 match trial {
-                    Some(n) => {
+                    Some(mut n) => {
                         if guard.is_some() {
                             ctr.graph_ns = costs.charged(ctr.n_dist, ctr.n_pred) as u64;
+                        }
+                        if kernel.local_rate != LocalRate::Off
+                            && plan.family == Family::Distance
+                            && kernel.collector == Collector::Heap
+                            && kernel.admission == Admission::All
+                        {
+                            self.observe_list(k, n, dists, &mut ctr);
+                            if kernel.local_rate == LocalRate::Replan {
+                                n = self.local_replan(
+                                    plan, ix, q, k, &d, n, exact_stat, &mut ctr, ids, dists,
+                                );
+                            }
                         }
                         n
                     }
@@ -1280,6 +1324,7 @@ impl Searcher {
                 postfilter_configured: false,
                 postfilter_late: false,
                 postfilter_both: false,
+                rate: 0.0,
             };
         }
         let est = self.estimates(plan, ix, exact_stat, ctr);
@@ -1346,6 +1391,7 @@ impl Searcher {
             postfilter_configured: postfilter && kernel.postfilter_starts.configured_at(rate),
             postfilter_late: postfilter && kernel.postfilter_starts.late_at(rate),
             postfilter_both: postfilter && kernel.postfilter_starts.both_at(rate),
+            rate,
         }
     }
 
@@ -1418,6 +1464,143 @@ impl Searcher {
         let cost = expansions * (b * costs.graph_pred_ns + (b * rho + 1.0) * costs.graph_dist_ns);
         let planned = if d.exact { d.est_exact } else { d.est_graph };
         (cost < planned).then_some(l_tree)
+    }
+
+    /// `local_rate` after an inline graph search with distance keys, admission `all` and the
+    /// heap collector, whose `n` answers are in `dists`: the matches `m` among the `t` data
+    /// entries of its final list up to the `K`-th answer's distance (the whole list when the list
+    /// holds fewer than `K` answers). The list holds every evaluated node closer than its last
+    /// entry, and a node whose check `heap_bound` skipped is farther than the final `K`-th
+    /// answer, so every entry counted was checked.
+    fn observe_list(&self, k: usize, n: usize, dists: &[f32], ctr: &mut Counters) {
+        let kth = if k > 0 && n >= k {
+            dists[k - 1]
+        } else {
+            f32::INFINITY
+        };
+        let (mut m, mut t) = (0, 0);
+        for e in self.beam32.entries() {
+            if e.state == State::Aux {
+                continue;
+            }
+            if e.d > kth {
+                break;
+            }
+            t += 1;
+            m += u64::from(e.state == State::Match);
+        }
+        (ctr.lr_m, ctr.lr_t) = (m, t);
+    }
+
+    /// `local_rate = replan`: a graph search whose final list holds `m < K` matches among `t`
+    /// entries, significantly fewer than the rate `r̂` it was planned with predicts
+    /// (`t · r̂ − m > Z √(t · r̂)`, the planner's `Z`), met a predicate that matches less around
+    /// the query than overall. Re-plans with the observed rate `(m + 1) / (t + 2)`: the cheaper,
+    /// by the cost model, of the exact path seeded with the `found` answers (not under the
+    /// graph crossover) and a new post-filter search whose list reaches the `K`-th match's rank
+    /// at that rate (the route's starts at that rate); the answers are the `K` nearest matches
+    /// found. Returns the number of answers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs"
+    )]
+    fn local_replan<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        k: usize,
+        d: &Decision,
+        found: usize,
+        exact_stat: Option<&LabelBitsets>,
+        ctr: &mut Counters,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> usize {
+        let (m, t) = (ctr.lr_m as f64, ctr.lr_t as f64);
+        let mu = t * d.rate;
+        if ctr.lr_t == 0 || m >= k as f64 || mu - m <= Z * mu.sqrt() {
+            return found;
+        }
+        let kernel = &plan.kernel;
+        let costs = plan.costs.as_ref().expect("validated");
+        let n_data = ix.graph.n_data();
+        let rate = (m + 1.0) / (t + 2.0);
+        let exact =
+            (kernel.crossover != Crossover::Graph && kernel.exact.is_planned()).then(|| {
+                PlanInputs {
+                    q: &self.compiled,
+                    labels: ix.labels,
+                    bitsets: exact_stat,
+                    k,
+                    df_lower: kernel.df_lower,
+                    pair: self.pair_cover.valid.then_some(&self.pair_cover),
+                }
+                .best(costs, kernel.exact_plans, &self.last_estimates, true, false)
+            });
+        let s = kernel.postfilter_starts;
+        let starts = if s.configured_at(rate) {
+            start_count(kernel, ix, &self.compiled)
+        } else {
+            ix.global.len()
+        };
+        let (l2, g2) = postfilter_option(costs, d.l, k, rate, n_data, starts);
+        match exact {
+            Some((p, e)) if e <= g2 => {
+                ctr.lr_route = 1;
+                ctr.plan = p as u64;
+                self.answers.reset(Collector::Heap, k, k);
+                for i in 0..found {
+                    self.answers.offer(dists[i], ids[i]);
+                }
+                self.exact_v2(plan, ix, q, k, p, exact_stat, true, ctr);
+                self.answers.finish(ids, dists)
+            }
+            _ if g2.is_finite() => {
+                ctr.lr_route = 2;
+                let first: Vec<(f32, u32)> = dists[..found]
+                    .iter()
+                    .copied()
+                    .zip(ids[..found].iter().copied())
+                    .collect();
+                let (route, n_start, final_l) = (ctr.route, ctr.n_start, ctr.final_l);
+                let both = s.both_at(rate);
+                let t = tic(ctr);
+                let n2 = self.postfilter(
+                    plan,
+                    ix,
+                    q,
+                    l2,
+                    s.configured_at(rate),
+                    s.late_at(rate) || both,
+                    both.then(|| s.second_list(l2, k)),
+                    exact_stat,
+                    ctr,
+                    ids,
+                    dists,
+                );
+                toc(t, &mut ctr.t_graph_ns);
+                (ctr.route, ctr.n_start) = (route, n_start);
+                ctr.final_l = final_l.max(ctr.final_l);
+                let mut all: Vec<(f32, u32)> = dists[..n2]
+                    .iter()
+                    .copied()
+                    .zip(ids[..n2].iter().copied())
+                    .collect();
+                for e in first {
+                    if !all.iter().any(|a| a.1 == e.1) {
+                        all.push(e);
+                    }
+                }
+                all.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                let n = ids.len().min(all.len());
+                for (i, &(dd, id)) in all[..n].iter().enumerate() {
+                    (ids[i], dists[i]) = (id, dd);
+                }
+                n
+            }
+            _ => found,
+        }
     }
 
     /// The post-filter route: an unfiltered search with list size `l` from the graph's global
