@@ -863,12 +863,14 @@ impl LabelKind for TreeGreedy<'_> {
 ///
 /// A pair tree saves `saving_ns` on its pair context (an independent query point: router vs pair
 /// tree on the pair curves) but, with calibrated routes, a different amount `s_D` on a
-/// base-derived query `{a} ∧ {b}`, whose point is a member of the joint (router vs pair tree on
-/// the member curves; negative where the router serves members faster). The selector values the
-/// base-derived part as `prob · saving_ns`, so `prob` here is the base-derived probability
-/// ([`context_prob`]) scaled by `s_D / saving_ns` (unscaled without curves: one saving).
+/// base-derived query `{a} ∧ {b}`, whose point is a member of the joint: its best route without
+/// the pair (the router or its smaller label's tree) vs the pair tree, on the member curves
+/// (negative where that route serves members faster). The selector values the base-derived part
+/// as `prob · saving_ns`, so `prob` here is the base-derived probability ([`context_prob`])
+/// scaled by `s_D / saving_ns` (unscaled without curves: one saving, against the router).
 pub fn pair_tree_values(
     pr: &Pricing,
+    labels: &LabelStore,
     model: &QueryModel,
     f: &[f64],
     cands: &[PairCand],
@@ -883,7 +885,16 @@ pub fn pair_tree_values(
             }
             let prob = match pr.curves {
                 Some(_) => {
-                    let s_d = pr.router_derived(j) - pr.pair_tree_derived(j);
+                    // Without the pair, a base-derived `{a} ∧ {b}` takes its best route: the
+                    // router or the tree of its smaller label (which the tree kind buys where
+                    // the router fails); counting from the router would count a query a label
+                    // tree makes answerable twice.
+                    let s = labels.posting_len(p.a).min(labels.posting_len(p.b));
+                    let mut alt = pr.router_derived(j);
+                    if s < pr.n {
+                        alt = alt.min(pr.tree_derived(s as f64, j, true));
+                    }
+                    let s_d = alt - pr.pair_tree_derived(j);
                     context_prob(model, f, &p) * s_d / saving_ns
                 }
                 None => context_prob(model, f, &p),
@@ -1018,7 +1029,7 @@ mod tests {
         // The greedy through the selector: within every budget, the rare label first.
         let (counts, f) = select::label_weights(&s, model.singleton, 2);
         let cands = select::pair_candidates(&s, &counts, model.singleton, |_| true, 2);
-        let values = pair_tree_values(&pr, &model, &f, &cands);
+        let values = pair_tree_values(&pr, &s, &model, &f, &cands);
         assert!(values.windows(2).all(|w| w[0].value >= w[1].value));
         for budget in [0u64, rare.bytes, 10 * rare.bytes, u64::MAX / 4] {
             let params = select::Params {
@@ -1289,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_tree_saves_on_member_queries_what_the_member_curves_say() {
+    fn calibrated_label_and_pair_trees_never_save_more_than_the_workload_costs() {
         let s = store();
         let c = costs();
         let tm = TreeModel {
@@ -1300,26 +1311,34 @@ mod tests {
             fanout: 26.0,
             router_bytes: 400,
         };
-        let class = |size: f64, router: f64, ns: f64| CurveClass {
+        // The router reaches 0.96 only on clauses of ≥ 1,000 points, placed anywhere; trees
+        // everywhere at 50 ns, except a label's tree on a pair context (diluted): 500 ns.
+        let class = |size: f64, router: f64, tree: f64| CurveClass {
             size,
             router: [
-                ("10".to_string(), vec![[router, ns]]),
-                ("100".to_string(), vec![[router, ns]]),
+                ("10".to_string(), vec![[router, 100.0]]),
+                ("100".to_string(), vec![[router, 100.0]]),
             ]
             .into_iter()
             .collect(),
             tree: [
-                ("10".to_string(), vec![[1.0, 50.0]]),
-                ("100".to_string(), vec![[1.0, 50.0]]),
+                ("10".to_string(), vec![[1.0, tree]]),
+                ("100".to_string(), vec![[1.0, tree]]),
             ]
             .into_iter()
             .collect(),
         };
-        // Independently placed pairs: the router never reaches 0.96; member queries: 100 ns.
+        let classes = |tree: f64| {
+            vec![
+                class(999.0, 0.5, tree),
+                class(1_000.0, 1.0, tree),
+                class(1e6, 1.0, tree),
+            ]
+        };
         let cv = RouteCurves {
-            u: vec![class(1.0, 0.5, 1_000.0), class(1e6, 0.5, 1_000.0)],
-            d: vec![class(1.0, 1.0, 100.0), class(1e6, 1.0, 100.0)],
-            p: vec![class(1.0, 0.5, 1_000.0), class(1e6, 0.5, 1_000.0)],
+            u: classes(50.0),
+            d: classes(50.0),
+            p: classes(500.0),
         };
         let pr = Pricing {
             tm,
@@ -1330,20 +1349,43 @@ mod tests {
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
         let model = QueryModel {
-            n_queries: 1_000,
-            seed: 3,
+            n_queries: 4_000,
+            seed: 11,
             uniform: 0.5,
             contexts: contexts.len() as u64,
+            single_labels: crate::islands::single_label_support(&s).len() as u64,
             ..QueryModel::default()
         };
-        let values = pair_tree_values(&pr, &model, &f, &contexts);
+        let sample = TreeSample::build_mixed(&s, &pr, model, &contexts, 2);
+        let mean = sample.mean_base_ns();
+        assert!(mean > 1e6, "unreachable queries dominate the mean");
+        let cands = select::pair_candidates(&s, &counts, 0.5, |_| true, 2);
+        let values = pair_tree_values(&pr, &s, &model, &f, &cands);
         assert!(!values.is_empty());
+        // On a base-derived `{a} ∧ {b}` (a member as the query point) a pair tree saves at most
+        // what the smaller label's tree costs there (50 ns), never the router's unreachable price.
         for v in &values {
-            // On its context the pair tree makes the query answerable; on a member query it saves
-            // 100 − 50 ns, so its base-derived part is P_D · 50 ns, not P_D · 10⁹.
-            assert!((v.saving_ns - (UNREACHABLE_NS - 50.0)).abs() < 1e-6);
-            let p_d = context_prob(&model, &f, &v.cand);
-            assert!((v.prob * v.saving_ns - p_d * 50.0).abs() <= 1e-9 * p_d * 50.0);
+            assert!(v.prob * v.saving_ns <= context_prob(&model, &f, &v.cand) * 50.0 + 1e-9);
         }
+        let params = select::Params {
+            k: 10,
+            r: 32,
+            budget_bytes: u64::MAX / 4,
+            model,
+            stop: select::Stop::Budget,
+            mean_ns: mean,
+            ..select::Params::default()
+        };
+        let sel = select::select_with(
+            &s,
+            || TreeGreedy::with_classes(&sample, &s, &pr, &f, 30),
+            &values,
+            &params,
+        );
+        // A base-derived query `{a} ∧ {b}` that a label tree makes answerable is not counted
+        // again by the pair tree: every tree taken, the expected saving stays within the
+        // workload's cost (up to the sampling noise of the rare labels' closed form).
+        assert!(sel.best.n_pairs > 0 && !sel.best.islands.is_empty());
+        assert!(sel.best.t_ns >= -0.01 * mean, "{} of {mean}", sel.best.t_ns);
     }
 }

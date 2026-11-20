@@ -2283,7 +2283,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         .copied()
         .collect();
     let values = match &pricing {
-        Some(pr) => diskann_filter_lab::select_g::pair_tree_values(pr, &model, &f, &cands),
+        Some(pr) => diskann_filter_lab::select_g::pair_tree_values(pr, &store, &model, &f, &cands),
         None => select::pair_values(&store, &costs, a.k, &model, &f, &cands),
     };
     let pairs_s = count_s + secs(t);
