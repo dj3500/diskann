@@ -619,6 +619,7 @@ impl QuerySample {
 
     /// Each query's cheapest cost with every candidate island built (a lower bound on its cost
     /// with islands; tests).
+    #[cfg(test)]
     pub(crate) fn island_floor_ns(&self) -> Vec<f64> {
         let mut x = self.base_ns.clone();
         for &(_, q, isl) in &self.recs {
