@@ -15,15 +15,20 @@
 //!
 //! **Costs** (ns, the kernel's unit costs):
 //!
-//! - router: `postfilter_nominal(K, M/n)` ([`crate::islands::postfilter_nominal`], as the
-//!   islands' `base`; the graph route is not modelled);
+//! - router: its post-filter route at the query's match rate `M/n` with the list that finds the
+//!   `K`-th match at the reference recall `R` — the kernel's effort curve (`effort_list(R, k')`,
+//!   the calibrated unfiltered list for recall `R` at `k'` neighbours) at the rank of the `K`-th
+//!   match, `k' = K/rate + z·√(K(1 − rate))/rate` (the graph route is not modelled; without an
+//!   effort curve, the islands' `postfilter_nominal`);
 //! - tree route over `s` members of which `M` match: `E` router expansions, each checking the
-//!   router's `b̄` children and computing a distance for the matching ones and one for the router,
-//!   `E·(b̄·graph_pred + (b̄·ρ + 1)·graph_dist)` with `ρ = M/s` (the term of the kernel's
-//!   `tree_choice = cost`), where `E = min(s/(b̄ − 1) + 1, F·s/M)`: the reference frontier `F`
-//!   (the declared frontier table's at a target recall of about 0.9: 512) scaled by the members
-//!   per match, so that a diluted clause is charged the search that reaches that recall on it,
-//!   at most the whole tree;
+//!   router's `b̄` children, computing a distance for the matching ones and one for the router,
+//!   `E·(b̄·pred(s/n) + b̄·ρ·dist(s/n) + graph_dist)` with `ρ = M/s` — the members' unit costs
+//!   those of a scan of the label's members at its density (`pred`, `dist`: the exact path's
+//!   calibrated curves; a tree's members are as scattered in memory as a posting's), the
+//!   router's a graph node's — where `E = min(s/(b̄ − 1) + 1, F·s/M)`: the reference frontier `F`
+//!   (the declared frontier table's at the reference recall `R` = 0.9: 512) scaled by the
+//!   members per match, so that a diluted clause is charged the search that reaches that recall
+//!   on it, at most the whole tree;
 //! - pair tree on a pair of joint `j`: the tree route over its `j` members, all matching,
 //!   against the better of the router and the tree route of the pair's smaller label.
 //!
@@ -41,7 +46,7 @@
 
 use crate::{
     islands::{draw_query, postfilter_nominal, query_matches, QueryModel},
-    kernel::cost::UnitCosts,
+    kernel::cost::{kth_match_rank, UnitCosts, Z},
     labels::LabelStore,
     select::{context_prob, pair_bytes, LabelKind, PairCand, PairValue},
 };
@@ -51,7 +56,9 @@ use crate::{
 pub struct TreeModel {
     /// Answers `K`.
     pub k: usize,
-    /// Reference tree frontier `F` (routers expanded at a target recall of about 0.9).
+    /// Reference recall `R` of both routes' costs.
+    pub recall: f64,
+    /// Reference tree frontier `F` (routers expanded at the reference recall).
     pub frontier: f64,
     /// Mean router fan-out `b̄` of the trees (k-means trees of fan-out bound 64: 20–28).
     pub fanout: f64,
@@ -62,16 +69,28 @@ pub struct TreeModel {
 impl TreeModel {
     /// The graph router's cost (its post-filter route) for `m` matches among `n` points.
     pub fn router_ns(&self, c: &UnitCosts, m: f64, n: usize) -> f64 {
-        postfilter_nominal(c, self.k, self.k, (m / n.max(1) as f64).min(1.0), n, 1).1
+        let rate = (m / n.max(1) as f64).min(1.0);
+        let rank = kth_match_rank(self.k, rate, Z);
+        if !rank.is_finite() {
+            return f64::INFINITY;
+        }
+        match c.effort_list(self.recall, rank) {
+            Some(l) => {
+                let l = l.max(self.k as f64).min(n as f64);
+                c.postfilter_cost(l, self.k, rate) + c.graph_dist_ns
+            }
+            None => postfilter_nominal(c, self.k, self.k, rate, n, 1).1,
+        }
     }
 
-    /// The tree route's cost over `s` members of which `m` match.
-    pub fn tree_ns(&self, c: &UnitCosts, s: f64, m: f64) -> f64 {
+    /// The tree route's cost over `s` members of which `m` match, on `n` points.
+    pub fn tree_ns(&self, c: &UnitCosts, s: f64, m: f64, n: usize) -> f64 {
         let s = s.max(1.0);
         let m = m.clamp(1.0, s);
         let b = self.fanout.max(2.0);
         let e = (s / (b - 1.0) + 1.0).min(self.frontier * s / m);
-        e * (b * c.graph_pred_ns + (b * m / s + 1.0) * c.graph_dist_ns)
+        let rho = (s / n.max(1) as f64).min(1.0);
+        e * (b * c.pred(rho) + b * (m / s) * c.dist(rho) + c.graph_dist_ns)
     }
 
     /// Routers of a tree over `s` members.
@@ -141,7 +160,7 @@ impl TreeSample {
                     if let (Some(&l), None) = (nonempty.next(), nonempty.next()) {
                         let s = labels.posting_len(l);
                         if s < n {
-                            recs.push((l, qi as u32, tm.tree_ns(c, s as f64, m) as f32));
+                            recs.push((l, qi as u32, tm.tree_ns(c, s as f64, m, n) as f32));
                         }
                     }
                 }
@@ -195,10 +214,41 @@ pub struct TreeGreedy {
 }
 
 impl TreeGreedy {
+    /// Candidates: every label with sampled queries, valued on its own queries.
     pub fn new(sample: &TreeSample, labels: &LabelStore, tm: &TreeModel) -> Self {
+        Self::build(sample, labels, tm, None)
+    }
+
+    /// Candidates: every label, its expected saving per query in closed form over the same
+    /// workload where the sample is too thin. A base-derived query holds the single-label clause
+    /// `{ℓ}` with probability `f_ℓ/2` ([`crate::select::label_weights`]: category kept, the
+    /// clause that label alone); the sample gives, per size class (`⌊log2 |P_ℓ|⌋`), the share
+    /// `β` of those clauses that bind (are the query's smallest) and their mean signed saving
+    /// `σ`. A label with at least `min_records` sampled queries keeps its own estimate; another
+    /// is worth `(f_ℓ/2)·β·σ` of its class (a class without enough records: `β = 1` and the
+    /// saving of the clause alone, `M = |P_ℓ|`). Rare labels, which a sample of base-derived
+    /// queries almost never draws, are the selective labels a tree serves best.
+    pub fn with_classes(
+        sample: &TreeSample,
+        labels: &LabelStore,
+        tm: &TreeModel,
+        c: &UnitCosts,
+        f: &[f64],
+        min_records: u32,
+    ) -> Self {
+        Self::build(sample, labels, tm, Some((c, f, min_records)))
+    }
+
+    fn build(
+        sample: &TreeSample,
+        labels: &LabelStore,
+        tm: &TreeModel,
+        closed: Option<(&UnitCosts, &[f64], u32)>,
+    ) -> Self {
         let nq = sample.base_ns.len().max(1) as f64;
         let recs = &sample.recs;
-        let mut terms = Vec::new();
+        // Per label: sampled queries and their summed signed saving.
+        let mut per: Vec<(u32, u32, f64)> = Vec::new();
         let mut i = 0;
         while i < recs.len() {
             let l = recs[i].0;
@@ -209,16 +259,72 @@ impl TreeGreedy {
                 saving += sample.base_ns[q as usize] - f64::from(t);
                 j += 1;
             }
-            let s = labels.posting_len(l);
-            terms.push(TreeTerm {
-                label: l,
-                size: s,
-                queries: (j - i) as u32,
-                saving_ns: saving / nq,
-                bytes: tm.tree_bytes(s),
-                order: None,
-            });
+            per.push((l, (j - i) as u32, saving));
             i = j;
+        }
+        let n = labels.n_points();
+        let mut terms = Vec::new();
+        match closed {
+            None => {
+                for &(l, q, saving) in &per {
+                    let s = labels.posting_len(l);
+                    terms.push(TreeTerm {
+                        label: l,
+                        size: s,
+                        queries: q,
+                        saving_ns: saving / nq,
+                        bytes: tm.tree_bytes(s),
+                        order: None,
+                    });
+                }
+            }
+            Some((c, f, min_records)) => {
+                let class = |s: usize| 63 - (s.max(1) as u64).leading_zeros() as usize;
+                // Per size class: records, their summed saving, and the clause probability mass.
+                let mut recs_c = [0u64; 64];
+                let mut save_c = [0f64; 64];
+                let mut mass_c = [0f64; 64];
+                let nl = labels.n_labels();
+                for l in 0..nl as u32 {
+                    let s = labels.posting_len(l);
+                    if s > 0 && s < n {
+                        mass_c[class(s)] += f[l as usize] / 2.0;
+                    }
+                }
+                for &(l, q, saving) in &per {
+                    let k = class(labels.posting_len(l));
+                    recs_c[k] += u64::from(q);
+                    save_c[k] += saving;
+                }
+                let own: std::collections::HashMap<u32, (u32, f64)> =
+                    per.iter().map(|&(l, q, sv)| (l, (q, sv))).collect();
+                for l in 0..nl as u32 {
+                    let s = labels.posting_len(l);
+                    if s == 0 || s >= n {
+                        continue;
+                    }
+                    let (q, sv) = own.get(&l).copied().unwrap_or((0, 0.0));
+                    let k = class(s);
+                    let saving_ns = if q >= min_records {
+                        sv / nq
+                    } else if recs_c[k] >= u64::from(min_records) && mass_c[k] > 0.0 {
+                        let beta = recs_c[k] as f64 / (nq * mass_c[k]);
+                        let sigma = save_c[k] / recs_c[k] as f64;
+                        f[l as usize] / 2.0 * beta * sigma
+                    } else {
+                        let sf = s as f64;
+                        f[l as usize] / 2.0 * (tm.router_ns(c, sf, n) - tm.tree_ns(c, sf, sf, n))
+                    };
+                    terms.push(TreeTerm {
+                        label: l,
+                        size: s,
+                        queries: q,
+                        saving_ns,
+                        bytes: tm.tree_bytes(s),
+                        order: None,
+                    });
+                }
+            }
         }
         let key = |t: &TreeTerm| t.saving_ns / t.bytes as f64;
         let mut order: Vec<usize> = (0..terms.len())
@@ -291,8 +397,8 @@ pub fn pair_tree_values(
         .filter_map(|&p| {
             let s = labels.posting_len(p.a).min(labels.posting_len(p.b)) as f64;
             let j = f64::from(p.joint);
-            let alt = tm.router_ns(c, j, n).min(tm.tree_ns(c, s, j));
-            let saving_ns = alt - tm.tree_ns(c, j, j);
+            let alt = tm.router_ns(c, j, n).min(tm.tree_ns(c, s, j, n));
+            let saving_ns = alt - tm.tree_ns(c, j, j, n);
             if !saving_ns.is_finite() || saving_ns <= 0.0 {
                 return None;
             }
@@ -356,6 +462,7 @@ mod tests {
         let c = costs();
         let tm = TreeModel {
             k: 10,
+            recall: 0.9,
             frontier: 512.0,
             fanout: 26.0,
             router_bytes: 400,
@@ -363,14 +470,16 @@ mod tests {
         let n = 1_000_000;
         // A selective label: the tree searches it whole, below the router's post-filter route
         // at its match rate — far below for 200 points (0.02 %), still below for 2,000.
-        assert!(tm.tree_ns(&c, 200.0, 200.0) < tm.router_ns(&c, 200.0, n) / 10.0);
-        assert!(tm.tree_ns(&c, 2_000.0, 2_000.0) < tm.router_ns(&c, 2_000.0, n));
+        assert!(tm.tree_ns(&c, 200.0, 200.0, n) < tm.router_ns(&c, 200.0, n) / 10.0);
+        assert!(tm.tree_ns(&c, 2_000.0, 2_000.0, n) < tm.router_ns(&c, 2_000.0, n));
         // A broad label whose matches are dense: the router wins.
-        assert!(tm.tree_ns(&c, 400_000.0, 300_000.0) > tm.router_ns(&c, 300_000.0, n));
+        assert!(tm.tree_ns(&c, 400_000.0, 300_000.0, n) > tm.router_ns(&c, 300_000.0, n));
         // Dilution costs the tree route members per match, up to the whole tree.
-        let whole = tm.tree_ns(&c, 500_000.0, 1.0);
-        assert!(tm.tree_ns(&c, 500_000.0, 50_000.0) < tm.tree_ns(&c, 500_000.0, 1_000.0) / 2.0);
-        assert!((tm.tree_ns(&c, 500_000.0, 100.0) - whole).abs() / whole < 0.01);
+        let whole = tm.tree_ns(&c, 500_000.0, 1.0, n);
+        assert!(
+            tm.tree_ns(&c, 500_000.0, 50_000.0, n) < tm.tree_ns(&c, 500_000.0, 1_000.0, n) / 2.0
+        );
+        assert!((tm.tree_ns(&c, 500_000.0, 100.0, n) - whole).abs() / whole < 0.01);
         // Bytes: one router per small label, about s/(b̄ − 1) for large ones.
         assert_eq!(tm.routers(10), 1);
         assert_eq!(tm.routers(2_501), 100);
@@ -382,6 +491,7 @@ mod tests {
         let c = costs();
         let tm = TreeModel {
             k: 10,
+            recall: 0.9,
             frontier: 512.0,
             fanout: 26.0,
             router_bytes: 400,

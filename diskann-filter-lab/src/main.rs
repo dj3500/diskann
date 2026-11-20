@@ -543,13 +543,20 @@ struct SelectArgs {
     /// labels, `sel-b<B>.trees.txt`, for `flab steiner --labels-file`, and the pairs).
     #[arg(long, value_enum, default_value = "hybrid")]
     track: SelectTrack,
+    /// `--track graph`: reference recall of the router's and the tree route's costs.
+    #[arg(long, default_value_t = 0.9)]
+    tree_recall: f64,
     /// `--track graph`: reference router frontier `F` of the tree-route cost (the declared
-    /// frontier table's at a target recall of about 0.9).
+    /// frontier table's at the reference recall).
     #[arg(long, default_value_t = 512.0)]
     tree_frontier: f64,
     /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
     #[arg(long, default_value_t = 26.0)]
     tree_fanout: f64,
+    /// `--track graph`: a label with fewer sampled queries is valued by its size class (the
+    /// workload's closed form; see `select_g::TreeGreedy::with_classes`).
+    #[arg(long, default_value_t = 30)]
+    tree_min_records: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1985,6 +1992,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         let (_, dim) = diskann_io::read_bin_header(&mut bf)?;
         Some(diskann_filter_lab::select_g::TreeModel {
             k: a.k,
+            recall: a.tree_recall,
             frontier: a.tree_frontier,
             fanout: a.tree_fanout,
             router_bytes: diskann_filter_lab::select_g::TreeModel::router_bytes_of(
@@ -2118,7 +2126,16 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             (Some(sample), _, _) => select::select(&store, sample, &values, &params),
             (_, Some(ts), Some(tm)) => select::select_with(
                 &store,
-                || diskann_filter_lab::select_g::TreeGreedy::new(ts, &store, tm),
+                || {
+                    diskann_filter_lab::select_g::TreeGreedy::with_classes(
+                        ts,
+                        &store,
+                        tm,
+                        &costs,
+                        &f,
+                        a.tree_min_records,
+                    )
+                },
                 &values,
                 &params,
             ),
