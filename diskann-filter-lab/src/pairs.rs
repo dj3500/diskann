@@ -79,6 +79,10 @@ pub enum Prior {
     /// A pair as likely as its smaller label is frequent: gain per entry times
     /// `min(|P_a|, |P_b|) / n`.
     Rare,
+    /// A pair as likely as a uniformly drawn data point carries both labels (base-derived
+    /// queries: sub-predicates of points' own label sets): gain per entry times `j / n` —
+    /// the conjunctions points actually have, by the members they save.
+    Data,
 }
 
 impl Prior {
@@ -86,6 +90,7 @@ impl Prior {
         match self {
             Self::Uniform => "uniform",
             Self::Rare => "rare",
+            Self::Data => "data",
         }
     }
 
@@ -93,7 +98,7 @@ impl Prior {
     fn key_min_log2(self) -> f64 {
         match self {
             Self::Uniform => -10.0,
-            Self::Rare => -40.0,
+            Self::Rare | Self::Data => -40.0,
         }
     }
 
@@ -104,6 +109,7 @@ impl Prior {
         match self {
             Self::Uniform => r,
             Self::Rare => r * min as f64 / n.max(1) as f64,
+            Self::Data => r * cost.saturating_sub(PAIR_OVERHEAD) as f64 / n.max(1) as f64,
         }
     }
 }
@@ -115,7 +121,8 @@ impl std::str::FromStr for Prior {
         match s {
             "uniform" => Ok(Self::Uniform),
             "rare" => Ok(Self::Rare),
-            _ => anyhow::bail!("unknown pair prior {s:?} (uniform, rare)"),
+            "data" => Ok(Self::Data),
+            _ => anyhow::bail!("unknown pair prior {s:?} (uniform, rare, data)"),
         }
     }
 }
@@ -1093,6 +1100,18 @@ mod tests {
             .copied()
             .filter(|p| pb.binary_search(p).is_ok())
             .collect()
+    }
+
+    #[test]
+    fn the_data_prior_prefers_the_diluted_conjunctions_points_carry() {
+        // A tiny joint of a small pair (j = 1, min 100) against a diluted joint of larger labels
+        // (j = 50, min 1,000): the uniform prior ranks the tiny one first, the data prior the
+        // conjunction that 50 points carry.
+        let n = 1_000_000;
+        let key = |p: Prior, min: u64, j: u64| p.key(min, min - j, j + PAIR_OVERHEAD, n);
+        assert!(key(Prior::Uniform, 100, 1) > key(Prior::Uniform, 1000, 50));
+        assert!(key(Prior::Data, 100, 1) < key(Prior::Data, 1000, 50));
+        assert_eq!("data".parse::<Prior>().unwrap(), Prior::Data);
     }
 
     #[test]
