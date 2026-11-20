@@ -227,6 +227,19 @@ impl RouteCurves {
     /// size between the measured classes around it (clamped to the smallest and largest); a class
     /// that cannot reach `r` decides when it is the nearer one.
     pub fn price(classes: &[CurveClass], route: Route, k: usize, size: f64, r: f64) -> Option<f64> {
+        Self::price_with(classes, route, k, size, r, false)
+    }
+
+    /// [`Self::price`]; with `at_max`, a class that cannot reach `r` is priced at its time at the
+    /// highest measured level.
+    pub fn price_with(
+        classes: &[CurveClass],
+        route: Route,
+        k: usize,
+        size: f64,
+        r: f64,
+        at_max: bool,
+    ) -> Option<f64> {
         if classes.is_empty() {
             return None;
         }
@@ -236,7 +249,18 @@ impl RouteCurves {
                 Route::Router => &c.router,
                 Route::Tree => &c.tree,
             };
-            m.get(&key).and_then(|pts| curve_price(pts, r))
+            m.get(&key).and_then(|pts| {
+                curve_price(pts, r).or_else(|| {
+                    at_max
+                        .then(|| {
+                            pts.iter()
+                                .map(|p| p[1])
+                                .filter(|t| t.is_finite())
+                                .reduce(f64::max)
+                        })
+                        .flatten()
+                })
+            })
         };
         let size = size.max(1.0);
         let i = classes.partition_point(|c| c.size <= size);
@@ -286,11 +310,15 @@ pub struct Pricing<'a> {
     pub curves: Option<&'a RouteCurves>,
     /// Data points.
     pub n: usize,
+    /// A route that never reaches the reference recall is priced at its time at the highest
+    /// measured level (the effort it spends trying) instead of [`UNREACHABLE_NS`].
+    pub at_max: bool,
 }
 
 impl Pricing<'_> {
     fn priced(&self, classes: &[CurveClass], route: Route, k: usize, size: f64) -> f64 {
-        RouteCurves::price(classes, route, k, size, self.tm.recall).unwrap_or(UNREACHABLE_NS)
+        RouteCurves::price_with(classes, route, k, size, self.tm.recall, self.at_max)
+            .unwrap_or(UNREACHABLE_NS)
     }
 
     /// A base-derived (data-like) query with `m` matches: the router — for a conjunction
@@ -1018,6 +1046,7 @@ mod tests {
             c: &c,
             curves: None,
             n: s.n_points(),
+            at_max: false,
         };
         let sample = TreeSample::build(&s, &pr, model, 2);
         let again = TreeSample::build(&s, &pr, model, 1);
@@ -1131,6 +1160,7 @@ mod tests {
             c: &c,
             curves: None,
             n: s.n_points(),
+            at_max: false,
         };
         let mixed = TreeSample::build_mixed(&s, &pr, model, &contexts, 2);
         assert_eq!(mixed.base_ns.len(), 4_000 + contexts.len());
@@ -1211,6 +1241,10 @@ mod tests {
         assert_eq!(at(20_000.0), Some(10_000.0));
         assert_eq!(at(500_000.0), None);
         assert_eq!(at(5.0e6), None);
+        // Priced at its highest level's time instead, an unreachable class is finite.
+        let at_max = |size| RouteCurves::price_with(&cl, Route::Router, 10, size, 0.96, true);
+        assert_eq!(at_max(5.0e6), Some(1.0));
+        assert!((at_max(100_000.0).unwrap() - 100.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1259,6 +1293,7 @@ mod tests {
             c: &c,
             curves: Some(&cv),
             n: s.n_points(),
+            at_max: false,
         };
         assert_eq!(pr.router_label(200.0), UNREACHABLE_NS);
         assert_eq!(pr.router_label(5_000.0), 1_000.0);
@@ -1362,6 +1397,7 @@ mod tests {
             c: &c,
             curves: Some(&cv),
             n: s.n_points(),
+            at_max: false,
         };
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);

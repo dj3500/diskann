@@ -579,6 +579,11 @@ struct SelectArgs {
     /// (`P`); `select_g::RouteCurves`) at the reference recall `--tree-recall`.
     #[arg(long)]
     route_curves: Option<PathBuf>,
+    /// `--track graph` with `--route-curves`: the price of a route that never reaches the
+    /// reference recall — `must` (a fixed large cost: a structure that makes the query answerable
+    /// is a must-have) or `at-max` (its time at the highest measured level).
+    #[arg(long, value_enum, default_value = "must")]
+    unreachable: SelectUnreachable,
     /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
     #[arg(long, default_value_t = 26.0)]
     tree_fanout: f64,
@@ -598,6 +603,12 @@ enum SelectTrack {
 enum SelectTreeEffort {
     Frontier,
     Curve,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SelectUnreachable {
+    Must,
+    AtMax,
 }
 
 /// Degree bound of a graph file (`graph.flab`, a directory holding one, or a DiskANN index).
@@ -2175,6 +2186,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             c: &costs,
             curves: curves.as_ref(),
             n,
+            at_max: a.unreachable == SelectUnreachable::AtMax,
         });
     // Every co-occurring pair of labels of different categories: the pair contexts of the
     // workload, and (labels of 64 to n − 1 points) the candidates.
@@ -2410,6 +2422,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "track": if graph_track { "graph" } else { "hybrid" },
         "tree_model": tree_model,
         "route_curves": a.route_curves,
+        "unreachable": if a.unreachable == SelectUnreachable::AtMax { "at-max" } else { "must" },
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
