@@ -418,6 +418,7 @@ pub fn tree_calibrate<T: Element>(
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
     };
     let e = tree_curve(&ds.base, &ix, &ds.labels, opts)?;
     let mut doc = calibration.clone();

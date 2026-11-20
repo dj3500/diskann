@@ -20,6 +20,7 @@ pub mod diskann_io;
 pub mod graph;
 pub mod gt;
 pub mod hugepages;
+pub mod islands;
 pub mod jsonl;
 pub mod kernel;
 pub mod label_starts;

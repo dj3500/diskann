@@ -1063,6 +1063,7 @@ fn run_typed<T: Element>(args: &DiagArgs) -> Result<()> {
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
     };
     let mut plans = Vec::new();
     for p in args

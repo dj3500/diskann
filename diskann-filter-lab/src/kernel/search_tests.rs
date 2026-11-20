@@ -191,6 +191,7 @@ impl Fixture {
             costs: None,
             sketches: None,
             pairs: None,
+            islands: None,
         }
     }
 
@@ -616,6 +617,7 @@ fn static_bits_do_not_change_answers_or_counters() {
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let mut k = Kernel::default();
@@ -628,6 +630,7 @@ fn static_bits_do_not_change_answers_or_counters() {
             costs: None,
             sketches: None,
             pairs: None,
+            islands: None,
             ..f.index()
         }
     )
@@ -809,6 +812,7 @@ fn run_line(
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
     };
     let plan = Plan::new(kernel, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -950,6 +954,7 @@ fn exact_duplicates_follow_the_upstream_tie_rule() {
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
     };
     let plan = Plan::new(&k, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -1708,6 +1713,7 @@ fn the_packed_beam_changes_no_answer() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let route = khpad(&[
@@ -1778,6 +1784,7 @@ fn row_prefetch_changes_no_answer_and_keeps_the_fast_paths() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let route = khpad(&[
@@ -1863,6 +1870,7 @@ fn planned_exact_plans_are_exact() {
             costs: Some(&costs),
             sketches: Some(&sketches),
             pairs: None,
+            islands: None,
             ..f.index()
         };
         for plans in [
@@ -1916,6 +1924,7 @@ fn residual_checks_keep_answers_routes_and_estimates() {
             costs: Some(&costs),
             sketches: Some(&sketches),
             pairs: None,
+            islands: None,
             ..f.index()
         };
         let exact_v2 = [
@@ -2124,6 +2133,7 @@ fn crossovers_give_valid_answers_and_exact_fallbacks() {
             costs: Some(costs),
             sketches: Some(&sketches),
             pairs: None,
+            islands: None,
             ..f.index()
         };
         let configs: Vec<Kernel> = vec![
@@ -2187,6 +2197,7 @@ fn complete_witnesses_make_the_guarded_trial_exact() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let k = khpad(&[
@@ -2225,6 +2236,7 @@ fn posting_l_fixes_the_list_size_before_navigation() {
     let ix = Index {
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let k = khpad(&[
@@ -2273,6 +2285,7 @@ fn the_postfilter_route_returns_the_heap_answers_of_a_global_search() {
             costs: Some(&costs),
             sketches: Some(&sketches),
             pairs: None,
+            islands: None,
             ..f.index()
         };
         let route = khpad(&[
@@ -2350,6 +2363,7 @@ fn the_cost_rule_prefers_postfilters_for_frequent_matches() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     // The guarded crossover routes the same way (its trial guards only inline graph searches).
@@ -2428,6 +2442,7 @@ fn hopeless_graph_searches_take_the_exact_path() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let s2 = [
@@ -2541,6 +2556,7 @@ fn the_effort_curve_plans_the_list_size_from_the_match_rate() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let k = khpad(&[
@@ -2588,6 +2604,7 @@ fn the_postfilter_route_with_the_configured_starts_keeps_the_heap_answers() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let base = [
@@ -2657,6 +2674,7 @@ fn by_rate_starts_are_the_global_ones_for_broad_predicates() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     let route = |starts: &'static str| {
@@ -2719,6 +2737,7 @@ fn the_graph_crossover_never_takes_the_exact_path() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
         ..f.index()
     };
     for (crossover, terminator) in [("cost", "effort_curve"), ("graph", "effort_curve(2)")] {
@@ -2919,6 +2938,7 @@ fn by_rate_late_rescues_a_search_that_missed_the_query() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        islands: None,
     };
     let plans: Vec<Plan> = ["by_rate_late", "by_rate", "by_rate_both", "by_rate_both_k"]
         .into_iter()
@@ -3393,4 +3413,48 @@ fn projection_smallest_navigates_on_the_binding_clause() {
         }
     }
     assert!(checked > 40 && multi > 10, "{checked} {multi}");
+}
+
+#[test]
+fn island_search_with_a_list_of_the_whole_island_is_exact() {
+    use crate::{
+        build::{BuildParams, PruneRule},
+        islands::IslandIndex,
+    };
+    let f = fixture(300, 13, false);
+    let all: Vec<u32> = (0..f.labels.n_labels() as u32)
+        .filter(|&l| f.labels.posting_len(l) >= 2)
+        .collect();
+    let params = BuildParams {
+        rule: PruneRule::Alpha { r: 8, alpha: 1.2 },
+        l_build: 16,
+        ..BuildParams::default()
+    };
+    let (isl, _, _) = IslandIndex::build(&f.base, &f.labels, &all, &params, 2).unwrap();
+    let ix = Index {
+        islands: Some(&isl),
+        ..f.index()
+    };
+    let mut st = Searcher::for_index(&ix, &[]);
+    let mut checked = 0;
+    for qi in 0..f.preds.len() {
+        for k in [1usize, 5, 10] {
+            let (mut ids, mut ds) = (vec![0u32; k], vec![0f32; k]);
+            if let Some((n, ctr)) = st.island_for_test(&ix, &f.query(qi), |s| s, &mut ids, &mut ds)
+            {
+                let got: Vec<(f32, u32)> = ds[..n]
+                    .iter()
+                    .copied()
+                    .zip(ids[..n].iter().copied())
+                    .collect();
+                assert_eq!(got, f.truth(qi, k), "q={qi} k={k}");
+                assert_eq!(ctr.route, Route::Island);
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "some query has a single-label clause with an island"
+    );
 }

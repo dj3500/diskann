@@ -40,6 +40,7 @@ use super::{
 use crate::{
     bitsets::LabelBitsets,
     graph::{Graph, NodeVectors},
+    islands::IslandIndex,
     labels::LabelStore,
     pairs::{Cover, PairIndex},
     predicate::Cnf,
@@ -86,6 +87,8 @@ pub struct Index<'a, T> {
     pub sketches: Option<&'a LabelSketches>,
     /// Combination postings of `labels` (the exact path's `pair` plan).
     pub pairs: Option<&'a PairIndex>,
+    /// Per-label sub-graphs (the `island` route).
+    pub islands: Option<&'a IslandIndex>,
 }
 
 /// One query: its vector, predicate and, with a label view, the view's predicate.
@@ -112,6 +115,8 @@ pub enum Route {
     Postfilter,
     /// The tree route's search over router trees (`tree_route`).
     Tree,
+    /// A search in one label's sub-graph, the predicate checked on the evaluated members.
+    Island,
 }
 
 impl Route {
@@ -123,6 +128,7 @@ impl Route {
             Self::Fallback => "fallback",
             Self::Postfilter => "postfilter",
             Self::Tree => "tree",
+            Self::Island => "island",
         }
     }
 }
@@ -1064,6 +1070,26 @@ impl Searcher {
                 ctr.route = Route::Exact;
                 self.exact_v2(plan, ix, q, k, d.plan, exact_stat, false, &mut ctr);
                 self.answers.finish(ids, dists)
+            } else if let (Some((i, l_is)), Some(isl)) = (d.island, ix.islands) {
+                let t = tic(&ctr);
+                let n = match exact_stat {
+                    Some(b) => self.island_search::<T, StaticBits>(
+                        ix,
+                        q,
+                        isl,
+                        i,
+                        l_is,
+                        Some(b),
+                        &mut ctr,
+                        ids,
+                        dists,
+                    ),
+                    None => self.island_search::<T, RowScan>(
+                        ix, q, isl, i, l_is, None, &mut ctr, ids, dists,
+                    ),
+                };
+                toc(t, &mut ctr.t_graph_ns);
+                n
             } else if d.postfilter {
                 let t = tic(&ctr);
                 let second_l = d
@@ -1280,6 +1306,7 @@ impl Searcher {
                 postfilter_configured: false,
                 postfilter_late: false,
                 postfilter_both: false,
+                island: None,
             };
         }
         let est = self.estimates(plan, ix, exact_stat, ctr);
@@ -1325,6 +1352,7 @@ impl Searcher {
         } else {
             l
         };
+        let l_base = l_run;
         // The post-filter alternative at a list size that holds the K nearest matches.
         let mut postfilter = false;
         if kernel.postfilter != PostfilterRoute::Off {
@@ -1335,17 +1363,37 @@ impl Searcher {
                 (postfilter, l_run, g) = (true, l_pf, g_pf);
             }
         }
+        // The island alternative: a post-filter search inside the smallest sub-graph of a
+        // single-label clause, at the match rate within it.
+        let mut island = None;
+        if let Some(isl) = ix.islands {
+            if let Some((i, s)) = island_choice(&self.compiled, isl, ix.labels) {
+                let rate_in = (est.m / s as f64).clamp(0.0, 1.0);
+                let (l_is, g_is) = postfilter_option(costs, l_base, k, rate_in, s, 1);
+                if g_is.is_finite() && g_is < g {
+                    island = Some((i, l_is));
+                    g = g_is;
+                }
+            }
+        }
         record(ctr, p, e, g, &est);
+        let graph_exact = hopeless && !postfilter && island.is_none();
+        let exact = !graph_only && (e <= g || graph_exact);
         Decision {
-            exact: !graph_only && (e <= g || (hopeless && !postfilter)),
+            exact,
             plan: p,
             est_exact: e,
             est_graph: g,
             l: l_run,
-            postfilter,
+            postfilter: postfilter && island.is_none(),
             postfilter_configured: postfilter && kernel.postfilter_starts.configured_at(rate),
-            postfilter_late: postfilter && kernel.postfilter_starts.late_at(rate),
-            postfilter_both: postfilter && kernel.postfilter_starts.both_at(rate),
+            postfilter_late: postfilter
+                && island.is_none()
+                && kernel.postfilter_starts.late_at(rate),
+            postfilter_both: postfilter
+                && island.is_none()
+                && kernel.postfilter_starts.both_at(rate),
+            island: if exact { None } else { island },
         }
     }
 
@@ -1793,6 +1841,59 @@ fn rank_l(costs: &UnitCosts, k: usize, rate: f64, n: usize) -> usize {
         return n.max(1);
     }
     (costs.graph_l_for(rank).ceil().min(n as f64) as usize).max(1)
+}
+
+impl Searcher {
+    /// Test hook: compiles `q` and, if a single-label clause has an island, runs the island
+    /// route in the smallest such island with list size `l(s)` (`s` its size); returns the
+    /// answers written and the counters.
+    #[cfg(test)]
+    pub(crate) fn island_for_test<T: Element>(
+        &mut self,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: impl Fn(usize) -> usize,
+        ids: &mut [u32],
+        dists: &mut [f32],
+    ) -> Option<(usize, Counters)> {
+        let isl = ix.islands?;
+        self.compiled.compile(
+            ix.labels,
+            q.cnf,
+            super::eval::Weights::Unit,
+            None,
+            &mut self.bits,
+        );
+        let choice = (!self.compiled.is_empty())
+            .then(|| island_choice(&self.compiled, isl, ix.labels))
+            .flatten();
+        let out = choice.map(|(i, s)| {
+            let mut ctr = Counters::default();
+            let n =
+                self.island_search::<T, RowScan>(ix, q, isl, i, l(s), None, &mut ctr, ids, dists);
+            (n, ctr)
+        });
+        self.compiled.clear_bits(&mut self.bits);
+        out
+    }
+}
+
+/// The island of the island route: among the clauses with exactly one non-empty label that has
+/// an island, the smallest island (its index and size).
+fn island_choice(q: &Compiled, isl: &IslandIndex, labels: &LabelStore) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for j in 0..q.n_clauses() {
+        let mut nonempty = q.clause(j).iter().filter(|&&l| labels.posting_len(l) > 0);
+        if let (Some(&l), None) = (nonempty.next(), nonempty.next()) {
+            if let Some(i) = isl.island(l) {
+                let s = isl.size(i);
+                if best.is_none_or(|(_, b)| s < b) {
+                    best = Some((i, s));
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Records the crossover's estimates in the counters.

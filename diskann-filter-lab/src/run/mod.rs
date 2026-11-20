@@ -51,6 +51,7 @@ use self::{
 };
 use crate::{
     bitsets::LabelBitsets,
+    islands::IslandIndex,
     kernel::{
         config::{Crossover, EstimateSource, Materializer, PredicateMode, StartSource, TreeRoute},
         cost::UnitCosts,
@@ -460,6 +461,29 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             .as_ref()
             .map_or(Value::Null, |p| pair_files[p].1.clone())
     };
+    // Per-label sub-graphs per file (untimed sidecars).
+    let mut island_files: BTreeMap<PathBuf, (IslandIndex, Value)> = BTreeMap::new();
+    for c in &exp.configs {
+        if let Some(path) = &c.islands_sidecar {
+            if !island_files.contains_key(path) {
+                let t = Instant::now();
+                let isl = IslandIndex::read(path)?;
+                isl.check(&ds.labels)
+                    .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
+                let doc = json!({
+                    "source": path, "islands": isl.n_islands(), "members": isl.n_members(),
+                    "edges": isl.n_edges(), "degree_bound": isl.degree_bound(),
+                    "bytes": isl.bytes(), "load_s": t.elapsed().as_secs_f64(),
+                });
+                island_files.insert(path.clone(), (isl, doc));
+            }
+        }
+    }
+    let islands_doc = |c: &ConfigSpec| -> Value {
+        c.islands_sidecar
+            .as_ref()
+            .map_or(Value::Null, |p| island_files[p].1.clone())
+    };
 
     // Indices, plans and per-row queries.
     let mut indices = Vec::new();
@@ -496,6 +520,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             costs: c.calibration.as_ref().map(|p| &cost_files[p].0),
             sketches: c.sketches_sidecar.as_ref().map(|p| &sketch_files[p].0),
             pairs: c.pairs_sidecar.as_ref().map(|p| &pair_files[p].0),
+            islands: c.islands_sidecar.as_ref().map(|p| &island_files[p].0),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
         if !exp.fast_paths {
@@ -626,6 +651,9 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             if c.pairs_sidecar.is_some() {
                 hash_input["pairs"] = pairs_doc(c)["source"].clone();
             }
+            if c.islands_sidecar.is_some() {
+                hash_input["islands"] = islands_doc(c)["source"].clone();
+            }
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));
             let safe: String = c
                 .name
@@ -709,6 +737,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     Value::Null
                 },
                 "pairs": pairs_doc(c),
+                "islands": islands_doc(c),
             });
             let protocol = json!({
                 "reps": if exp.mode == Mode::Timed { exp.reps } else { 1 },
@@ -823,7 +852,7 @@ fn counter_docs() -> Value {
         "n_hops": "adjacency lists read (expansions and second-hop reads)",
         "n_match_seen": "evaluated nodes satisfying the navigation predicate",
         "n_out": "answers returned (<= K)",
-        "route": "graph | exact | empty",
+        "route": "graph | exact | empty | fallback | postfilter | island",
         "n_aux_dist": "distance computations to auxiliary nodes",
         "n_lazy": "nodes skipped by distance_first",
         "n_aux_expand": "expansions of auxiliary nodes",

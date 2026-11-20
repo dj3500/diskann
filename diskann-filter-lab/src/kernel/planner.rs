@@ -288,6 +288,9 @@ pub struct Decision {
     /// A post-filter search from the global starts is followed by a second search from the
     /// configured starts (`postfilter_starts = by_rate_both`).
     pub postfilter_both: bool,
+    /// The island route: a search in island `.0` of the per-label sub-graphs with list size
+    /// `.1` (instead of the graph search).
+    pub island: Option<(usize, usize)>,
 }
 
 #[cfg(test)]
