@@ -419,6 +419,7 @@ pub fn tree_calibrate<T: Element>(
         sketches: None,
         pairs: None,
         islands: None,
+        pair_roots: None,
     };
     let e = tree_curve(&ds.base, &ix, &ds.labels, opts)?;
     let mut doc = calibration.clone();
@@ -511,6 +512,7 @@ mod tests {
             sketches: None,
             pairs: None,
             islands: None,
+            pair_roots: None,
         };
         assert_eq!(tree_labels(&ix, &labels), [labels.name_index()["a=1"]]);
         let e = tree_curve(

@@ -389,6 +389,27 @@ impl Compiled {
         }
     }
 
+    /// Navigation evaluates the clauses outside `skip` (bits of positions; not projected: the
+    /// navigation verdict is the answer verdict). For searches whose every evaluated node
+    /// satisfies the skipped clauses (the pair-tree route). Call before [`Self::split_static`].
+    pub fn residual_nav_except(&mut self, skip: u64) {
+        if self.empty || self.n_clauses == 0 {
+            return;
+        }
+        self.nav.clear();
+        self.nav
+            .extend((0..self.n_clauses as u32).filter(|&j| j >= 64 || skip >> j & 1 == 0));
+        self.nav_weight = self.nav.iter().map(|&j| self.w[j as usize]).sum();
+        self.max_nav_weight = self
+            .nav
+            .iter()
+            .map(|&j| self.w[j as usize])
+            .fold(0.0, f32::max);
+        if self.use_bits {
+            self.nav_mask = self.full_mask & !skip;
+        }
+    }
+
     pub fn project_smallest(&mut self) {
         if self.empty || self.n_clauses <= 1 {
             return;

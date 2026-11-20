@@ -403,7 +403,8 @@ enum PairsCommand {
         #[arg(long, value_delimiter = ',')]
         report: Vec<PathBuf>,
         /// Which pairs queries are assumed to use: `uniform` (every co-occurring pair; rank by
-        /// gain per entry) or `rare` (as likely as the smaller label is frequent).
+        /// gain per entry), `rare` (as likely as the smaller label is frequent) or `data` (as
+        /// likely as a uniformly drawn point carries both labels).
         #[arg(long, default_value = "uniform")]
         prior: diskann_filter_lab::pairs::Prior,
         /// Nested selections (the default): a budget's selection keeps every pair of the

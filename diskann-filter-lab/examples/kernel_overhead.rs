@@ -85,6 +85,7 @@ fn bench<T: Element>(
         sketches: None,
         pairs: None,
         islands: None,
+        pair_roots: None,
     };
     let post_fast = Plan::new(&Preset::parse("postfilter")?.kernel(), &ix)?;
     let inline_fast = Plan::new(&Preset::parse("upstream-inline")?.kernel(), &ix)?;
