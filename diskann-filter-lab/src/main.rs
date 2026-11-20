@@ -504,9 +504,10 @@ struct SelectArgs {
     /// bytes`; 0: no floor).
     #[arg(long, default_value_t = 0.0)]
     kappa: f64,
-    /// Share of pair contexts in the workload: queries `{a} ∧ {b}` of a pair of labels of
-    /// different categories drawn uniformly among the co-occurring ones (0: base-derived queries
-    /// only).
+    /// Share of the independent queries in the workload: with probability ½ a label drawn
+    /// uniformly among those that occur, as `{ℓ}`, otherwise a pair of labels of different
+    /// categories drawn uniformly among the co-occurring ones, as `{a} ∧ {b}`; the query vector
+    /// a data point drawn independently (0: base-derived queries only).
     #[arg(long, default_value_t = 0.5)]
     uniform: f64,
     /// Answers `K` of the cost terms.
@@ -550,6 +551,11 @@ struct SelectArgs {
     /// them; the floor's label pruning is applied as when counting.
     #[arg(long)]
     load_candidates: Option<PathBuf>,
+    /// Also write the first `M` base-derived queries and `M` independent queries drawn i.i.d.
+    /// from the workload (`--seed`) as query sets: `workload-{d,u}.fpred` (predicates),
+    /// `workload-{d,u}.<base extension>` (the vectors of their points) and `workload-{d,u}.tsv`.
+    #[arg(long)]
+    dump_workload: Option<usize>,
     /// Whose auxiliary structures: `hybrid` (islands and combination postings, valued against
     /// the exact path and the graph route) or `graph` (track G: a router tree per label and a
     /// pair tree per label pair, valued against the graph router alone; writes the trees'
@@ -570,8 +576,7 @@ struct SelectArgs {
     /// `--track graph`: price both routes from route calibration curves (JSON: per label-size
     /// class, the router's and the tree route's mean recall and time at each frontier level, on
     /// queries placed independently of the label (`U`), on members (`D`) and on label pairs
-    /// (`P`); `select_g::RouteCurves`) at the reference recall `--tree-recall`, and add the
-    /// workload's single-label contexts (half of `--uniform`; the other half on pairs).
+    /// (`P`); `select_g::RouteCurves`) at the reference recall `--tree-recall`.
     #[arg(long)]
     route_curves: Option<PathBuf>,
     /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
@@ -2008,6 +2013,100 @@ fn read_candidates(
     Ok((f, cands, complete))
 }
 
+/// `flab select --dump-workload M`: the workload's first `M` base-derived queries and `M`
+/// independent queries drawn i.i.d. ([`islands::draw_independent`]), as query sets of the
+/// vectors of their points (gathered from the base file) and their predicates.
+fn dump_workload<T: diskann_filter_lab::build::BuildElement>(
+    a: &SelectArgs,
+    store: &LabelStore,
+    base_file: &Path,
+    model: &islands::QueryModel,
+    contexts: &[diskann_filter_lab::select::PairCand],
+    m: usize,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let singles = islands::single_label_support(store);
+    let model = islands::QueryModel {
+        single_labels: singles.len() as u64,
+        contexts: contexts.len() as u64,
+        ..*model
+    };
+    let ext = base_file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin")
+        .to_string();
+    let mut f = std::fs::File::open(base_file)?;
+    let mut head = [0u8; 8];
+    f.read_exact(&mut head)?;
+    let nrows = u32::from_le_bytes(head[0..4].try_into()?) as usize;
+    let dim = u32::from_le_bytes(head[4..8].try_into()?) as usize;
+    ensure!(
+        nrows == store.n_points(),
+        "{} holds {nrows} vectors, the label store {} points",
+        base_file.display(),
+        store.n_points()
+    );
+    let row_bytes = dim * std::mem::size_of::<T>();
+    for (name, drawn) in [
+        (
+            "d",
+            (0..m)
+                .filter_map(|i| islands::draw_data(store, &model, i))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "u",
+            (0..m)
+                .filter_map(|i| islands::draw_independent(store, &model, contexts, &singles, i))
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let mut pb = PredicateSetBuilder::new(store);
+        let mut tsv = String::from("query\tpart\tpoint\tpredicate\n");
+        let mut vecs = Vec::with_capacity(8 + drawn.len() * row_bytes);
+        vecs.extend_from_slice(&(drawn.len() as u32).to_le_bytes());
+        vecs.extend_from_slice(&(dim as u32).to_le_bytes());
+        let mut row = vec![0u8; row_bytes];
+        for (q, d) in drawn.iter().enumerate() {
+            let names: Vec<Vec<&str>> = d
+                .clauses
+                .iter()
+                .map(|c| c.iter().map(|&l| store.label_name(l)).collect())
+                .collect();
+            pb.push(&names);
+            tsv += &format!(
+                "{q}\t{}\t{}\t{}\n",
+                serde_json::to_value(d.part)?.as_str().unwrap_or("?"),
+                d.point,
+                names
+                    .iter()
+                    .map(|c| c.join("|"))
+                    .collect::<Vec<_>>()
+                    .join(" & ")
+            );
+            f.seek(SeekFrom::Start(8 + d.point as u64 * row_bytes as u64))?;
+            f.read_exact(&mut row)?;
+            vecs.extend_from_slice(&row);
+        }
+        let stem = a.out_dir.join(format!("workload-{name}"));
+        pb.finish().write(&stem.with_extension("fpred"))?;
+        std::fs::write(stem.with_extension(&ext), vecs)?;
+        std::fs::write(stem.with_extension("tsv"), tsv)?;
+        println!(
+            "workload: {} {} queries to {}.{{fpred,{ext},tsv}}",
+            drawn.len(),
+            if name == "d" {
+                "base-derived"
+            } else {
+                "independent"
+            },
+            stem.display()
+        );
+    }
+    Ok(())
+}
+
 fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> Result<()> {
     use diskann_filter_lab::select;
     let t0 = Instant::now();
@@ -2102,6 +2201,14 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let count_s = secs(t);
     if a.uniform > 0.0 {
         model.contexts = contexts.len() as u64;
+        model.single_labels = islands::single_label_support(&store).len() as u64;
+    }
+    if let Some(m) = a.dump_workload {
+        ensure!(
+            complete,
+            "--dump-workload needs every co-occurring pair (count again or load a SELCAND2 file)"
+        );
+        dump_workload::<T>(&a, &store, &base_file, &model, &contexts, m)?;
     }
     let mixed: &[select::PairCand] = if a.uniform > 0.0 { &contexts } else { &[] };
     let t = Instant::now();
@@ -2109,12 +2216,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         Some(pr) => (
             None,
             Some(diskann_filter_lab::select_g::TreeSample::build_mixed(
-                &store,
-                pr,
-                model,
-                mixed,
-                curves.is_some(),
-                a.threads,
+                &store, pr, model, mixed, a.threads,
             )),
         ),
         None => (
@@ -2125,24 +2227,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         ),
     };
     let sample_s = secs(t);
-    let base_ns: &[f64] = match (&sample, &tree_sample) {
-        (Some(s), _) => &s.base_ns,
-        (_, Some(s)) => &s.base_ns,
+    let (mean, (mean_derived, mean_pairs, mean_singles)) = match (&sample, &tree_sample) {
+        (Some(s), _) => (s.mean_base_ns(), s.part_means(&s.base_ns)),
+        (_, Some(s)) => (s.mean_base_ns(), s.part_means(&s.base_ns)),
         _ => unreachable!("one sample"),
     };
-    let part_mean = |r: std::ops::Range<usize>| -> f64 {
-        let xs = &base_ns[r];
-        xs.iter().sum::<f64>() / xs.len().max(1) as f64
-    };
-    let mean = match (&sample, &tree_sample) {
-        (Some(s), _) => s.mean_base_ns(),
-        (_, Some(s)) => s.mean_base_ns(),
-        _ => unreachable!("one sample"),
-    };
-    let (mean_derived, mean_pairs) = (
-        part_mean(0..a.queries.min(base_ns.len())),
-        part_mean(a.queries.min(base_ns.len())..base_ns.len()),
-    );
     let stop = match a.stop {
         StopArg::Elasticity => select::Stop::Elasticity,
         StopArg::Budget => select::Stop::Budget,
@@ -2152,11 +2241,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         select::Stop::Elasticity => 0.0,
     };
     println!(
-        "{} base-derived queries, {} label contexts and {} pair contexts (of {}) in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0} and {mean_pairs:.0}); index {:.2} GiB; stop {}{}",
+        "{} base-derived queries, {} pair contexts (of {}) and {} single labels in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0}, {mean_pairs:.0} and {mean_singles:.0}); index {:.2} GiB; stop {}{}",
         a.queries,
-        tree_sample.as_ref().map_or(0, |s| s.n_label_ctx),
         model.n_pair_queries(),
         contexts.len(),
+        model.n_single_queries(),
         index_bytes as f64 / (1u64 << 30) as f64,
         match stop {
             select::Stop::Elasticity => "elasticity",
@@ -2307,7 +2396,9 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "mean_cost_ns": mean,
         "mean_cost_derived_ns": mean_derived,
         "mean_cost_pair_contexts_ns": mean_pairs,
+        "mean_cost_single_labels_ns": mean_singles,
         "pair_contexts": contexts.len(),
+        "single_labels": model.n_single_queries(),
         "model": model,
         "k": a.k, "r": a.r, "l_build": a.l_build, "alpha": a.alpha,
         "threads": a.threads,
@@ -2319,7 +2410,6 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "track": if graph_track { "graph" } else { "hybrid" },
         "tree_model": tree_model,
         "route_curves": a.route_curves,
-        "label_contexts": tree_sample.as_ref().map_or(0, |s| s.n_label_ctx),
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();

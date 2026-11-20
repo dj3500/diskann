@@ -13,8 +13,10 @@
 //! whose single-label clauses `{a}`, `{b}` have a pair tree takes the pair route.
 //!
 //! **Workload**: the selector's mixture ([`QueryModel`]): a sample of base-derived queries and,
-//! with share `μ`, every pair context `{a} ∧ {b}` of co-occurring labels once (binding clause:
-//! the smaller label; `M` = the joint size).
+//! with share `μ`, the independent queries exhaustively — every pair context `{a} ∧ {b}` of
+//! co-occurring labels once (binding clause: the smaller label; `M` = the joint size) and every
+//! single label `{ℓ}` that occurs once (`M = |P_ℓ|`), with query vectors independent of the
+//! labels.
 //!
 //! **Costs** (ns, the kernel's unit costs):
 //!
@@ -39,6 +41,17 @@
 //!   saving: against the router, as the selector's pair kinds; on its pair context against the
 //!   context's current cost, shared with the label trees through [`LabelKind`]).
 //!
+//! **Calibrated costs** (`flab select --route-curves`, [`RouteCurves`]): instead of the model
+//! above, both routes are priced from recall/time curves measured per label-size class on
+//! calibration queries drawn from the base (a single label with an independent query point, with
+//! a member as the query point, and label pairs by joint size), each at the time its class's
+//! Pareto frontier reaches the reference recall `R` (interpolated between classes in log size);
+//! a route whose class never reaches `R` costs [`UNREACHABLE_NS`], so a label the router cannot
+//! serve gets a must-have tree. A base-derived query is priced by the member curves (the tree at
+//! `K·s/M` members), an independent single label by the independent ones, a pair context by the
+//! pair curves at its joint size (the router, and the tree of its smaller label) and a pair tree
+//! by the independent tree curve at its joint size.
+//!
 //! **Bytes**: a tree over `s` members has `⌈(s − 1)/(b̄ − 1)⌉` routers (at least one), each a
 //! graph row, a vector and a kind byte (`router_bytes`); a pair tree adds its pair's list and
 //! directory entry ([`crate::select::pair_bytes`]); the pairs' co-occurrence matrix is charged
@@ -54,7 +67,7 @@
 //! route first), which then no longer counts for the label tree.
 
 use crate::{
-    islands::{draw_query, postfilter_nominal, query_matches, QueryModel},
+    islands::{draw_query, postfilter_nominal, query_matches, single_label_support, QueryModel},
     kernel::cost::{kth_match_rank, UnitCosts, Z},
     labels::LabelStore,
     select::{context_prob, pair_bytes, LabelKind, PairCand, PairValue},
@@ -350,67 +363,69 @@ impl Pricing<'_> {
     }
 }
 
-/// The label-tree terms of the workload, as the selector's [`crate::islands::QuerySample`]: its
-/// `n_data` base-derived queries (a sample, weight `(1 − μ)/n_data` each) and every context of its
-/// independent part once — with label contexts (B2i's U: half of `μ` on single labels, half on
-/// pairs) every label `{ℓ}` (weight `μ/2` over the labels) and every pair `{a} ∧ {b}` (weight `μ/2`
-/// over the pairs), else every pair (weight `μ/N`) — per query its router cost and, when its
+/// The label-tree terms of the workload, as the selector's [`crate::islands::QuerySample`] (the
+/// same layout and weights): its `n_data` base-derived queries (a sample, weight `(1 − μ)/n_data`
+/// each), then the independent part exhaustively — every pair context `{a} ∧ {b}` (weight
+/// `μ/2 / N`) and every single label `{ℓ}` that occurs (weight `μ/2 / L`; the whole `μ` to the
+/// one non-empty support, [`QueryModel::shares`]) — per query its router cost and, when its
 /// binding clause is a single label (for a pair, the smaller label), that label's tree route cost.
 #[derive(Debug, Clone)]
 pub struct TreeSample {
     pub model: QueryModel,
-    /// Router cost of each query: the base-derived queries, then the label contexts (label
-    /// order), then the pair contexts in the order of their (sorted) list.
+    /// Router cost of each query: the base-derived queries, then the pair contexts in the order
+    /// of their (sorted) list, then the single labels in label order.
     pub base_ns: Vec<f64>,
     /// `(label, query, tree route cost)` of the queries whose binding clause is that label, by
     /// label and query.
     recs: Vec<(u32, u32, f32)>,
     /// Base-derived queries (the first `n_data` of `base_ns`).
     pub n_data: usize,
-    /// Label contexts (after the base-derived queries).
-    pub n_label_ctx: usize,
     /// The pair contexts' labels `(a, b)`, in the order of their queries.
     ctx_keys: Vec<(u32, u32)>,
+    /// The single labels, in the order of their queries (sorted).
+    single_keys: Vec<u32>,
 }
 
 impl TreeSample {
     /// Draws the base-derived queries and computes their cost terms (with up to `threads`
-    /// threads; the result does not depend on the thread count). Without contexts (see
-    /// [`Self::build_mixed`]).
+    /// threads; the result does not depend on the thread count). Without the independent part
+    /// (see [`Self::build_mixed`]).
     pub fn build(labels: &LabelStore, pr: &Pricing, model: QueryModel, threads: usize) -> Self {
         let model = QueryModel {
             uniform: 0.0,
             ..model
         };
-        Self::build_mixed(labels, pr, model, &[], false, threads)
+        Self::build_mixed(labels, pr, model, &[], threads)
     }
 
     /// [`Self::build`] with the workload's independent part ([`QueryModel::uniform`]): one query
-    /// `{a} ∧ {b}` per pair of `contexts` (sorted; `M` = the joint size) and, with
-    /// `label_contexts`, one query `{ℓ}` per label of 1 to `n − 1` points.
+    /// `{a} ∧ {b}` per pair of `contexts` (sorted; `M` = the joint size) and one query `{ℓ}` per
+    /// label that occurs ([`single_label_support`], when `model.single_labels > 0`).
     pub fn build_mixed(
         labels: &LabelStore,
         pr: &Pricing,
         model: QueryModel,
         contexts: &[PairCand],
-        label_contexts: bool,
         threads: usize,
     ) -> Self {
         assert!(
             model.uniform == 0.0 || model.contexts == contexts.len() as u64,
             "the model's pair contexts must be the given ones"
         );
-        let n = labels.n_points();
-        let chunk = 1024usize;
-        let ctx_labels: Vec<u32> = if label_contexts && model.uniform > 0.0 {
-            (0..labels.n_labels() as u32)
-                .filter(|&l| (1..n).contains(&labels.posting_len(l)))
-                .collect()
+        let singles = if model.n_single_queries() > 0 {
+            single_label_support(labels)
         } else {
             Vec::new()
         };
-        let n_l = ctx_labels.len();
-        let n_total = model.n_queries + n_l + model.n_pair_queries();
+        assert_eq!(
+            singles.len(),
+            model.n_single_queries(),
+            "the model's single labels must be the labels that occur"
+        );
+        let n = labels.n_points();
+        let chunk = 1024usize;
+        let n_ctx = model.n_pair_queries();
+        let n_total = model.n_queries + n_ctx + singles.len();
         let init = || {
             (
                 Vec::<u32>::new(),
@@ -426,8 +441,17 @@ impl TreeSample {
                 let mut base = Vec::new();
                 let mut recs = Vec::new();
                 for qi in ci * chunk..((ci + 1) * chunk).min(n_total) {
-                    if qi >= model.n_queries + n_l {
-                        let p = &contexts[qi - model.n_queries - n_l];
+                    if qi >= model.n_queries + n_ctx {
+                        let l = singles[qi - model.n_queries - n_ctx];
+                        let s = labels.posting_len(l) as f64;
+                        base.push(pr.router_label(s));
+                        if labels.posting_len(l) < n {
+                            recs.push((l, qi as u32, pr.tree_label(s) as f32));
+                        }
+                        continue;
+                    }
+                    if qi >= model.n_queries {
+                        let p = &contexts[qi - model.n_queries];
                         let j = f64::from(p.joint).max(1.0);
                         base.push(pr.router_pair(j));
                         let (sa, sb) = (labels.posting_len(p.a), labels.posting_len(p.b));
@@ -440,13 +464,6 @@ impl TreeSample {
                             let t = pr.tree_pair_label(s as f64, j);
                             recs.push((l, qi as u32, t as f32));
                         }
-                        continue;
-                    }
-                    if qi >= model.n_queries {
-                        let l = ctx_labels[qi - model.n_queries];
-                        let s = labels.posting_len(l) as f64;
-                        base.push(pr.router_label(s));
-                        recs.push((l, qi as u32, pr.tree_label(s) as f32));
                         continue;
                     }
                     if !draw_query(labels, &model, qi, kl, clauses, cats) {
@@ -475,7 +492,7 @@ impl TreeSample {
             recs.extend(r);
         }
         recs.sort_unstable_by_key(|&(l, q, _)| (l, q));
-        let ctx_keys: Vec<(u32, u32)> = if model.n_pair_queries() > 0 {
+        let ctx_keys: Vec<(u32, u32)> = if n_ctx > 0 {
             contexts.iter().map(|p| (p.a, p.b)).collect()
         } else {
             Vec::new()
@@ -486,36 +503,20 @@ impl TreeSample {
             base_ns,
             recs,
             n_data: model.n_queries,
-            n_label_ctx: n_l,
             ctx_keys,
-        }
-    }
-
-    /// Share `μ` of the independent part (0 without contexts).
-    fn mu(&self) -> f64 {
-        if self.ctx_keys.is_empty() && self.n_label_ctx == 0 {
-            0.0
-        } else {
-            self.model.uniform
+            single_keys: singles,
         }
     }
 
     /// Workload weight of query `q`.
     pub fn weight(&self, q: usize) -> f64 {
-        let mu = self.mu();
-        let (nl, np) = (self.n_label_ctx, self.ctx_keys.len());
-        // With label contexts the independent part is split evenly between labels and pairs.
-        let (wl, wp) = match (nl > 0, np > 0) {
-            (true, true) => (mu / 2.0, mu / 2.0),
-            (true, false) => (mu, 0.0),
-            (false, _) => (0.0, mu),
-        };
+        let (wd, wp, ws) = self.model.shares();
         if q < self.n_data {
-            (1.0 - mu) / self.n_data.max(1) as f64
-        } else if q < self.n_data + nl {
-            wl / nl as f64
+            wd / self.n_data.max(1) as f64
+        } else if q < self.n_data + self.ctx_keys.len() {
+            wp / self.ctx_keys.len() as f64
         } else {
-            wp / np.max(1) as f64
+            ws / self.single_keys.len().max(1) as f64
         }
     }
 
@@ -529,12 +530,31 @@ impl TreeSample {
         self.weighted_mean(&self.base_ns)
     }
 
+    /// The mean of per-query values `x` within each part: base-derived, pair contexts, single
+    /// labels (0 for an empty part).
+    pub fn part_means(&self, x: &[f64]) -> (f64, f64, f64) {
+        let mean = |r: std::ops::Range<usize>| -> f64 {
+            let xs = &x[r.start.min(x.len())..r.end.min(x.len())];
+            xs.iter().sum::<f64>() / xs.len().max(1) as f64
+        };
+        let (a, b) = (self.n_data, self.n_data + self.ctx_keys.len());
+        (mean(0..a), mean(a..b), mean(b..b + self.single_keys.len()))
+    }
+
     /// The query of the pair context `{a} ∧ {b}` (`a < b`), if the sample holds pair contexts.
     pub fn context_query(&self, a: u32, b: u32) -> Option<usize> {
         self.ctx_keys
             .binary_search(&(a, b))
             .ok()
-            .map(|i| self.n_data + self.n_label_ctx + i)
+            .map(|i| self.n_data + i)
+    }
+
+    /// The query of the single label `{ℓ}`, if the sample holds single labels.
+    pub fn single_query(&self, l: u32) -> Option<usize> {
+        self.single_keys
+            .binary_search(&l)
+            .ok()
+            .map(|i| self.n_data + self.ctx_keys.len() + i)
     }
 }
 
@@ -743,13 +763,15 @@ impl<'s> TreeGreedy<'s> {
     fn gain(&self, x: usize) -> f64 {
         let (a, b) = self.ctx[x];
         let nd = self.sample.n_data;
-        let w = self.sample.weight(nd);
         let ctx: f64 = self.ctx_recs[a..b]
             .iter()
             .filter(|&&(q, _)| self.served[q as usize - nd].is_infinite())
-            .map(|&(q, t)| self.sample.base_ns[q as usize] - f64::from(t))
+            .map(|&(q, t)| {
+                let q = q as usize;
+                self.sample.weight(q) * (self.sample.base_ns[q] - f64::from(t))
+            })
             .sum();
-        self.terms[x].derived_ns + w * ctx
+        self.terms[x].derived_ns + ctx
     }
 }
 
@@ -1066,7 +1088,7 @@ mod tests {
             curves: None,
             n: s.n_points(),
         };
-        let mixed = TreeSample::build_mixed(&s, &pr, model, &contexts, false, 2);
+        let mixed = TreeSample::build_mixed(&s, &pr, model, &contexts, 2);
         assert_eq!(mixed.base_ns.len(), 4_000 + contexts.len());
         let plain = TreeSample::build(&s, &pr, model, 2);
         assert_eq!(plain.base_ns.len(), 4_000);
@@ -1201,34 +1223,45 @@ mod tests {
         assert!((pr.tree_derived(2_000.0, 20.0, true) - 200.0).abs() < 1e-9);
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
+        let singles = crate::islands::single_label_support(&s);
+        let (nc, nl) = (contexts.len(), singles.len());
         let model = QueryModel {
             n_queries: 2_000,
             seed: 7,
             uniform: 0.5,
-            contexts: contexts.len() as u64,
+            contexts: nc as u64,
+            single_labels: nl as u64,
             ..QueryModel::default()
         };
-        let sample = TreeSample::build_mixed(&s, &pr, model, &contexts, true, 2);
-        let nl = (0..s.n_labels() as u32)
-            .filter(|&l| (1..s.n_points()).contains(&s.posting_len(l)))
-            .count();
-        assert_eq!(sample.n_label_ctx, nl);
-        assert_eq!(sample.base_ns.len(), 2_000 + nl + contexts.len());
+        // The selector's layout: base-derived queries, pair contexts, single labels.
+        let sample = TreeSample::build_mixed(&s, &pr, model, &contexts, 2);
+        assert_eq!(sample.base_ns.len(), 2_000 + nc + nl);
         let total: f64 = (0..sample.base_ns.len()).map(|q| sample.weight(q)).sum();
         assert!((total - 1.0).abs() < 1e-9);
-        assert!((sample.weight(2_000) * nl as f64 - 0.25).abs() < 1e-12);
-        // The rare label tr (200 points) is a must-have: its label context alone is worth the
-        // unreachable router's price (weight 1/4 over the labels).
-        let g = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30);
-        let id = s.name_index()["tr"];
-        let t = g.terms.iter().find(|t| t.label == id).unwrap();
-        assert!(
-            t.saving_ns >= 0.25 / nl as f64 * (UNREACHABLE_NS - 50.0) * 0.999,
-            "{t:?}"
-        );
         let q = sample
             .context_query(contexts[0].a, contexts[0].b)
             .expect("a pair context");
-        assert_eq!(q, 2_000 + nl);
+        assert_eq!(q, 2_000);
+        assert!((sample.weight(q) * nc as f64 - 0.25).abs() < 1e-12);
+        let id = s.name_index()["tr"];
+        let q = sample.single_query(id).expect("a single label");
+        assert!(q >= 2_000 + nc);
+        assert!((sample.weight(q) * nl as f64 - 0.25).abs() < 1e-12);
+        // The rare label tr (200 points) is a must-have: its single label and each pair context
+        // it binds (the router unreachable below 2,000 points, its tree at 50 ns) are worth the
+        // router's price, each at its own weight (1/4 over the labels, 1/4 over the pairs).
+        let g = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30);
+        let t = g.terms.iter().find(|t| t.label == id).unwrap();
+        let bound = contexts
+            .iter()
+            .filter(|p| [p.a, p.b].contains(&id))
+            .filter(|p| s.posting_len(p.a).min(s.posting_len(p.b)) == s.posting_len(id))
+            .count();
+        assert!(bound > 0);
+        let want = (0.25 / nl as f64 + bound as f64 * 0.25 / nc as f64) * (UNREACHABLE_NS - 50.0);
+        assert!(
+            (t.saving_ns - t.derived_ns - want).abs() <= 1e-6 * want,
+            "{t:?} {want}"
+        );
     }
 }

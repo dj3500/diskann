@@ -229,15 +229,22 @@ pub struct QueryModel {
     /// independent of the query's point) instead of the query's point: 0 keeps the categories
     /// of a query as correlated as in the data, 1 makes them independent.
     pub fresh: f64,
-    /// Share `μ` of the workload's second component, *pair contexts*: a pair of labels of
-    /// different categories drawn uniformly among the `contexts` pairs that co-occur, as the
-    /// query `{a} ∧ {b}` (0: base-derived queries only). A [`QuerySample`] holds every pair
-    /// context once, with weight `μ / contexts`, besides its `n_queries` base-derived queries
-    /// (weight `(1 − μ) / n_queries` each).
+    /// Share `μ` of the workload's second component, the *independent* queries `U` (0:
+    /// base-derived queries only): with probability ½ a label drawn uniformly among the
+    /// `single_labels` labels that occur, as the query `{ℓ}`, otherwise a *pair context*, a pair
+    /// of labels of different categories drawn uniformly among the `contexts` pairs that
+    /// co-occur, as the query `{a} ∧ {b}` (all of `U` when one of the two supports is empty);
+    /// the query vector is a data point drawn uniformly and independently of the labels. A
+    /// [`QuerySample`] holds every pair context and every single label once, weighted by its
+    /// probability (`μ/2 / contexts`, `μ/2 / single_labels`), besides its `n_queries`
+    /// base-derived queries (weight `(1 − μ) / n_queries` each).
     pub uniform: f64,
     /// Number of co-occurring label pairs of different categories (the pair contexts' support;
     /// set from the counting pass when `uniform > 0`).
     pub contexts: u64,
+    /// Number of labels that occur (the single labels' support, [`single_label_support`]; set
+    /// when `uniform > 0`; 0: `U` is the pair contexts alone, the first definition).
+    pub single_labels: u64,
 }
 
 impl Default for QueryModel {
@@ -250,6 +257,7 @@ impl Default for QueryModel {
             fresh: 0.0,
             uniform: 0.0,
             contexts: 0,
+            single_labels: 0,
         }
     }
 }
@@ -260,13 +268,137 @@ impl QueryModel {
         if self.uniform > 0.0 && self.contexts > 0 {
             assert!(
                 self.uniform < 1.0,
-                "the pair contexts' share must be below 1"
+                "the independent queries' share must be below 1"
             );
             self.contexts as usize
         } else {
             0
         }
     }
+
+    /// Single-label queries of a sample: every label that occurs, when `uniform > 0`.
+    pub fn n_single_queries(&self) -> usize {
+        if self.uniform > 0.0 && self.single_labels > 0 {
+            assert!(
+                self.uniform < 1.0,
+                "the independent queries' share must be below 1"
+            );
+            self.single_labels as usize
+        } else {
+            0
+        }
+    }
+
+    /// Workload shares of the base-derived queries, the pair contexts and the single labels
+    /// (summing to 1): `(1 − μ, μ/2, μ/2)`, the whole `μ` to the one non-empty support of `U`,
+    /// `(1, 0, 0)` without `U`.
+    pub fn shares(&self) -> (f64, f64, f64) {
+        let (p, s) = (self.n_pair_queries() > 0, self.n_single_queries() > 0);
+        let mu = self.uniform;
+        match (p, s) {
+            (false, false) => (1.0, 0.0, 0.0),
+            (true, false) => (1.0 - mu, mu, 0.0),
+            (false, true) => (1.0 - mu, 0.0, mu),
+            (true, true) => (1.0 - mu, 0.5 * mu, 0.5 * mu),
+        }
+    }
+}
+
+/// The support of the workload's single-label queries: every label of at least one point, in id
+/// order.
+pub fn single_label_support(labels: &LabelStore) -> Vec<u32> {
+    (0..labels.n_labels() as u32)
+        .filter(|&l| labels.posting_len(l) > 0)
+        .collect()
+}
+
+/// Salt of the independent queries' vector draws.
+const POINT_SALT: u64 = 0x5eed_0f0b_ec70_45a1;
+
+/// The data point whose vector is query `q`'s of a [`QuerySample`] (`n_data` base-derived
+/// queries first): a base-derived query's own point ([`draw_query`]), for an independent query
+/// a point drawn uniformly, independently of its labels (seeded by `model.seed` and `q`).
+pub fn query_point(model: &QueryModel, n_points: usize, n_data: usize, q: usize) -> u32 {
+    let h = if q < n_data {
+        mix(model.seed ^ mix(q as u64))
+    } else {
+        mix(mix(model.seed ^ POINT_SALT) ^ mix(q as u64))
+    };
+    (h % n_points.max(1) as u64) as u32
+}
+
+/// Part of the workload a query comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Part {
+    /// Base-derived (`D`): a data point's sub-predicate, the point's own vector.
+    Data,
+    /// Independent (`U`), a single label `{ℓ}`.
+    Single,
+    /// Independent (`U`), a pair context `{a} ∧ {b}`.
+    Pair,
+}
+
+/// One query drawn from the workload: its clauses (sorted label ids each) and the data point
+/// whose vector it searches with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Drawn {
+    pub part: Part,
+    pub clauses: Vec<Vec<u32>>,
+    pub point: u32,
+}
+
+/// Base-derived query `i` of the workload (the `i`-th of a [`QuerySample`]'s base-derived
+/// queries; `None` for a point without labels).
+pub fn draw_data(labels: &LabelStore, model: &QueryModel, i: usize) -> Option<Drawn> {
+    let (mut kl, mut clauses, mut cats) = (Vec::new(), Vec::new(), Vec::new());
+    if !draw_query(labels, model, i, &mut kl, &mut clauses, &mut cats) {
+        return None;
+    }
+    Some(Drawn {
+        part: Part::Data,
+        clauses: clauses
+            .iter()
+            .map(|&(a, b)| {
+                let mut c = kl[a..b].to_vec();
+                c.sort_unstable();
+                c
+            })
+            .collect(),
+        point: query_point(model, labels.n_points(), usize::MAX, i),
+    })
+}
+
+/// Independent query `i` of the workload, drawn i.i.d. (seeded by `model.seed` and `i`): with
+/// probability ½ a label of `singles` uniformly as `{ℓ}`, otherwise a pair of `contexts`
+/// uniformly as `{a} ∧ {b}` (all of one kind when the other support is empty), and a data point
+/// drawn uniformly and independently as its vector. The sample of the selector holds these
+/// supports exhaustively, each query weighted by its probability ([`QuerySample::build_mixed`]);
+/// this draw gives the same distribution as concrete queries (e.g. to measure routes on them).
+pub fn draw_independent(
+    labels: &LabelStore,
+    model: &QueryModel,
+    contexts: &[crate::select::PairCand],
+    singles: &[u32],
+    i: usize,
+) -> Option<Drawn> {
+    if contexts.is_empty() && singles.is_empty() {
+        return None;
+    }
+    let z = mix(mix(model.seed ^ POINT_SALT.rotate_left(17)) ^ mix(i as u64));
+    let pair = !contexts.is_empty() && (singles.is_empty() || z & 1 == 0);
+    let y = mix(z);
+    let clauses = if pair {
+        let p = &contexts[(y % contexts.len() as u64) as usize];
+        vec![vec![p.a], vec![p.b]]
+    } else {
+        vec![vec![singles[(y % singles.len() as u64) as usize]]]
+    };
+    Some(Drawn {
+        part: if pair { Part::Pair } else { Part::Single },
+        clauses,
+        point: (mix(y) % labels.n_points().max(1) as u64) as u32,
+    })
 }
 
 #[inline]
@@ -301,7 +433,8 @@ fn meets(row: &[u32], clause: &[u32]) -> bool {
 pub struct QuerySample {
     pub model: QueryModel,
     /// Cost of each query's best route without islands: the `n_data` base-derived queries,
-    /// then the pair contexts (if any) in the order of their list.
+    /// then the pair contexts (if any) in the order of their list, then the single labels (if
+    /// any) in label order.
     pub base_ns: Vec<f64>,
     /// `(label, query, island cost)` of the cheaper islands, by label.
     recs: Vec<(u32, u32, f32)>,
@@ -309,6 +442,9 @@ pub struct QuerySample {
     pub n_data: usize,
     /// The pair contexts' labels `(a, b)`, in the order of their queries (sorted).
     ctx_keys: Vec<(u32, u32)>,
+    /// The single labels, in the order of their queries (sorted).
+    single_keys: Vec<u32>,
+    n_points: usize,
 }
 
 /// One label of the `queries` selection.
@@ -487,10 +623,13 @@ impl QuerySample {
         Self::build_mixed(labels, c, k, model, &[], threads)
     }
 
-    /// [`Self::build`] with the workload's pair contexts ([`QueryModel::uniform`]): after the
-    /// `n_queries` base-derived queries (weight `(1 − μ) / n_queries` each), one query
+    /// [`Self::build`] with the workload's independent queries ([`QueryModel::uniform`]): after
+    /// the `n_queries` base-derived queries (weight `(1 − μ) / n_queries` each), one query
     /// `{a} ∧ {b}` per pair of `contexts` (every co-occurring pair of labels of different
-    /// categories, sorted, with its joint size: the match count `M`; weight `μ / N` each).
+    /// categories, sorted, with its joint size: the match count `M`; weight `μ/2 / N` each) and
+    /// one query `{ℓ}` per label that occurs ([`single_label_support`], when
+    /// `model.single_labels > 0`; `M = |P_ℓ|`, weight `μ/2 / L` each). Their vectors are
+    /// independent of their labels ([`query_point`]); the costs do not depend on them.
     pub fn build_mixed(
         labels: &LabelStore,
         c: &UnitCosts,
@@ -503,10 +642,21 @@ impl QuerySample {
             model.uniform == 0.0 || model.contexts == contexts.len() as u64,
             "the model's pair contexts must be the given ones"
         );
+        let singles = if model.n_single_queries() > 0 {
+            single_label_support(labels)
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            singles.len(),
+            model.n_single_queries(),
+            "the model's single labels must be the labels that occur"
+        );
         let n = labels.n_points();
         let nf = n as f64;
         let chunk = 1024usize;
-        let n_total = model.n_queries + model.n_pair_queries();
+        let n_ctx = model.n_pair_queries();
+        let n_total = model.n_queries + n_ctx + singles.len();
         let n_chunks = n_total.div_ceil(chunk);
         let init = || {
             (
@@ -527,7 +677,7 @@ impl QuerySample {
                     }
                     let (_, s_min, m) = query_matches(labels, &model, kl, clauses);
                     (s_min, m)
-                } else {
+                } else if qi < model.n_queries + n_ctx {
                     let p = &contexts[qi - model.n_queries];
                     kl.clear();
                     kl.extend([p.a, p.b]);
@@ -535,6 +685,14 @@ impl QuerySample {
                     clauses.extend([(0, 1), (1, 2)]);
                     let s_min = labels.posting_len(p.a).min(labels.posting_len(p.b)) as u64;
                     (s_min, f64::from(p.joint).max(1.0))
+                } else {
+                    let l = singles[qi - model.n_queries - n_ctx];
+                    kl.clear();
+                    kl.push(l);
+                    clauses.clear();
+                    clauses.push((0, 1));
+                    let s = labels.posting_len(l) as u64;
+                    (s, (s as f64).max(1.0))
                 };
                 let (kl, clauses): (&Vec<u32>, &Vec<(usize, usize)>) = (kl, clauses);
                 let rho_min = s_min as f64 / nf;
@@ -570,7 +728,7 @@ impl QuerySample {
             recs.extend(r);
         }
         recs.sort_unstable_by_key(|&(l, q, _)| (l, q));
-        let ctx_keys: Vec<(u32, u32)> = if model.n_pair_queries() > 0 {
+        let ctx_keys: Vec<(u32, u32)> = if n_ctx > 0 {
             contexts.iter().map(|p| (p.a, p.b)).collect()
         } else {
             Vec::new()
@@ -582,39 +740,79 @@ impl QuerySample {
             recs,
             n_data: model.n_queries,
             ctx_keys,
+            single_keys: singles,
+            n_points: n,
         }
     }
 
-    /// Share `μ` of the pair contexts (0 without them).
-    fn mu(&self) -> f64 {
-        if self.ctx_keys.is_empty() {
-            0.0
-        } else {
-            self.model.uniform
-        }
+    /// Workload shares of the base-derived queries, the pair contexts and the single labels
+    /// ([`QueryModel::shares`]).
+    fn shares(&self) -> (f64, f64, f64) {
+        self.model.shares()
     }
 
     /// The workload's mean of per-query values `x` (`(1 − μ)` times the base-derived queries'
-    /// mean plus `μ` times the pair contexts' mean).
+    /// mean plus `μ/2` times the pair contexts' mean and `μ/2` times the single labels' mean).
     pub fn weighted_mean(&self, x: &[f64]) -> f64 {
-        let (d, c) = x.split_at(self.n_data.min(x.len()));
+        let (d, rest) = x.split_at(self.n_data.min(x.len()));
         let md = d.iter().sum::<f64>() / self.n_data.max(1) as f64;
-        let mu = self.mu();
-        if mu == 0.0 {
-            md
-        } else {
-            (1.0 - mu) * md + mu * c.iter().sum::<f64>() / c.len().max(1) as f64
+        let (wd, wp, ws) = self.shares();
+        if wd == 1.0 {
+            return md;
         }
+        let (p, s) = rest.split_at(self.ctx_keys.len().min(rest.len()));
+        let mut m = wd * md;
+        if !self.ctx_keys.is_empty() {
+            m += wp * p.iter().sum::<f64>() / p.len().max(1) as f64;
+        }
+        if !self.single_keys.is_empty() {
+            m += ws * s.iter().sum::<f64>() / s.len().max(1) as f64;
+        }
+        m
     }
 
     /// Workload weight of query `q`.
     pub fn weight(&self, q: usize) -> f64 {
-        let mu = self.mu();
+        let (wd, wp, ws) = self.shares();
         if q < self.n_data {
-            (1.0 - mu) / self.n_data.max(1) as f64
+            wd / self.n_data.max(1) as f64
+        } else if q < self.n_data + self.ctx_keys.len() {
+            wp / self.ctx_keys.len() as f64
         } else {
-            mu / self.ctx_keys.len().max(1) as f64
+            ws / self.single_keys.len().max(1) as f64
         }
+    }
+
+    /// Part of the workload query `q` comes from.
+    pub fn part(&self, q: usize) -> Part {
+        if q < self.n_data {
+            Part::Data
+        } else if q < self.n_data + self.ctx_keys.len() {
+            Part::Pair
+        } else {
+            Part::Single
+        }
+    }
+
+    /// The data point whose vector query `q` searches with ([`query_point`]).
+    pub fn point(&self, q: usize) -> u32 {
+        query_point(&self.model, self.n_points, self.n_data, q)
+    }
+
+    /// Number of pair-context queries and of single-label queries.
+    pub fn n_independent(&self) -> (usize, usize) {
+        (self.ctx_keys.len(), self.single_keys.len())
+    }
+
+    /// The workload's mean of per-query values `x` within each part: base-derived, pair
+    /// contexts, single labels (0 for an empty part).
+    pub fn part_means(&self, x: &[f64]) -> (f64, f64, f64) {
+        let mean = |r: std::ops::Range<usize>| -> f64 {
+            let xs = &x[r.start.min(x.len())..r.end.min(x.len())];
+            xs.iter().sum::<f64>() / xs.len().max(1) as f64
+        };
+        let (a, b) = (self.n_data, self.n_data + self.ctx_keys.len());
+        (mean(0..a), mean(a..b), mean(b..b + self.single_keys.len()))
     }
 
     /// Each query's cheapest cost with every candidate island built (a lower bound on its cost
@@ -627,6 +825,14 @@ impl QuerySample {
             *c = c.min(f64::from(isl));
         }
         x
+    }
+
+    /// The query of the single label `{ℓ}`, if the sample holds single labels.
+    pub fn single_query(&self, l: u32) -> Option<usize> {
+        self.single_keys
+            .binary_search(&l)
+            .ok()
+            .map(|i| self.n_data + self.ctx_keys.len() + i)
     }
 
     /// The query of the pair context `{a} ∧ {b}` (`a < b`), if the sample holds pair contexts.
@@ -771,22 +977,32 @@ impl<'s> IslandGreedy<'s> {
     /// weighted mean of its per-query savings).
     fn gain(&self, x: usize) -> f64 {
         let (_, a, b) = self.cands[x];
-        let nd = self.sample.n_data as u32;
-        let recs = &self.sample.recs[a..b];
-        // Records by query: the base-derived queries first.
+        let s = self.sample;
+        let nd = s.n_data as u32;
+        let recs = &s.recs[a..b];
+        // Records by query: the base-derived queries, then the pair contexts, then the single
+        // labels.
         let split = recs.partition_point(|&(_, q, _)| q < nd);
         let saving = |r: &[(u32, u32, f32)]| {
             r.iter()
                 .map(|&(_, q, isl)| (self.cur[q as usize] - f64::from(isl)).max(0.0))
                 .sum::<f64>()
         };
-        let sd = saving(&recs[..split]) / self.sample.n_data.max(1) as f64;
-        let mu = self.sample.mu();
-        if mu == 0.0 {
-            sd
-        } else {
-            (1.0 - mu) * sd + mu * saving(&recs[split..]) / self.sample.ctx_keys.len().max(1) as f64
+        let sd = saving(&recs[..split]) / s.n_data.max(1) as f64;
+        let (wd, wp, ws) = s.shares();
+        if wd == 1.0 {
+            return sd;
         }
+        let rest = &recs[split..];
+        let split2 = rest.partition_point(|&(_, q, _)| (q as usize) < s.n_data + s.ctx_keys.len());
+        let mut g = wd * sd;
+        if !s.ctx_keys.is_empty() {
+            g += wp * saving(&rest[..split2]) / s.ctx_keys.len() as f64;
+        }
+        if !s.single_keys.is_empty() {
+            g += ws * saving(&rest[split2..]) / s.single_keys.len() as f64;
+        }
+        g
     }
 
     /// The best remaining candidate (its current saving per query per byte and its index),
