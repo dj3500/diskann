@@ -488,14 +488,27 @@ struct SelectArgs {
     /// bytes are the index bytes of the value floor.
     #[arg(long)]
     graph: PathBuf,
-    /// Memory budgets in bytes per data point (one selection each).
+    /// Memory budgets in bytes per data point (one selection each; with `--stop elasticity` a
+    /// ceiling).
     #[arg(short, long, value_delimiter = ',', required = true)]
     budget: Vec<f64>,
-    /// Value floor: an item must speed the workload up by at least `kappa` times the fraction by
-    /// which it grows the index (expected saving per query per byte at least
-    /// `kappa · mean cost / index bytes`; 0: no floor).
-    #[arg(long, default_value_t = 1.0)]
+    /// When the greedy stops: `elasticity` (an item is taken only if it lowers the workload's
+    /// mean query time by at least the fraction by which it grows the index, `Δt/t ≥ ΔB/B`; the
+    /// budget is a ceiling) or `budget` (fill the budget, items below the `--kappa` floor
+    /// excluded).
+    #[arg(long, value_enum, default_value = "elasticity")]
+    stop: StopArg,
+    /// `--stop budget`: value floor, an item must speed the workload up by at least `kappa`
+    /// times the fraction by which it grows the index, both measured without auxiliary
+    /// structures (expected saving per query per byte at least `kappa · mean cost / index
+    /// bytes`; 0: no floor).
+    #[arg(long, default_value_t = 0.0)]
     kappa: f64,
+    /// Share of pair contexts in the workload: queries `{a} ∧ {b}` of a pair of labels of
+    /// different categories drawn uniformly among the co-occurring ones (0: base-derived queries
+    /// only).
+    #[arg(long, default_value_t = 0.5)]
+    uniform: f64,
     /// Answers `K` of the cost terms.
     #[arg(short, long, default_value_t = 10)]
     k: usize,
@@ -550,6 +563,10 @@ struct SelectArgs {
     /// frontier table's at the reference recall).
     #[arg(long, default_value_t = 512.0)]
     tree_frontier: f64,
+    /// `--track graph`: the tree route's expansions from the reference frontier (`frontier`) or
+    /// from the calibration's tree effort curve (`curve`; `flab tree-calibrate`).
+    #[arg(long, value_enum, default_value = "frontier")]
+    tree_effort: SelectTreeEffort,
     /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
     #[arg(long, default_value_t = 26.0)]
     tree_fanout: f64,
@@ -563,6 +580,12 @@ struct SelectArgs {
 enum SelectTrack {
     Hybrid,
     Graph,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SelectTreeEffort {
+    Frontier,
+    Curve,
 }
 
 /// Degree bound of a graph file (`graph.flab`, a directory holding one, or a DiskANN index).
@@ -579,6 +602,12 @@ fn graph_degree_bound(path: &Path) -> Result<usize> {
         let mut f = std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
         Ok(diskann_io::Header::read(&mut f)?.max_degree as usize)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StopArg {
+    Elasticity,
+    Budget,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1892,10 +1921,12 @@ fn file_bytes(p: &Path) -> Result<u64> {
         .len())
 }
 
-const CANDS_MAGIC: u64 = 0x5345_4c43_414e_4431; // "SELCAND1"
+const CANDS_MAGIC: u64 = 0x5345_4c43_414e_4431; // "SELCAND1": the candidates only
+const CONTEXTS_MAGIC: u64 = 0x5345_4c43_414e_4432; // "SELCAND2": every co-occurring pair
 
-/// Writes the pair candidates of `flab select` (header: magic, points, labels, singleton,
-/// count; then `f` per label, then `(a, b, joint, g)` per candidate, little-endian).
+/// Writes the pair contexts of `flab select` (every co-occurring pair of labels of different
+/// categories; header: magic, points, labels, singleton, count; then `f` per label, then
+/// `(a, b, joint, g)` per pair, little-endian).
 fn write_candidates(
     path: &Path,
     store: &LabelStore,
@@ -1905,7 +1936,7 @@ fn write_candidates(
 ) -> Result<()> {
     let mut b: Vec<u8> = Vec::with_capacity(40 + 8 * f.len() + 20 * cands.len());
     for x in [
-        CANDS_MAGIC,
+        CONTEXTS_MAGIC,
         store.n_points() as u64,
         store.n_labels() as u64,
         singleton.to_bits(),
@@ -1925,18 +1956,21 @@ fn write_candidates(
     std::fs::write(path, b).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Reads [`write_candidates`]' file, checking it belongs to `store` and `singleton`.
+/// Reads [`write_candidates`]' file, checking it belongs to `store` and `singleton`; also
+/// files of earlier versions that hold only the candidates (labels of 64 to `n − 1` points),
+/// flagged by `false`.
 fn read_candidates(
     path: &Path,
     store: &LabelStore,
     singleton: f64,
-) -> Result<(Vec<f64>, Vec<diskann_filter_lab::select::PairCand>)> {
+) -> Result<(Vec<f64>, Vec<diskann_filter_lab::select::PairCand>, bool)> {
     let b = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
     ensure!(
-        b.len() >= 40 && u64_at(0) == CANDS_MAGIC,
+        b.len() >= 40 && (u64_at(0) == CANDS_MAGIC || u64_at(0) == CONTEXTS_MAGIC),
         "not a candidates file"
     );
+    let complete = u64_at(0) == CONTEXTS_MAGIC;
     ensure!(
         u64_at(8) == store.n_points() as u64
             && u64_at(16) == store.n_labels() as u64
@@ -1964,7 +1998,7 @@ fn read_candidates(
             }
         })
         .collect();
-    Ok((f, cands))
+    Ok((f, cands, complete))
 }
 
 fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> Result<()> {
@@ -1978,15 +2012,24 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         + file_bytes(&a.dataset.join("labels.flab"))?
         + file_bytes(&a.graph)?;
     let n = store.n_points();
-    let model = islands::QueryModel {
+    ensure!(
+        (0.0..1.0).contains(&a.uniform),
+        "--uniform must be in [0, 1)"
+    );
+    let mut model = islands::QueryModel {
         n_queries: a.queries,
         seed: a.seed,
         singleton: a.singleton,
         fresh: a.fresh,
+        uniform: a.uniform,
         ..Default::default()
     };
     let graph_track = a.track == SelectTrack::Graph;
     let tree_model = if graph_track {
+        ensure!(
+            a.tree_effort == SelectTreeEffort::Frontier || !costs.tree_r.is_empty(),
+            "--tree-effort curve needs a calibration with a tree effort curve (flab tree-calibrate)"
+        );
         let r_max = graph_degree_bound(&a.graph)?;
         let mut bf = std::fs::File::open(&base_file)?;
         let (_, dim) = diskann_io::read_bin_header(&mut bf)?;
@@ -1994,6 +2037,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             k: a.k,
             recall: a.tree_recall,
             frontier: a.tree_frontier,
+            curve: a.tree_effort == SelectTreeEffort::Curve,
             fanout: a.tree_fanout,
             router_bytes: diskann_filter_lab::select_g::TreeModel::router_bytes_of(
                 r_max,
@@ -2003,85 +2047,127 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     } else {
         None
     };
+    // Every co-occurring pair of labels of different categories: the pair contexts of the
+    // workload, and (labels of 64 to n − 1 points) the candidates.
+    let t = Instant::now();
+    let (f, contexts, complete) = match &a.load_candidates {
+        Some(path) => read_candidates(path, &store, a.singleton)?,
+        None => {
+            let (counts, f) = select::label_weights(&store, a.singleton, a.threads);
+            let contexts = select::pair_contexts(&store, &counts, a.singleton, a.threads);
+            (f, contexts, true)
+        }
+    };
+    ensure!(
+        complete || a.uniform == 0.0,
+        "pair contexts need every co-occurring pair; {} holds only the candidates (count again)",
+        a.load_candidates
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
+    if let Some(path) = &a.save_candidates {
+        write_candidates(path, &store, a.singleton, &f, &contexts)?;
+    }
+    let count_s = secs(t);
+    if a.uniform > 0.0 {
+        model.contexts = contexts.len() as u64;
+    }
+    let mixed: &[select::PairCand] = if a.uniform > 0.0 { &contexts } else { &[] };
     let t = Instant::now();
     let (sample, tree_sample) = match &tree_model {
         Some(tm) => (
             None,
-            Some(diskann_filter_lab::select_g::TreeSample::build(
-                &store, &costs, tm, model, a.threads,
+            Some(diskann_filter_lab::select_g::TreeSample::build_mixed(
+                &store, &costs, tm, model, mixed, a.threads,
             )),
         ),
         None => (
-            Some(islands::QuerySample::build(
-                &store, &costs, a.k, model, a.threads,
+            Some(islands::QuerySample::build_mixed(
+                &store, &costs, a.k, model, mixed, a.threads,
             )),
             None,
         ),
     };
     let sample_s = secs(t);
-    let mean = match (&sample, &tree_sample) {
-        (Some(s), _) => s.mean_base_ns(),
-        (_, Some(s)) => s.mean_base_ns(),
+    let base_ns: &[f64] = match (&sample, &tree_sample) {
+        (Some(s), _) => &s.base_ns,
+        (_, Some(s)) => &s.base_ns,
         _ => unreachable!("one sample"),
     };
-    let floor = a.kappa * mean / index_bytes as f64;
+    let part_mean = |r: std::ops::Range<usize>| -> f64 {
+        let xs = &base_ns[r];
+        xs.iter().sum::<f64>() / xs.len().max(1) as f64
+    };
+    let mean = part_mean(0..base_ns.len());
+    let (mean_derived, mean_pairs) = (
+        part_mean(0..a.queries.min(base_ns.len())),
+        part_mean(a.queries.min(base_ns.len())..base_ns.len()),
+    );
+    let stop = match a.stop {
+        StopArg::Elasticity => select::Stop::Elasticity,
+        StopArg::Budget => select::Stop::Budget,
+    };
+    let floor = match stop {
+        select::Stop::Budget => a.kappa * mean / index_bytes as f64,
+        select::Stop::Elasticity => 0.0,
+    };
     println!(
-        "{} base-derived queries in {sample_s:.1} s; mean cost {mean:.0} ns; index {:.2} GiB; floor {floor:.3e} ns per query per byte (kappa {})",
+        "{} base-derived queries and {} pair contexts (of {}) in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0} and {mean_pairs:.0}); index {:.2} GiB; stop {}{}",
         a.queries,
+        model.n_pair_queries(),
+        contexts.len(),
         index_bytes as f64 / (1u64 << 30) as f64,
-        a.kappa
+        match stop {
+            select::Stop::Elasticity => "elasticity",
+            select::Stop::Budget => "budget",
+        },
+        if stop == select::Stop::Budget {
+            format!(" (floor {floor:.3e} ns per query per byte, kappa {})", a.kappa)
+        } else {
+            String::new()
+        }
     );
     let t = Instant::now();
-    // Labels whose bound on any pair's value reaches the floor (all of them when `kappa` is 0).
-    let bound_keep = |f: &[f64]| -> Vec<bool> {
-        if graph_track {
-            // The bound is the exact path's; track G's pairs are valued against the router.
-            return vec![true; store.n_labels()];
-        }
+    // Labels whose bound on any pair's value reaches the floor (all of them without a floor).
+    let keep: Vec<bool> = {
         let f_max = f.iter().copied().fold(0.0, f64::max);
         (0..store.n_labels() as u32)
-            .map(|l| select::pair_value_bound(&store, &costs, &model, f, f_max, l) >= floor)
+            .map(|l| {
+                // `--track graph`: the bound is the exact path's; track G's pairs are valued
+                // against the router.
+                graph_track
+                    || floor <= 0.0
+                    || select::pair_value_bound(&store, &costs, &model, &f, f_max, l) >= floor
+            })
             .collect()
     };
-    let (f, cands, keep) = match &a.load_candidates {
-        Some(path) => {
-            let (f, mut cands) = read_candidates(path, &store, a.singleton)?;
-            // The counting pass's pruning, so that loaded candidates select as counted ones.
-            let keep = bound_keep(&f);
-            cands.retain(|c| keep[c.a as usize] && keep[c.b as usize]);
-            (f, cands, keep)
-        }
-        None => {
-            let (counts, f) = select::label_weights(&store, a.singleton, a.threads);
-            let keep = bound_keep(&f);
-            let cands = select::pair_candidates(
-                &store,
-                &counts,
-                a.singleton,
-                |l| keep[l as usize],
-                a.threads,
-            );
-            (f, cands, keep)
-        }
-    };
     let n_keep = keep.iter().filter(|&&k| k).count();
-    if let Some(path) = &a.save_candidates {
-        write_candidates(path, &store, a.singleton, &f, &cands)?;
-    }
+    let cands: Vec<select::PairCand> = contexts
+        .iter()
+        .filter(|c| {
+            select::is_candidate_label(&store, c.a)
+                && select::is_candidate_label(&store, c.b)
+                && keep[c.a as usize]
+                && keep[c.b as usize]
+        })
+        .copied()
+        .collect();
     let values = match &tree_model {
         Some(tm) => {
             diskann_filter_lab::select_g::pair_tree_values(&store, &costs, tm, &model, &f, &cands)
         }
         None => select::pair_values(&store, &costs, a.k, &model, &f, &cands),
     };
-    let pairs_s = secs(t);
+    let pairs_s = count_s + secs(t);
     println!(
-        "{n_keep} of {} labels can pass the floor; {} co-occurring pairs in different categories, {} with a positive saving, in {pairs_s:.1} s{}",
+        "{n_keep} of {} labels can pass the floor; {} co-occurring pairs in different categories, {} candidates, {} with a positive saving, in {pairs_s:.1} s{}",
         store.n_labels(),
+        contexts.len(),
         cands.len(),
         values.len(),
         match &a.load_candidates {
-            Some(path) => format!(" (candidates read from {})", path.display()),
+            Some(path) => format!(" (counted pairs read from {})", path.display()),
             None => String::new(),
         }
     );
@@ -2120,6 +2206,9 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             budget_bytes: (b * n as f64) as u64,
             floor,
             model,
+            stop,
+            mean_ns: mean,
+            index_bytes,
         };
         let t = Instant::now();
         let sel = match (&sample, &tree_sample, &tree_model) {
@@ -2159,6 +2248,14 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             best.bytes() as f64 / (1u64 << 20) as f64,
             best.cut
         );
+        println!(
+            "  {:.2} B/point spent; mean cost {:.0} → {:.0} ns (−{:.1} %), index +{:.2} %",
+            best.bytes() as f64 / n as f64,
+            mean,
+            mean - best.saving_ns(),
+            100.0 * best.saving_ns() / mean,
+            100.0 * best.bytes() as f64 / index_bytes as f64
+        );
         sels.push((b, params, sel, select_s));
     }
     let common = json!({
@@ -2168,8 +2265,12 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "n_points": n,
         "index_bytes": index_bytes,
         "kappa": a.kappa,
+        "stop": stop,
         "floor_ns_per_query_byte": floor,
         "mean_cost_ns": mean,
+        "mean_cost_derived_ns": mean_derived,
+        "mean_cost_pair_contexts_ns": mean_pairs,
+        "pair_contexts": contexts.len(),
         "model": model,
         "k": a.k, "r": a.r, "l_build": a.l_build, "alpha": a.alpha,
         "threads": a.threads,
@@ -2200,6 +2301,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         r["select_s"] = json!(select_s);
         r["best"] = json!(sel.best);
         r["bytes"] = json!(sel.best.bytes());
+        r["bytes_per_point"] = json!(sel.best.bytes() as f64 / n as f64);
         r["expected_saving_ns"] = json!(sel.best.saving_ns());
         r["runs"] = json!(sel.runs);
         // `--track graph`: the per-label kind is the router trees.

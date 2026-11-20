@@ -1178,7 +1178,10 @@ mod tests {
         let text = "7\n# a comment\n2 # trailing\n\n  7\n0\n";
         assert_eq!(parse_label_list(text, 8, "list").unwrap(), vec![0, 2, 7]);
         let err = parse_label_list("3\n8\n", 8, "list").unwrap_err();
-        assert!(err.to_string().contains("list:2: label 8 out of range"), "{err}");
+        assert!(
+            err.to_string().contains("list:2: label 8 out of range"),
+            "{err}"
+        );
         assert!(parse_label_list("x\n", 8, "list").is_err());
     }
 
