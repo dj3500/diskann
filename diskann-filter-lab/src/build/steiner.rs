@@ -203,6 +203,10 @@ pub fn run(args: &SteinerArgs) -> Result<()> {
 pub fn read_label_list(path: &std::path::Path, n_labels: usize) -> Result<Vec<u32>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading the label list {}", path.display()))?;
+    parse_label_list(&text, n_labels, &path.display().to_string())
+}
+
+fn parse_label_list(text: &str, n_labels: usize, origin: &str) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let t = line.split('#').next().unwrap_or("").trim();
@@ -211,11 +215,10 @@ pub fn read_label_list(path: &std::path::Path, n_labels: usize) -> Result<Vec<u3
         }
         let l: u32 = t
             .parse()
-            .with_context(|| format!("{}:{}: not a label id: {t:?}", path.display(), i + 1))?;
+            .with_context(|| format!("{origin}:{}: not a label id: {t:?}", i + 1))?;
         ensure!(
             (l as usize) < n_labels,
-            "{}:{}: label {l} out of range ({n_labels} labels)",
-            path.display(),
+            "{origin}:{}: label {l} out of range ({n_labels} labels)",
             i + 1
         );
         out.push(l);
@@ -814,7 +817,10 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         "tool": "flab steiner",
         "dataset": args.dataset, "graph": args.graph, "starts": args.starts,
         "construction": format!("{:?}", args.construction).to_lowercase(),
-        "block": b, "min_size": args.min_size, "max_size": max_size, "labels_file": args.labels_file,
+        "block": b, "labels_file": args.labels_file,
+        // A label list replaces the size bounds.
+        "min_size": args.labels_file.is_none().then_some(args.min_size),
+        "max_size": args.labels_file.is_none().then_some(max_size),
         "router": format!("{:?}", args.router).to_lowercase(), "keep_starts": args.keep_starts,
         "partition": format!("{:?}", args.partition).to_lowercase(), "kmeans_iters": args.kmeans_iters,
         "kmeans_sample": args.kmeans_sample,
@@ -1165,6 +1171,15 @@ mod tests {
         for l in 0..labels.n_labels() as u32 {
             assert_eq!(starts_of(&a, l), st0.label_starts(l));
         }
+    }
+
+    #[test]
+    fn a_label_list_is_sorted_deduplicated_and_range_checked() {
+        let text = "7\n# a comment\n2 # trailing\n\n  7\n0\n";
+        assert_eq!(parse_label_list(text, 8, "list").unwrap(), vec![0, 2, 7]);
+        let err = parse_label_list("3\n8\n", 8, "list").unwrap_err();
+        assert!(err.to_string().contains("list:2: label 8 out of range"), "{err}");
+        assert!(parse_label_list("x\n", 8, "list").is_err());
     }
 
     #[test]
