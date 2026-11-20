@@ -532,7 +532,8 @@ struct SelectArgs {
     #[arg(long)]
     save_candidates: Option<PathBuf>,
     /// Read the pair candidates from a file written by `--save-candidates` (same label store and
-    /// `--singleton`) instead of counting them.
+    /// `--singleton`; written with `--kappa 0`, it serves every `--kappa`) instead of counting
+    /// them; the floor's label pruning is applied as when counting.
     #[arg(long)]
     load_candidates: Option<PathBuf>,
 }
@@ -1953,18 +1954,24 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         a.kappa
     );
     let t = Instant::now();
-    let (f, cands, n_keep) = match &a.load_candidates {
+    // Labels whose bound on any pair's value reaches the floor (all of them when `kappa` is 0).
+    let bound_keep = |f: &[f64]| -> Vec<bool> {
+        let f_max = f.iter().copied().fold(0.0, f64::max);
+        (0..store.n_labels() as u32)
+            .map(|l| select::pair_value_bound(&store, &costs, &model, f, f_max, l) >= floor)
+            .collect()
+    };
+    let (f, cands, keep) = match &a.load_candidates {
         Some(path) => {
-            let (f, cands) = read_candidates(path, &store, a.singleton)?;
-            (f, cands, usize::MAX)
+            let (f, mut cands) = read_candidates(path, &store, a.singleton)?;
+            // The counting pass's pruning, so that loaded candidates select as counted ones.
+            let keep = bound_keep(&f);
+            cands.retain(|c| keep[c.a as usize] && keep[c.b as usize]);
+            (f, cands, keep)
         }
         None => {
             let (counts, f) = select::label_weights(&store, a.singleton, a.threads);
-            let f_max = f.iter().copied().fold(0.0, f64::max);
-            let keep: Vec<bool> = (0..store.n_labels() as u32)
-                .map(|l| select::pair_value_bound(&store, &costs, &model, &f, f_max, l) >= floor)
-                .collect();
-            let n_keep = keep.iter().filter(|&&k| k).count();
+            let keep = bound_keep(&f);
             let cands = select::pair_candidates(
                 &store,
                 &counts,
@@ -1972,19 +1979,24 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
                 |l| keep[l as usize],
                 a.threads,
             );
-            (f, cands, n_keep)
+            (f, cands, keep)
         }
     };
+    let n_keep = keep.iter().filter(|&&k| k).count();
     if let Some(path) = &a.save_candidates {
         write_candidates(path, &store, a.singleton, &f, &cands)?;
     }
     let values = select::pair_values(&store, &costs, a.k, &model, &f, &cands);
     let pairs_s = secs(t);
     println!(
-        "{n_keep} of {} labels can pass the floor; {} co-occurring pairs in different categories, {} with a positive saving, in {pairs_s:.1} s",
+        "{n_keep} of {} labels can pass the floor; {} co-occurring pairs in different categories, {} with a positive saving, in {pairs_s:.1} s{}",
         store.n_labels(),
         cands.len(),
-        values.len()
+        values.len(),
+        match &a.load_candidates {
+            Some(path) => format!(" (candidates read from {})", path.display()),
+            None => String::new(),
+        }
     );
     let mut tsv = String::from("a\tb\tsize_a\tsize_b\tjoint\tprob\tsaving_ns\tbytes\tvalue\n");
     for v in values.iter().take(200_000) {
