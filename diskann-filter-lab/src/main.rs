@@ -503,9 +503,10 @@ struct SelectArgs {
     /// bytes`; 0: no floor).
     #[arg(long, default_value_t = 0.0)]
     kappa: f64,
-    /// Share of pair contexts in the workload: queries `{a} ∧ {b}` of a pair of labels of
-    /// different categories drawn uniformly among the co-occurring ones (0: base-derived queries
-    /// only).
+    /// Share of the independent queries in the workload: with probability ½ a label drawn
+    /// uniformly among those that occur, as `{ℓ}`, otherwise a pair of labels of different
+    /// categories drawn uniformly among the co-occurring ones, as `{a} ∧ {b}`; the query vector
+    /// a data point drawn independently (0: base-derived queries only).
     #[arg(long, default_value_t = 0.5)]
     uniform: f64,
     /// Answers `K` of the cost terms.
@@ -549,6 +550,11 @@ struct SelectArgs {
     /// them; the floor's label pruning is applied as when counting.
     #[arg(long)]
     load_candidates: Option<PathBuf>,
+    /// Also write the first `M` base-derived queries and `M` independent queries drawn i.i.d.
+    /// from the workload (`--seed`) as query sets: `workload-{d,u}.fpred` (predicates),
+    /// `workload-{d,u}.<base extension>` (the vectors of their points) and `workload-{d,u}.tsv`.
+    #[arg(long)]
+    dump_workload: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1948,6 +1954,100 @@ fn read_candidates(
     Ok((f, cands, complete))
 }
 
+/// `flab select --dump-workload M`: the workload's first `M` base-derived queries and `M`
+/// independent queries drawn i.i.d. ([`islands::draw_independent`]), as query sets of the
+/// vectors of their points (gathered from the base file) and their predicates.
+fn dump_workload<T: diskann_filter_lab::build::BuildElement>(
+    a: &SelectArgs,
+    store: &LabelStore,
+    base_file: &Path,
+    model: &islands::QueryModel,
+    contexts: &[diskann_filter_lab::select::PairCand],
+    m: usize,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let singles = islands::single_label_support(store);
+    let model = islands::QueryModel {
+        single_labels: singles.len() as u64,
+        contexts: contexts.len() as u64,
+        ..*model
+    };
+    let ext = base_file
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin")
+        .to_string();
+    let mut f = std::fs::File::open(base_file)?;
+    let mut head = [0u8; 8];
+    f.read_exact(&mut head)?;
+    let nrows = u32::from_le_bytes(head[0..4].try_into()?) as usize;
+    let dim = u32::from_le_bytes(head[4..8].try_into()?) as usize;
+    ensure!(
+        nrows == store.n_points(),
+        "{} holds {nrows} vectors, the label store {} points",
+        base_file.display(),
+        store.n_points()
+    );
+    let row_bytes = dim * std::mem::size_of::<T>();
+    for (name, drawn) in [
+        (
+            "d",
+            (0..m)
+                .filter_map(|i| islands::draw_data(store, &model, i))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "u",
+            (0..m)
+                .filter_map(|i| islands::draw_independent(store, &model, contexts, &singles, i))
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let mut pb = PredicateSetBuilder::new(store);
+        let mut tsv = String::from("query\tpart\tpoint\tpredicate\n");
+        let mut vecs = Vec::with_capacity(8 + drawn.len() * row_bytes);
+        vecs.extend_from_slice(&(drawn.len() as u32).to_le_bytes());
+        vecs.extend_from_slice(&(dim as u32).to_le_bytes());
+        let mut row = vec![0u8; row_bytes];
+        for (q, d) in drawn.iter().enumerate() {
+            let names: Vec<Vec<&str>> = d
+                .clauses
+                .iter()
+                .map(|c| c.iter().map(|&l| store.label_name(l)).collect())
+                .collect();
+            pb.push(&names);
+            tsv += &format!(
+                "{q}\t{}\t{}\t{}\n",
+                serde_json::to_value(d.part)?.as_str().unwrap_or("?"),
+                d.point,
+                names
+                    .iter()
+                    .map(|c| c.join("|"))
+                    .collect::<Vec<_>>()
+                    .join(" & ")
+            );
+            f.seek(SeekFrom::Start(8 + d.point as u64 * row_bytes as u64))?;
+            f.read_exact(&mut row)?;
+            vecs.extend_from_slice(&row);
+        }
+        let stem = a.out_dir.join(format!("workload-{name}"));
+        pb.finish().write(&stem.with_extension("fpred"))?;
+        std::fs::write(stem.with_extension(&ext), vecs)?;
+        std::fs::write(stem.with_extension("tsv"), tsv)?;
+        println!(
+            "workload: {} {} queries to {}.{{fpred,{ext},tsv}}",
+            drawn.len(),
+            if name == "d" {
+                "base-derived"
+            } else {
+                "independent"
+            },
+            stem.display()
+        );
+    }
+    Ok(())
+}
+
 fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> Result<()> {
     use diskann_filter_lab::select;
     let t0 = Instant::now();
@@ -1996,6 +2096,14 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let count_s = secs(t);
     if a.uniform > 0.0 {
         model.contexts = contexts.len() as u64;
+        model.single_labels = islands::single_label_support(&store).len() as u64;
+    }
+    if let Some(m) = a.dump_workload {
+        ensure!(
+            complete,
+            "--dump-workload needs every co-occurring pair (count again or load a SELCAND2 file)"
+        );
+        dump_workload::<T>(&a, &store, &base_file, &model, &contexts, m)?;
     }
     let t = Instant::now();
     let sample = islands::QuerySample::build_mixed(
@@ -2008,14 +2116,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     );
     let sample_s = secs(t);
     let mean = sample.mean_base_ns();
-    let part_mean = |r: std::ops::Range<usize>| -> f64 {
-        let xs = &sample.base_ns[r];
-        xs.iter().sum::<f64>() / xs.len().max(1) as f64
-    };
-    let (mean_derived, mean_pairs) = (
-        part_mean(0..a.queries.min(sample.base_ns.len())),
-        part_mean(a.queries.min(sample.base_ns.len())..sample.base_ns.len()),
-    );
+    let (mean_derived, mean_pairs, mean_singles) = sample.part_means(&sample.base_ns);
     let stop = match a.stop {
         StopArg::Elasticity => select::Stop::Elasticity,
         StopArg::Budget => select::Stop::Budget,
@@ -2025,10 +2126,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         select::Stop::Elasticity => 0.0,
     };
     println!(
-        "{} base-derived queries and {} pair contexts (of {}) in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0} and {mean_pairs:.0}); index {:.2} GiB; stop {}{}",
+        "{} base-derived queries, {} pair contexts (of {}) and {} single labels in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0}, {mean_pairs:.0} and {mean_singles:.0}); index {:.2} GiB; stop {}{}",
         a.queries,
         model.n_pair_queries(),
         contexts.len(),
+        model.n_single_queries(),
         index_bytes as f64 / (1u64 << 30) as f64,
         match stop {
             select::Stop::Elasticity => "elasticity",
@@ -2154,7 +2256,9 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "mean_cost_ns": mean,
         "mean_cost_derived_ns": mean_derived,
         "mean_cost_pair_contexts_ns": mean_pairs,
+        "mean_cost_single_labels_ns": mean_singles,
         "pair_contexts": contexts.len(),
+        "single_labels": model.n_single_queries(),
         "model": model,
         "k": a.k, "r": a.r, "l_build": a.l_build, "alpha": a.alpha,
         "threads": a.threads,

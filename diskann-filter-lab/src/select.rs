@@ -9,26 +9,33 @@
 //! one memory budget, with the unit costs of the cost model. Categories are read as the label
 //! store's groups only; no query log is read.
 //!
-//! **Workload.** A mixture of two components ([`QueryModel`]): with weight `1 − μ`, the
-//! base-derived queries of the islands' `queries` selection — a data point drawn uniformly, each
-//! of its categories kept with probability ½, a kept category's clause one of the point's labels
-//! in it (probability `singleton`) or a random subset of them (optionally, with probability
-//! `fresh`, drawn from another data point): queries that look like the data; with weight `μ`,
-//! *pair contexts* — a pair of labels of different categories drawn uniformly among the `N`
-//! pairs that co-occur, as the query `{a} ∧ {b}`: every combination equally likely. (`μ = ½`
-//! hedges between the two; `μ = 0` is the base-derived workload alone.) An island serves a
-//! query through a single-label clause; a pair `(a, b)` through two single-label clauses
-//! `{a} ∧ {b}` in different categories (the `pair` plan's exact cover).
+//! **Workload.** A fixed mixture of two components ([`QueryModel`]), the same for every kind of
+//! candidate: with weight `1 − μ`, **data-like** queries (`D`), the base-derived queries of the
+//! islands' `queries` selection — a data point drawn uniformly, each of its categories kept with
+//! probability ½, a kept category's clause one of the point's labels in it (probability
+//! `singleton`) or a random subset of them (optionally, with probability `fresh`, drawn from
+//! another data point), the query vector that point's: queries that look like the data; with
+//! weight `μ`, **independent** queries (`U`) — with probability ½ a label drawn uniformly among
+//! the `L` labels that occur, as the query `{ℓ}`, otherwise a pair of labels of different
+//! categories drawn uniformly among the `N` pairs that co-occur, as the query `{a} ∧ {b}` —
+//! with a query vector drawn uniformly among the data points, independently of the labels: any
+//! label or pair, from anywhere. (`μ = ½` hedges between the two and is not tuned; `μ = 0` is
+//! the base-derived workload alone.) An island serves a query through a single-label clause; a
+//! pair `(a, b)` through two single-label clauses `{a} ∧ {b}` in different categories (the
+//! `pair` plan's exact cover).
 //!
 //! **Islands** are valued on a sample of this workload ([`QuerySample::build_mixed`]:
-//! `n_queries` base-derived queries and `n_queries · μ / (1 − μ)` pair contexts, equally
-//! weighted; per query the cost of its best route without auxiliary structures and of the island
-//! of each single-label clause).
+//! `n_queries` base-derived queries, weight `(1 − μ)/n_queries` each, and `U`'s support
+//! exhaustively — every pair context, weight `μ/2 / N`, and every single label, weight
+//! `μ/2 / L` — so `U` enters in expectation, without sampling noise; per query the cost of its
+//! best route without auxiliary structures and of the island of each single-label clause). The
+//! costs do not depend on the query vector; [`crate::islands::draw_independent`] draws `U`'s
+//! queries i.i.d. with their vectors (seeded), for measurements on concrete queries.
 //!
-//! **Pairs** are too many, and each drawn too rarely, for a sample (among base-derived queries a
+//! **Pairs** are too many, and each drawn too rarely, for a sample of base-derived queries (a
 //! pair whose joint posting holds `j` points is drawn with probability ∝ `j/n`), so their value
-//! is the expectation over the same workload in closed form: the probability that a query's
-//! clauses in the categories of `a` and `b` are `{a}` and `{b}`, `(1 − μ)·P_ab + μ/N` with
+//! on `D` is the expectation in closed form: the probability that a query's clauses in the
+//! categories of `a` and `b` are `{a}` and `{b}`, `(1 − μ)·P_ab` with
 //!
 //! ```text
 //! P_ab = ¼·[(1 − fresh)²·g_ab + (1 − (1 − fresh)²)·f_a·f_b]
@@ -46,11 +53,12 @@
 //! ```
 //!
 //! (the scan of the smaller clause or the post-filter route `base` at rate `M/n`, against the
-//! joint posting read with a residual clause checked), at `4·(j + 3)` bytes. Only pairs that
+//! joint posting read with a residual clause checked), at `4·(j + 3)` bytes; on `U` a pair is
+//! valued on its own pair context of the sample, against that query's current cost (which a
+//! taken island or pair lowers: one cost per query, shared by the kinds). Only pairs that
 //! co-occur are candidates (a query of the workload has a match), of labels of at least
-//! [`pairs::T_MIN`] points. The kinds' interactions (a query served by both) are not modelled:
-//! a pair is valued against the routes without auxiliary structures, an island against those and
-//! the islands taken before it.
+//! [`pairs::T_MIN`] points. On `D`, a pair is valued against the routes without auxiliary
+//! structures (not modelled: a base-derived query served by both kinds).
 //!
 //! **Selection.** One greedy over both kinds by expected saving per query per byte. It stops
 //! ([`Stop::Elasticity`]) at the first item whose relative saving of the mean query time is
@@ -395,14 +403,16 @@ pub struct PairValue {
 
 /// Probability per query of the context `{a} ∧ {b}` of a candidate pair among the base-derived
 /// part of the workload (`(1 − μ)·P_ab`, `P_ab` of the module documentation; `μ =
-/// model.uniform` when the workload has pair contexts). The pair-context part (`μ / N`) is
-/// valued on the sample's context query, shared with the per-label kind (see [`LabelKind`]).
+/// model.uniform` when the workload has independent queries). The pair-context part (`μ/2 / N`)
+/// is valued on the sample's context query, shared with the per-label kind (see
+/// [`LabelKind`]).
 pub fn context_prob(model: &QueryModel, f: &[f64], p: &PairCand) -> f64 {
     let fr = model.fresh;
     let (own, other) = ((1.0 - fr) * (1.0 - fr), 1.0 - (1.0 - fr) * (1.0 - fr));
     let derived = 0.25 * (own * p.g + other * f[p.a as usize] * f[p.b as usize]);
-    if model.uniform > 0.0 && model.contexts > 0 {
-        (1.0 - model.uniform) * derived
+    let (wd, _, _) = model.shares();
+    if wd < 1.0 {
+        wd * derived
     } else {
         derived
     }
@@ -1059,6 +1069,106 @@ mod tests {
         // A thread count does not change the sample.
         let three = QuerySample::build_mixed(&s, &c, 10, mixed, &contexts, 1);
         assert_eq!(two.base_ns, three.base_ns);
+    }
+
+    #[test]
+    fn the_independent_queries_are_single_labels_and_pair_contexts_from_anywhere() {
+        let s = store();
+        let c = UnitCosts::default();
+        let (counts, f) = label_weights(&s, 0.5, 2);
+        let contexts = pair_contexts(&s, &counts, 0.5, 2);
+        let singles = islands::single_label_support(&s);
+        let (n_ctx, n_one) = (contexts.len(), singles.len());
+        assert_eq!(n_one, s.n_labels());
+        let pairs_only = QueryModel {
+            n_queries: 2_000,
+            seed: 5,
+            cap: 512,
+            uniform: 0.5,
+            contexts: n_ctx as u64,
+            ..Default::default()
+        };
+        let model = QueryModel {
+            single_labels: n_one as u64,
+            ..pairs_only
+        };
+        assert_eq!(model.shares(), (0.5, 0.25, 0.25));
+        let v1 = QuerySample::build_mixed(&s, &c, 10, pairs_only, &contexts, 2);
+        let v2 = QuerySample::build_mixed(&s, &c, 10, model, &contexts, 3);
+        assert_eq!(v2.base_ns.len(), 2_000 + n_ctx + n_one);
+        assert_eq!(v2.n_independent(), (n_ctx, n_one));
+        // The base-derived queries and the pair contexts are those of the pairs-only workload;
+        // each single label is `{ℓ}` with `M = |P_ℓ|` (no check), weighted μ/2 / L.
+        assert_eq!(&v2.base_ns[..2_000 + n_ctx], &v1.base_ns[..]);
+        let nf = s.n_points() as f64;
+        for (i, &l) in singles.iter().enumerate() {
+            let q = v2.single_query(l).expect("a single-label query");
+            assert_eq!(q, 2_000 + n_ctx + i);
+            assert_eq!(v2.part(q), islands::Part::Single);
+            let m = s.posting_len(l) as f64;
+            let exact = m * c.dist(m / nf);
+            let base = islands::postfilter_nominal(&c, 10, 10, m / nf, s.n_points(), 1).1;
+            assert!((v2.base_ns[q] - exact.min(base)).abs() <= 1e-9 * exact.min(base));
+            assert!((v2.weight(q) - 0.25 / n_one as f64).abs() < 1e-18);
+        }
+        let q_ctx = v2.context_query(contexts[0].a, contexts[0].b).unwrap();
+        assert_eq!(v2.part(q_ctx), islands::Part::Pair);
+        assert!((v2.weight(q_ctx) - 0.25 / n_ctx as f64).abs() < 1e-18);
+        let total: f64 = (0..v2.base_ns.len()).map(|q| v2.weight(q)).sum();
+        assert!((total - 1.0).abs() < 1e-9);
+        let (md, mp, ms) = v2.part_means(&v2.base_ns);
+        assert!((v2.mean_base_ns() - (0.5 * md + 0.25 * mp + 0.25 * ms)).abs() < 1e-6);
+        // The pairs' base-derived part does not depend on how `U` is split.
+        for p in contexts.iter().take(20) {
+            assert_eq!(
+                context_prob(&model, &f, p),
+                context_prob(&pairs_only, &f, p)
+            );
+        }
+        // Single labels serve islands: some label's island is cheaper on its own query.
+        let gr = IslandGreedy::new(&v2, &s, 32, |_| true);
+        assert!(gr.terms.iter().any(|t| t.alone_ns > 0.0));
+        // Vectors: a base-derived query searches from its own point (which matches it); an
+        // independent one from a point drawn independently of its labels.
+        for i in 0..200 {
+            let d = islands::draw_data(&s, &model, i).expect("a labelled point");
+            assert_eq!(d.point, v2.point(i));
+            let row = s.row(d.point);
+            assert!(d
+                .clauses
+                .iter()
+                .all(|cl| cl.iter().any(|l| row.binary_search(l).is_ok())));
+        }
+        let (mut n_single, mut n_match) = (0, 0);
+        let draws = 4_000;
+        for i in 0..draws {
+            let u = islands::draw_independent(&s, &model, &contexts, &singles, i).unwrap();
+            match u.part {
+                islands::Part::Single => {
+                    n_single += 1;
+                    assert_eq!(u.clauses.len(), 1);
+                    assert!(singles.binary_search(&u.clauses[0][0]).is_ok());
+                }
+                islands::Part::Pair => {
+                    let (a, b) = (u.clauses[0][0], u.clauses[1][0]);
+                    assert!(contexts.iter().any(|p| (p.a, p.b) == (a, b)));
+                }
+                islands::Part::Data => unreachable!(),
+            }
+            let row = s.row(u.point);
+            n_match += u
+                .clauses
+                .iter()
+                .all(|cl| cl.iter().any(|l| row.binary_search(l).is_ok()))
+                as usize;
+        }
+        // Half single labels; the points match their predicates only at the labels' rates.
+        assert!((n_single as f64 / draws as f64 - 0.5).abs() < 0.05);
+        assert!((n_match as f64) < 0.5 * draws as f64);
+        assert_eq!(
+            islands::draw_independent(&s, &model, &contexts, &singles, 7),
+            islands::draw_independent(&s, &model, &contexts, &singles, 7)
+        );
     }
 
     #[test]
