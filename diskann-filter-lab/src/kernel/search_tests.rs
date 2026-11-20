@@ -1052,6 +1052,7 @@ fn the_tree_route_serves_tree_eligible_queries() {
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
     };
     let mut pb = PredicateSetBuilder::new(&labels);
     pb.push(&[vec!["x=1"]]);
@@ -1125,6 +1126,7 @@ fn the_static_bits_tree_route_checks_only_the_other_clauses() {
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
     };
     let mut pb = PredicateSetBuilder::new(&labels);
     pb.push(&[vec!["x=1"], vec!["y=1"]]);
@@ -1252,6 +1254,7 @@ fn tree_index<'a>(
         costs: None,
         sketches: None,
         pairs: None,
+        islands: None,
     }
 }
 

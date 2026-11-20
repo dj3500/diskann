@@ -510,6 +510,7 @@ mod tests {
             costs: None,
             sketches: None,
             pairs: None,
+            islands: None,
         };
         assert_eq!(tree_labels(&ix, &labels), [labels.name_index()["a=1"]]);
         let e = tree_curve(
