@@ -567,6 +567,13 @@ struct SelectArgs {
     /// from the calibration's tree effort curve (`curve`; `flab tree-calibrate`).
     #[arg(long, value_enum, default_value = "frontier")]
     tree_effort: SelectTreeEffort,
+    /// `--track graph`: price both routes from route calibration curves (JSON: per label-size
+    /// class, the router's and the tree route's mean recall and time at each frontier level, on
+    /// queries placed independently of the label (`U`), on members (`D`) and on label pairs
+    /// (`P`); `select_g::RouteCurves`) at the reference recall `--tree-recall`, and add the
+    /// workload's single-label contexts (half of `--uniform`; the other half on pairs).
+    #[arg(long)]
+    route_curves: Option<PathBuf>,
     /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
     #[arg(long, default_value_t = 26.0)]
     tree_fanout: f64,
@@ -2047,6 +2054,29 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     } else {
         None
     };
+    let curves: Option<diskann_filter_lab::select_g::RouteCurves> = match &a.route_curves {
+        Some(path) => {
+            ensure!(
+                graph_track,
+                "--route-curves prices track G's routes (--track graph)"
+            );
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            Some(
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )
+        }
+        None => None,
+    };
+    let pricing = tree_model
+        .as_ref()
+        .map(|tm| diskann_filter_lab::select_g::Pricing {
+            tm: *tm,
+            c: &costs,
+            curves: curves.as_ref(),
+            n,
+        });
     // Every co-occurring pair of labels of different categories: the pair contexts of the
     // workload, and (labels of 64 to n − 1 points) the candidates.
     let t = Instant::now();
@@ -2075,11 +2105,16 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     }
     let mixed: &[select::PairCand] = if a.uniform > 0.0 { &contexts } else { &[] };
     let t = Instant::now();
-    let (sample, tree_sample) = match &tree_model {
-        Some(tm) => (
+    let (sample, tree_sample) = match &pricing {
+        Some(pr) => (
             None,
             Some(diskann_filter_lab::select_g::TreeSample::build_mixed(
-                &store, &costs, tm, model, mixed, a.threads,
+                &store,
+                pr,
+                model,
+                mixed,
+                curves.is_some(),
+                a.threads,
             )),
         ),
         None => (
@@ -2117,8 +2152,9 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         select::Stop::Elasticity => 0.0,
     };
     println!(
-        "{} base-derived queries and {} pair contexts (of {}) in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0} and {mean_pairs:.0}); index {:.2} GiB; stop {}{}",
+        "{} base-derived queries, {} label contexts and {} pair contexts (of {}) in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0} and {mean_pairs:.0}); index {:.2} GiB; stop {}{}",
         a.queries,
+        tree_sample.as_ref().map_or(0, |s| s.n_label_ctx),
         model.n_pair_queries(),
         contexts.len(),
         index_bytes as f64 / (1u64 << 30) as f64,
@@ -2157,10 +2193,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         })
         .copied()
         .collect();
-    let values = match &tree_model {
-        Some(tm) => {
-            diskann_filter_lab::select_g::pair_tree_values(&store, &costs, tm, &model, &f, &cands)
-        }
+    let values = match &pricing {
+        Some(pr) => diskann_filter_lab::select_g::pair_tree_values(pr, &model, &f, &cands),
         None => select::pair_values(&store, &costs, a.k, &model, &f, &cands),
     };
     let pairs_s = count_s + secs(t);
@@ -2215,16 +2249,15 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             index_bytes,
         };
         let t = Instant::now();
-        let sel = match (&sample, &tree_sample, &tree_model) {
+        let sel = match (&sample, &tree_sample, &pricing) {
             (Some(sample), _, _) => select::select(&store, sample, &values, &params),
-            (_, Some(ts), Some(tm)) => select::select_with(
+            (_, Some(ts), Some(pr)) => select::select_with(
                 &store,
                 || {
                     diskann_filter_lab::select_g::TreeGreedy::with_classes(
                         ts,
                         &store,
-                        tm,
-                        &costs,
+                        pr,
                         &f,
                         a.tree_min_records,
                     )
@@ -2285,6 +2318,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "pair_values": values.len(),
         "track": if graph_track { "graph" } else { "hybrid" },
         "tree_model": tree_model,
+        "route_curves": a.route_curves,
+        "label_contexts": tree_sample.as_ref().map_or(0, |s| s.n_label_ctx),
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
