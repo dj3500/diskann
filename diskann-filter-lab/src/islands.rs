@@ -231,8 +231,9 @@ pub struct QueryModel {
     pub fresh: f64,
     /// Share `μ` of the workload's second component, *pair contexts*: a pair of labels of
     /// different categories drawn uniformly among the `contexts` pairs that co-occur, as the
-    /// query `{a} ∧ {b}` (0: base-derived queries only). A sample of `n_queries` base-derived
-    /// queries then holds `n_queries · μ / (1 − μ)` pair contexts besides.
+    /// query `{a} ∧ {b}` (0: base-derived queries only). A [`QuerySample`] holds every pair
+    /// context once, with weight `μ / contexts`, besides its `n_queries` base-derived queries
+    /// (weight `(1 − μ) / n_queries` each).
     pub uniform: f64,
     /// Number of co-occurring label pairs of different categories (the pair contexts' support;
     /// set from the counting pass when `uniform > 0`).
@@ -254,24 +255,18 @@ impl Default for QueryModel {
 }
 
 impl QueryModel {
-    /// Pair contexts in a sample of `n_queries` base-derived queries (see [`Self::uniform`]).
+    /// Pair contexts of a sample: every co-occurring pair, when `uniform > 0`.
     pub fn n_pair_queries(&self) -> usize {
         if self.uniform > 0.0 && self.contexts > 0 {
             assert!(
                 self.uniform < 1.0,
                 "the pair contexts' share must be below 1"
             );
-            (self.n_queries as f64 * self.uniform / (1.0 - self.uniform)).round() as usize
+            self.contexts as usize
         } else {
             0
         }
     }
-}
-
-/// The pair context of sample query `qi` (a pair-context query of the sample, see
-/// [`QueryModel::uniform`]): an index into the `contexts` co-occurring pairs, drawn uniformly.
-pub fn pair_context_draw(model: &QueryModel, qi: usize) -> usize {
-    (mix(model.seed ^ 0x5041_4952 ^ mix(qi as u64)) % model.contexts.max(1)) as usize
 }
 
 #[inline]
@@ -305,10 +300,15 @@ fn meets(row: &[u32], clause: &[u32]) -> bool {
 #[derive(Debug, Clone)]
 pub struct QuerySample {
     pub model: QueryModel,
-    /// Cost of each query's best route without islands.
+    /// Cost of each query's best route without islands: the `n_data` base-derived queries,
+    /// then the pair contexts (if any) in the order of their list.
     pub base_ns: Vec<f64>,
     /// `(label, query, island cost)` of the cheaper islands, by label.
     recs: Vec<(u32, u32, f32)>,
+    /// Base-derived queries (the first `n_data` of `base_ns`).
+    pub n_data: usize,
+    /// The pair contexts' labels `(a, b)`, in the order of their queries (sorted).
+    ctx_keys: Vec<(u32, u32)>,
 }
 
 /// One label of the `queries` selection.
@@ -488,9 +488,9 @@ impl QuerySample {
     }
 
     /// [`Self::build`] with the workload's pair contexts ([`QueryModel::uniform`]): after the
-    /// `n_queries` base-derived queries, [`QueryModel::n_pair_queries`] queries `{a} ∧ {b}` of
-    /// pairs drawn uniformly from `contexts` (every co-occurring pair of labels of different
-    /// categories, with its joint size: the match count `M`), all with the same weight.
+    /// `n_queries` base-derived queries (weight `(1 − μ) / n_queries` each), one query
+    /// `{a} ∧ {b}` per pair of `contexts` (every co-occurring pair of labels of different
+    /// categories, sorted, with its joint size: the match count `M`; weight `μ / N` each).
     pub fn build_mixed(
         labels: &LabelStore,
         c: &UnitCosts,
@@ -528,7 +528,7 @@ impl QuerySample {
                     let (_, s_min, m) = query_matches(labels, &model, kl, clauses);
                     (s_min, m)
                 } else {
-                    let p = &contexts[pair_context_draw(&model, qi)];
+                    let p = &contexts[qi - model.n_queries];
                     kl.clear();
                     kl.extend([p.a, p.b]);
                     clauses.clear();
@@ -570,11 +570,71 @@ impl QuerySample {
             recs.extend(r);
         }
         recs.sort_unstable_by_key(|&(l, q, _)| (l, q));
+        let ctx_keys: Vec<(u32, u32)> = if model.n_pair_queries() > 0 {
+            contexts.iter().map(|p| (p.a, p.b)).collect()
+        } else {
+            Vec::new()
+        };
+        debug_assert!(ctx_keys.windows(2).all(|w| w[0] < w[1]), "sorted contexts");
         Self {
             model,
             base_ns,
             recs,
+            n_data: model.n_queries,
+            ctx_keys,
         }
+    }
+
+    /// Share `μ` of the pair contexts (0 without them).
+    fn mu(&self) -> f64 {
+        if self.ctx_keys.is_empty() {
+            0.0
+        } else {
+            self.model.uniform
+        }
+    }
+
+    /// The workload's mean of per-query values `x` (`(1 − μ)` times the base-derived queries'
+    /// mean plus `μ` times the pair contexts' mean).
+    pub fn weighted_mean(&self, x: &[f64]) -> f64 {
+        let (d, c) = x.split_at(self.n_data.min(x.len()));
+        let md = d.iter().sum::<f64>() / self.n_data.max(1) as f64;
+        let mu = self.mu();
+        if mu == 0.0 {
+            md
+        } else {
+            (1.0 - mu) * md + mu * c.iter().sum::<f64>() / c.len().max(1) as f64
+        }
+    }
+
+    /// Workload weight of query `q`.
+    pub fn weight(&self, q: usize) -> f64 {
+        let mu = self.mu();
+        if q < self.n_data {
+            (1.0 - mu) / self.n_data.max(1) as f64
+        } else {
+            mu / self.ctx_keys.len().max(1) as f64
+        }
+    }
+
+    /// Each query's cheapest cost with every candidate island built (a lower bound on its cost
+    /// with islands; tests).
+    #[cfg(test)]
+    pub(crate) fn island_floor_ns(&self) -> Vec<f64> {
+        let mut x = self.base_ns.clone();
+        for &(_, q, isl) in &self.recs {
+            let c = &mut x[q as usize];
+            *c = c.min(f64::from(isl));
+        }
+        x
+    }
+
+    /// The query of the pair context `{a} ∧ {b}` (`a < b`), if the sample holds pair contexts.
+    pub fn context_query(&self, a: u32, b: u32) -> Option<usize> {
+        self.ctx_keys
+            .binary_search(&(a, b))
+            .ok()
+            .map(|i| self.n_data + i)
     }
 
     /// Greedy selection within `budget_bytes` (islands of degree bound `r`): repeatedly the
@@ -606,9 +666,9 @@ impl QuerySample {
         (out, gr.terms)
     }
 
-    /// Expected cost per query (ns) without islands.
+    /// Expected cost per query (ns) without islands (the workload's weighted mean).
     pub fn mean_base_ns(&self) -> f64 {
-        self.base_ns.iter().sum::<f64>() / self.base_ns.len().max(1) as f64
+        self.weighted_mean(&self.base_ns)
     }
 }
 
@@ -637,7 +697,6 @@ impl Ord for OrdF64 {
 /// ([`crate::select`]).
 pub struct IslandGreedy<'s> {
     sample: &'s QuerySample,
-    nq: f64,
     cur: Vec<f64>,
     /// Candidate label and its range of the sample's records.
     cands: Vec<(u32, usize, usize)>,
@@ -671,7 +730,6 @@ impl<'s> IslandGreedy<'s> {
         }
         let mut g = Self {
             sample,
-            nq: sample.base_ns.len().max(1) as f64,
             cur: sample.base_ns.clone(),
             cands,
             terms: Vec::new(),
@@ -709,14 +767,26 @@ impl<'s> IslandGreedy<'s> {
         g
     }
 
-    /// Expected saving per query (ns) of candidate `x` given the islands taken.
+    /// Expected saving per query (ns) of candidate `x` given the items taken (the workload's
+    /// weighted mean of its per-query savings).
     fn gain(&self, x: usize) -> f64 {
         let (_, a, b) = self.cands[x];
-        self.sample.recs[a..b]
-            .iter()
-            .map(|&(_, q, isl)| (self.cur[q as usize] - f64::from(isl)).max(0.0))
-            .sum::<f64>()
-            / self.nq
+        let nd = self.sample.n_data as u32;
+        let recs = &self.sample.recs[a..b];
+        // Records by query: the base-derived queries first.
+        let split = recs.partition_point(|&(_, q, _)| q < nd);
+        let saving = |r: &[(u32, u32, f32)]| {
+            r.iter()
+                .map(|&(_, q, isl)| (self.cur[q as usize] - f64::from(isl)).max(0.0))
+                .sum::<f64>()
+        };
+        let sd = saving(&recs[..split]) / self.sample.n_data.max(1) as f64;
+        let mu = self.sample.mu();
+        if mu == 0.0 {
+            sd
+        } else {
+            (1.0 - mu) * sd + mu * saving(&recs[split..]) / self.sample.ctx_keys.len().max(1) as f64
+        }
     }
 
     /// The best remaining candidate (its current saving per query per byte and its index),
@@ -764,9 +834,30 @@ impl<'s> IslandGreedy<'s> {
         debug_assert_eq!(top, Some(x), "skip the peeked candidate");
     }
 
-    /// Expected cost per query (ns) with the islands taken.
+    /// Expected cost per query (ns) with the items taken.
     pub fn mean_cost_ns(&self) -> f64 {
-        self.cur.iter().sum::<f64>() / self.nq
+        self.sample.weighted_mean(&self.cur)
+    }
+
+    /// The sample's query of the pair context `{a} ∧ {b}`.
+    pub fn context_query(&self, a: u32, b: u32) -> Option<usize> {
+        self.sample.context_query(a, b)
+    }
+
+    /// Current cost of sample query `q` (its cheapest route with the items taken).
+    pub fn query_cost(&self, q: usize) -> f64 {
+        self.cur[q]
+    }
+
+    /// Workload weight of sample query `q`.
+    pub fn query_weight(&self, q: usize) -> f64 {
+        self.sample.weight(q)
+    }
+
+    /// Another kind's item serves sample query `q` at `cost`.
+    pub fn serve(&mut self, q: usize, cost: f64) {
+        let c = &mut self.cur[q];
+        *c = c.min(cost);
     }
 }
 

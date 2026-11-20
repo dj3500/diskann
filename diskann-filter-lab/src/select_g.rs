@@ -12,8 +12,8 @@
 //! a label with a tree takes the tree route, whatever it costs (`tree_choice = always`); a query
 //! whose single-label clauses `{a}`, `{b}` have a pair tree takes the pair route.
 //!
-//! **Workload**: the selector's mixture ([`QueryModel`]): base-derived queries and, with share
-//! `μ`, pair contexts `{a} ∧ {b}` drawn uniformly among the co-occurring pairs (binding clause:
+//! **Workload**: the selector's mixture ([`QueryModel`]): a sample of base-derived queries and,
+//! with share `μ`, every pair context `{a} ∧ {b}` of co-occurring labels once (binding clause:
 //! the smaller label; `M` = the joint size).
 //!
 //! **Costs** (ns, the kernel's unit costs):
@@ -35,8 +35,9 @@
 //!   the calibrated **tree effort curve** instead (`flab tree-calibrate`: the router frontier for
 //!   recall `R` at `k'` members of a label, per label-size class) at the rank of the `K`-th
 //!   match among the members, `k' = K·s/M` with its spread;
-//! - pair tree on a pair of joint `j`: the tree route over its `j` members, all matching,
-//!   against the better of the router and the tree route of the pair's smaller label.
+//! - pair tree on a pair of joint `j`: the tree route over its `j` members, all matching (its
+//!   saving: against the router, as the selector's pair kinds; on its pair context against the
+//!   context's current cost, shared with the label trees through [`LabelKind`]).
 //!
 //! **Bytes**: a tree over `s` members has `⌈(s − 1)/(b̄ − 1)⌉` routers (at least one), each a
 //! graph row, a vector and a kind byte (`router_bytes`); a pair tree adds its pair's list and
@@ -47,12 +48,13 @@
 //! several labels needs a tree for each of them, which this kind does not value), so label trees
 //! do not interact: a tree's expected saving per query is its queries' signed savings (router −
 //! tree route) — the base-derived ones from the sample (or in closed form by size class where the
-//! sample is thin), the pair contexts' exactly over every context — fixed. Pair trees are valued
-//! in closed form as combination postings ([`crate::select::pair_values`]); the kinds'
-//! interactions are not modelled.
+//! sample is thin), its pair contexts' exactly. Pair trees are valued as the selector's pair kinds
+//! ([`crate::select::pair_values`]): on base-derived queries in closed form, on their pair context
+//! against its current cost; a pair tree taken serves its context (the kernel takes the pair
+//! route first), which then no longer counts for the label tree.
 
 use crate::{
-    islands::{draw_query, pair_context_draw, postfilter_nominal, query_matches, QueryModel},
+    islands::{draw_query, postfilter_nominal, query_matches, QueryModel},
     kernel::cost::{kth_match_rank, UnitCosts, Z},
     labels::LabelStore,
     select::{context_prob, pair_bytes, LabelKind, PairCand, PairValue},
@@ -142,21 +144,23 @@ impl TreeModel {
     }
 }
 
-/// The label-tree terms of the workload: a sample of its base-derived queries — per query its
-/// router cost and, when its binding clause is a single label, that label's tree route cost —
-/// and of its pair contexts (their router costs in the sample, for the workload's mean cost; their
-/// tree savings exactly, per label, over every context).
+/// The label-tree terms of the workload, as the selector's [`crate::islands::QuerySample`]: its
+/// `n_data` base-derived queries (a sample, weight `(1 − μ)/n_data` each) and every pair context
+/// once (weight `μ/N` each) — per query its router cost and, when its binding clause is a single
+/// label (for a pair context, the smaller label), that label's tree route cost.
 #[derive(Debug, Clone)]
 pub struct TreeSample {
     pub model: QueryModel,
-    /// Router cost of each query (base-derived, then pair contexts).
+    /// Router cost of each query: the base-derived queries, then the pair contexts in the order
+    /// of their (sorted) list.
     pub base_ns: Vec<f64>,
-    /// `(label, query, tree route cost)` of the base-derived queries whose binding clause is
-    /// that label.
+    /// `(label, query, tree route cost)` of the queries whose binding clause is that label, by
+    /// label and query.
     recs: Vec<(u32, u32, f32)>,
-    /// Per label: the expected saving per workload query (ns, signed) of its tree on the pair
-    /// contexts whose binding clause it is (0 without pair contexts).
-    pair_part: Vec<f64>,
+    /// Base-derived queries (the first `n_data` of `base_ns`).
+    pub n_data: usize,
+    /// The pair contexts' labels `(a, b)`, in the order of their queries.
+    ctx_keys: Vec<(u32, u32)>,
 }
 
 impl TreeSample {
@@ -177,8 +181,8 @@ impl TreeSample {
         Self::build_mixed(labels, c, tm, model, &[], threads)
     }
 
-    /// [`Self::build`] with the workload's pair contexts ([`QueryModel::uniform`]; as
-    /// [`crate::islands::QuerySample::build_mixed`]).
+    /// [`Self::build`] with the workload's pair contexts ([`QueryModel::uniform`]): one query
+    /// `{a} ∧ {b}` per pair of `contexts` (sorted; `M` = the joint size).
     pub fn build_mixed(
         labels: &LabelStore,
         c: &UnitCosts,
@@ -210,8 +214,19 @@ impl TreeSample {
                 let mut recs = Vec::new();
                 for qi in ci * chunk..((ci + 1) * chunk).min(n_total) {
                     if qi >= model.n_queries {
-                        let p = &contexts[pair_context_draw(&model, qi)];
-                        base.push(tm.router_ns(c, f64::from(p.joint).max(1.0), n));
+                        let p = &contexts[qi - model.n_queries];
+                        let m = f64::from(p.joint).max(1.0);
+                        base.push(tm.router_ns(c, m, n));
+                        let (sa, sb) = (labels.posting_len(p.a), labels.posting_len(p.b));
+                        let (l, s) = if (sa, p.a) <= (sb, p.b) {
+                            (p.a, sa)
+                        } else {
+                            (p.b, sb)
+                        };
+                        if s > 0 && s < n {
+                            let t = tm.tree_ns(c, s as f64, m, true);
+                            recs.push((l, qi as u32, t as f32));
+                        }
                         continue;
                     }
                     if !draw_query(labels, &model, qi, kl, clauses, cats) {
@@ -240,35 +255,55 @@ impl TreeSample {
             recs.extend(r);
         }
         recs.sort_unstable_by_key(|&(l, q, _)| (l, q));
-        let mut pair_part = vec![0.0; labels.n_labels()];
-        if model.n_pair_queries() > 0 {
-            let w = model.uniform / contexts.len() as f64;
-            for p in contexts {
-                let (sa, sb) = (labels.posting_len(p.a), labels.posting_len(p.b));
-                let (l, s) = if (sa, p.a) <= (sb, p.b) {
-                    (p.a, sa)
-                } else {
-                    (p.b, sb)
-                };
-                if s == 0 || s >= n {
-                    continue;
-                }
-                let m = f64::from(p.joint).max(1.0);
-                pair_part[l as usize] +=
-                    w * (tm.router_ns(c, m, n) - tm.tree_ns(c, s as f64, m, true));
-            }
-        }
+        let ctx_keys: Vec<(u32, u32)> = if model.n_pair_queries() > 0 {
+            contexts.iter().map(|p| (p.a, p.b)).collect()
+        } else {
+            Vec::new()
+        };
+        debug_assert!(ctx_keys.windows(2).all(|w| w[0] < w[1]), "sorted contexts");
         Self {
             model,
             base_ns,
             recs,
-            pair_part,
+            n_data: model.n_queries,
+            ctx_keys,
         }
+    }
+
+    /// Share `μ` of the pair contexts (0 without them).
+    fn mu(&self) -> f64 {
+        if self.ctx_keys.is_empty() {
+            0.0
+        } else {
+            self.model.uniform
+        }
+    }
+
+    /// Workload weight of query `q`.
+    pub fn weight(&self, q: usize) -> f64 {
+        if q < self.n_data {
+            (1.0 - self.mu()) / self.n_data.max(1) as f64
+        } else {
+            self.mu() / self.ctx_keys.len().max(1) as f64
+        }
+    }
+
+    /// The workload's mean of per-query values `x` (base-derived and pair-context parts weighted).
+    pub fn weighted_mean(&self, x: &[f64]) -> f64 {
+        x.iter().enumerate().map(|(q, v)| self.weight(q) * v).sum()
     }
 
     /// Expected cost per query (ns) without auxiliary structures (the router alone).
     pub fn mean_base_ns(&self) -> f64 {
-        self.base_ns.iter().sum::<f64>() / self.base_ns.len().max(1) as f64
+        self.weighted_mean(&self.base_ns)
+    }
+
+    /// The query of the pair context `{a} ∧ {b}` (`a < b`), if the sample holds pair contexts.
+    pub fn context_query(&self, a: u32, b: u32) -> Option<usize> {
+        self.ctx_keys
+            .binary_search(&(a, b))
+            .ok()
+            .map(|i| self.n_data + i)
     }
 }
 
@@ -277,30 +312,65 @@ impl TreeSample {
 pub struct TreeTerm {
     pub label: u32,
     pub size: usize,
-    /// Sampled queries whose binding clause is this label.
+    /// Sampled base-derived queries whose binding clause is this label.
     pub queries: u32,
-    /// Expected saving per query (ns) of this tree (signed: queries the router serves better
-    /// count against it).
+    /// Pair contexts whose binding clause is this label.
+    pub contexts: u32,
+    /// Expected saving per query (ns) on the base-derived queries (signed: queries the router
+    /// serves better count against it).
+    pub derived_ns: f64,
+    /// Expected saving per query (ns) of this tree (signed), on its pair contexts not served by a
+    /// pair tree: at the start, and when taken.
     pub saving_ns: f64,
     pub bytes: u64,
     /// Position in the greedy order (`None`: not taken).
     pub order: Option<u32>,
 }
 
-/// The tree kind as the selector's greedy sees it: candidates by expected saving per query per
-/// byte; the savings do not change as trees are taken (see the module documentation).
-#[derive(Debug, Clone)]
-pub struct TreeGreedy {
-    pub terms: Vec<TreeTerm>,
-    /// Candidates with a positive saving, by decreasing saving per byte.
-    order: Vec<usize>,
-    next: usize,
-    taken: u32,
+/// `f64` with a total order (the greedy's heap).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Key(f64);
+
+impl Eq for Key {}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
 }
 
-impl TreeGreedy {
+impl Ord for Key {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&o.0)
+    }
+}
+
+/// The tree kind as the selector's greedy sees it: candidates by expected saving per query per
+/// byte. A tree's saving on the base-derived queries is fixed; on a pair context it counts only
+/// while no pair tree serves the context (the kernel takes the pair route first), so a pair tree
+/// taken lowers the savings of the tree of its smaller label (lazy re-evaluation; a signed saving
+/// can also rise, which the lazy order sees only when the candidate comes up again).
+#[derive(Debug, Clone)]
+pub struct TreeGreedy<'s> {
+    sample: &'s TreeSample,
+    pub terms: Vec<TreeTerm>,
+    /// Per candidate, its pair-context records' range in `ctx_recs`.
+    ctx: Vec<(usize, usize)>,
+    /// `(query, tree route cost)` of the candidates' pair contexts.
+    ctx_recs: Vec<(u32, f32)>,
+    /// Per pair context: the candidate of its binding label (`u32::MAX`: none) and that tree's
+    /// cost on it.
+    ctx_cand: Vec<(u32, f32)>,
+    /// Per pair context: the cost of the pair tree that serves it (`∞`: none).
+    served: Vec<f64>,
+    taken: Vec<bool>,
+    heap: std::collections::BinaryHeap<(Key, std::cmp::Reverse<usize>)>,
+    n_taken: u32,
+}
+
+impl<'s> TreeGreedy<'s> {
     /// Candidates: every label with sampled queries or pair contexts, valued on its own.
-    pub fn new(sample: &TreeSample, labels: &LabelStore, tm: &TreeModel) -> Self {
+    pub fn new(sample: &'s TreeSample, labels: &LabelStore, tm: &TreeModel) -> Self {
         Self::build(sample, labels, tm, None)
     }
 
@@ -312,10 +382,11 @@ impl TreeGreedy {
     /// saving `σ`. A label with at least `min_records` sampled queries keeps its own estimate;
     /// another is worth `(f_ℓ/2)·β·σ` of its class (a class without enough records: `β = 1` and
     /// the saving of the clause alone, `M = |P_ℓ|`), times the base-derived queries' share of the
-    /// workload; plus its pair contexts' part (exact). Rare labels, which a sample of
-    /// base-derived queries almost never draws, are the selective labels a tree serves best.
+    /// workload. Its pair contexts (exact: every context is in the sample) come on top. Rare
+    /// labels, which a sample of base-derived queries almost never draws, are the selective
+    /// labels a tree serves best.
     pub fn with_classes(
-        sample: &TreeSample,
+        sample: &'s TreeSample,
         labels: &LabelStore,
         tm: &TreeModel,
         c: &UnitCosts,
@@ -326,149 +397,163 @@ impl TreeGreedy {
     }
 
     fn build(
-        sample: &TreeSample,
+        sample: &'s TreeSample,
         labels: &LabelStore,
         tm: &TreeModel,
         closed: Option<(&UnitCosts, &[f64], u32)>,
     ) -> Self {
-        let nq = sample.base_ns.len().max(1) as f64;
+        let nd = sample.n_data;
+        let wd = sample.weight(0) * nd as f64; // the base-derived share, 1 − μ
         let recs = &sample.recs;
-        // Per label: sampled queries and their summed signed saving.
-        let mut per: Vec<(u32, u32, f64)> = Vec::new();
-        let mut i = 0;
-        while i < recs.len() {
-            let l = recs[i].0;
-            let mut j = i;
-            let mut saving = 0.0;
-            while j < recs.len() && recs[j].0 == l {
-                let (_, q, t) = recs[j];
-                saving += sample.base_ns[q as usize] - f64::from(t);
-                j += 1;
-            }
-            per.push((l, (j - i) as u32, saving));
-            i = j;
-        }
+        let nl = labels.n_labels();
         let n = labels.n_points();
-        let mut terms = Vec::new();
-        // The base-derived queries' share of the workload (the sample holds the pair contexts'
-        // share besides).
-        let wd = sample.model.n_queries as f64 / nq;
-        let pair = &sample.pair_part;
-        match closed {
-            None => {
-                let own: std::collections::HashMap<u32, (u32, f64)> =
-                    per.iter().map(|&(l, q, sv)| (l, (q, sv))).collect();
-                for l in 0..labels.n_labels() as u32 {
-                    let (q, sv) = own.get(&l).copied().unwrap_or((0, 0.0));
-                    if q == 0 && pair[l as usize] == 0.0 {
-                        continue;
-                    }
-                    let s = labels.posting_len(l);
-                    terms.push(TreeTerm {
-                        label: l,
-                        size: s,
-                        queries: q,
-                        saving_ns: sv / nq + pair[l as usize],
-                        bytes: tm.tree_bytes(s),
-                        order: None,
-                    });
-                }
+        // Per label: base-derived records and their summed signed saving; context records.
+        let mut own: Vec<(u32, f64)> = vec![(0, 0.0); nl];
+        let mut ctx_of: Vec<Vec<(u32, f32)>> = vec![Vec::new(); nl];
+        for &(l, q, t) in recs {
+            if (q as usize) < nd {
+                let o = &mut own[l as usize];
+                o.0 += 1;
+                o.1 += sample.base_ns[q as usize] - f64::from(t);
+            } else {
+                ctx_of[l as usize].push((q, t));
             }
+        }
+        let derived: Vec<Option<f64>> = match closed {
+            None => (0..nl)
+                .map(|l| {
+                    let (q, sv) = own[l];
+                    (q > 0 || !ctx_of[l].is_empty()).then(|| wd * sv / nd.max(1) as f64)
+                })
+                .collect(),
             Some((c, f, min_records)) => {
                 let class = |s: usize| 63 - (s.max(1) as u64).leading_zeros() as usize;
                 // Per size class: records, their summed saving, and the clause probability mass.
                 let mut recs_c = [0u64; 64];
                 let mut save_c = [0f64; 64];
                 let mut mass_c = [0f64; 64];
-                let nl = labels.n_labels();
-                for l in 0..nl as u32 {
-                    let s = labels.posting_len(l);
+                for l in 0..nl {
+                    let s = labels.posting_len(l as u32);
                     if s > 0 && s < n {
-                        mass_c[class(s)] += f[l as usize] / 2.0;
+                        let k = class(s);
+                        mass_c[k] += f[l] / 2.0;
+                        recs_c[k] += u64::from(own[l].0);
+                        save_c[k] += own[l].1;
                     }
                 }
-                for &(l, q, saving) in &per {
-                    let k = class(labels.posting_len(l));
-                    recs_c[k] += u64::from(q);
-                    save_c[k] += saving;
-                }
-                let own: std::collections::HashMap<u32, (u32, f64)> =
-                    per.iter().map(|&(l, q, sv)| (l, (q, sv))).collect();
-                for l in 0..nl as u32 {
-                    let s = labels.posting_len(l);
-                    if s == 0 || s >= n {
-                        continue;
-                    }
-                    let (q, sv) = own.get(&l).copied().unwrap_or((0, 0.0));
-                    let k = class(s);
-                    let derived = if q >= min_records {
-                        sv / nq
-                    } else if recs_c[k] >= u64::from(min_records) && mass_c[k] > 0.0 {
-                        let nd = sample.model.n_queries as f64;
-                        let beta = recs_c[k] as f64 / (nd * mass_c[k]);
-                        let sigma = save_c[k] / recs_c[k] as f64;
-                        wd * f[l as usize] / 2.0 * beta * sigma
-                    } else {
-                        let sf = s as f64;
-                        let alone = tm.router_ns(c, sf, n) - tm.tree_ns(c, sf, sf, false);
-                        wd * f[l as usize] / 2.0 * alone
-                    };
-                    let saving_ns = derived + pair[l as usize];
-                    terms.push(TreeTerm {
-                        label: l,
-                        size: s,
-                        queries: q,
-                        saving_ns,
-                        bytes: tm.tree_bytes(s),
-                        order: None,
-                    });
-                }
+                (0..nl)
+                    .map(|l| {
+                        let s = labels.posting_len(l as u32);
+                        if s == 0 || s >= n {
+                            return None;
+                        }
+                        let (q, sv) = own[l];
+                        let k = class(s);
+                        let per_query = if q >= min_records {
+                            sv / nd.max(1) as f64
+                        } else if recs_c[k] >= u64::from(min_records) && mass_c[k] > 0.0 {
+                            let beta = recs_c[k] as f64 / (nd.max(1) as f64 * mass_c[k]);
+                            let sigma = save_c[k] / recs_c[k] as f64;
+                            f[l] / 2.0 * beta * sigma
+                        } else {
+                            let sf = s as f64;
+                            f[l] / 2.0 * (tm.router_ns(c, sf, n) - tm.tree_ns(c, sf, sf, false))
+                        };
+                        Some(wd * per_query)
+                    })
+                    .collect()
+            }
+        };
+        let n_ctx = sample.base_ns.len() - nd;
+        let mut g = Self {
+            sample,
+            terms: Vec::new(),
+            ctx: Vec::new(),
+            ctx_recs: Vec::new(),
+            ctx_cand: vec![(u32::MAX, 0.0); n_ctx],
+            served: vec![f64::INFINITY; n_ctx],
+            taken: Vec::new(),
+            heap: std::collections::BinaryHeap::new(),
+            n_taken: 0,
+        };
+        for (l, d) in derived.iter().enumerate() {
+            let Some(d) = *d else { continue };
+            let x = g.terms.len();
+            let a = g.ctx_recs.len();
+            for &(q, t) in &ctx_of[l] {
+                g.ctx_cand[q as usize - nd] = (x as u32, t);
+                g.ctx_recs.push((q, t));
+            }
+            g.ctx.push((a, g.ctx_recs.len()));
+            let s = labels.posting_len(l as u32);
+            g.terms.push(TreeTerm {
+                label: l as u32,
+                size: s,
+                queries: own[l].0,
+                contexts: ctx_of[l].len() as u32,
+                derived_ns: d,
+                saving_ns: 0.0,
+                bytes: tm.tree_bytes(s),
+                order: None,
+            });
+            g.taken.push(false);
+        }
+        for x in 0..g.terms.len() {
+            let gain = g.gain(x);
+            g.terms[x].saving_ns = gain;
+            if gain > 0.0 {
+                let key = gain / g.terms[x].bytes as f64;
+                g.heap.push((Key(key), std::cmp::Reverse(x)));
             }
         }
-        let key = |t: &TreeTerm| t.saving_ns / t.bytes as f64;
-        let mut order: Vec<usize> = (0..terms.len())
-            .filter(|&x| terms[x].saving_ns > 0.0)
-            .collect();
-        order.sort_by(|&x, &y| {
-            key(&terms[y])
-                .total_cmp(&key(&terms[x]))
-                .then(terms[x].label.cmp(&terms[y].label))
-        });
-        Self {
-            terms,
-            order,
-            next: 0,
-            taken: 0,
-        }
+        g
+    }
+
+    /// Expected saving per query (ns) of candidate `x` given the items taken.
+    fn gain(&self, x: usize) -> f64 {
+        let (a, b) = self.ctx[x];
+        let nd = self.sample.n_data;
+        let w = self.sample.weight(nd);
+        let ctx: f64 = self.ctx_recs[a..b]
+            .iter()
+            .filter(|&&(q, _)| self.served[q as usize - nd].is_infinite())
+            .map(|&(q, t)| self.sample.base_ns[q as usize] - f64::from(t))
+            .sum();
+        self.terms[x].derived_ns + w * ctx
     }
 }
 
-impl LabelKind for TreeGreedy {
+impl LabelKind for TreeGreedy<'_> {
     fn peek(&mut self) -> Option<(f64, usize)> {
-        let &x = self.order.get(self.next)?;
-        let t = &self.terms[x];
-        Some((t.saving_ns / t.bytes as f64, x))
+        loop {
+            let &(Key(key), std::cmp::Reverse(x)) = self.heap.peek()?;
+            let g = self.gain(x);
+            let now = g / self.terms[x].bytes as f64;
+            if (now - key).abs() > 1e-12 * key.abs() {
+                self.heap.pop();
+                if g > 0.0 {
+                    self.heap.push((Key(now), std::cmp::Reverse(x)));
+                }
+                continue;
+            }
+            return Some((now, x));
+        }
     }
 
     fn take(&mut self, x: usize) -> f64 {
-        debug_assert_eq!(
-            self.order.get(self.next),
-            Some(&x),
-            "take the peeked candidate"
-        );
-        self.next += 1;
-        self.terms[x].order = Some(self.taken);
-        self.taken += 1;
-        self.terms[x].saving_ns
+        let top = self.heap.pop().map(|(_, std::cmp::Reverse(y))| y);
+        debug_assert_eq!(top, Some(x), "take the peeked candidate");
+        let g = self.gain(x);
+        self.taken[x] = true;
+        self.terms[x].order = Some(self.n_taken);
+        self.terms[x].saving_ns = g;
+        self.n_taken += 1;
+        g
     }
 
     fn skip(&mut self, x: usize) {
-        debug_assert_eq!(
-            self.order.get(self.next),
-            Some(&x),
-            "skip the peeked candidate"
-        );
-        self.next += 1;
+        let top = self.heap.pop().map(|(_, std::cmp::Reverse(y))| y);
+        debug_assert_eq!(top, Some(x), "skip the peeked candidate");
     }
 
     fn bytes(&self, x: usize) -> u64 {
@@ -477,6 +562,37 @@ impl LabelKind for TreeGreedy {
 
     fn label(&self, x: usize) -> u32 {
         self.terms[x].label
+    }
+
+    fn context_query(&self, a: u32, b: u32) -> Option<usize> {
+        self.sample.context_query(a, b)
+    }
+
+    fn query_cost(&self, q: usize) -> f64 {
+        let nd = self.sample.n_data;
+        if q < nd {
+            return self.sample.base_ns[q];
+        }
+        let i = q - nd;
+        if self.served[i].is_finite() {
+            return self.served[i];
+        }
+        match self.ctx_cand[i] {
+            (x, t) if x != u32::MAX && self.taken[x as usize] => f64::from(t),
+            _ => self.sample.base_ns[q],
+        }
+    }
+
+    fn query_weight(&self, q: usize) -> f64 {
+        self.sample.weight(q)
+    }
+
+    fn serve(&mut self, q: usize, cost: f64) {
+        let nd = self.sample.n_data;
+        if q >= nd {
+            // The kernel takes a stored pair's route first, whatever the context's tree costs.
+            self.served[q - nd] = cost;
+        }
     }
 }
 
@@ -494,10 +610,8 @@ pub fn pair_tree_values(
     let mut out: Vec<PairValue> = cands
         .iter()
         .filter_map(|&p| {
-            let s = labels.posting_len(p.a).min(labels.posting_len(p.b)) as f64;
             let j = f64::from(p.joint);
-            let alt = tm.router_ns(c, j, n).min(tm.tree_ns(c, s, j, true));
-            let saving_ns = alt - tm.tree_ns(c, j, j, false);
+            let saving_ns = tm.router_ns(c, j, n) - tm.tree_ns(c, j, j, false);
             if !saving_ns.is_finite() || saving_ns <= 0.0 {
                 return None;
             }
@@ -693,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn pair_contexts_value_the_tree_of_their_smaller_label_exactly() {
+    fn pair_contexts_value_the_tree_of_their_smaller_label_until_a_pair_tree_serves_them() {
         let s = store();
         let c = costs();
         let tm = TreeModel {
@@ -714,30 +828,50 @@ mod tests {
             ..QueryModel::default()
         };
         let mixed = TreeSample::build_mixed(&s, &c, &tm, model, &contexts, 2);
-        assert_eq!(mixed.base_ns.len(), 4_000 + model.n_pair_queries());
+        assert_eq!(mixed.base_ns.len(), 4_000 + contexts.len());
         let plain = TreeSample::build(&s, &c, &tm, model, 2);
         assert_eq!(plain.base_ns.len(), 4_000);
         assert_eq!(plain.base_ns[..], mixed.base_ns[..4_000]);
+        // Weights: (1 − μ) over the base-derived queries, μ over the contexts.
+        let total: f64 = (0..mixed.base_ns.len()).map(|q| mixed.weight(q)).sum();
+        assert!((total - 1.0).abs() < 1e-9);
         let id = |name: &str| s.name_index()[name];
         // tr (1 %) is the binding clause of its contexts with the u labels (0.1 % joint each):
-        // their exact share, (μ / N) per context times its signed saving.
+        // (μ / N) per context times its signed saving, on top of half its base-derived saving.
         let w = model.uniform / contexts.len() as f64;
-        let want: f64 = contexts
+        let mine: Vec<&PairCand> = contexts
             .iter()
             .filter(|p| [p.a, p.b].contains(&id("tr")))
             .filter(|p| s.posting_len(p.a).min(s.posting_len(p.b)) == s.posting_len(id("tr")))
+            .collect();
+        let want: f64 = mine
+            .iter()
             .map(|p| {
                 let m = f64::from(p.joint);
                 w * (tm.router_ns(&c, m, s.n_points()) - tm.tree_ns(&c, 200.0, m, true))
             })
             .sum();
         assert!(want > 0.0);
-        assert!((mixed.pair_part[id("tr") as usize] - want).abs() <= 1e-9 * want);
-        // The greedy adds it to the base-derived part, weighted by the base-derived share.
-        let g_mixed = TreeGreedy::with_classes(&mixed, &s, &tm, &c, &f, 30);
+        let mut g_mixed = TreeGreedy::with_classes(&mixed, &s, &tm, &c, &f, 30);
         let g_plain = TreeGreedy::with_classes(&plain, &s, &tm, &c, &f, 30);
-        let term = |g: &TreeGreedy| g.terms.iter().find(|t| t.label == id("tr")).cloned();
-        let (a, b) = (term(&g_mixed).unwrap(), term(&g_plain).unwrap());
-        assert!((a.saving_ns - (0.5 * b.saving_ns + want)).abs() <= 1e-6 * a.saving_ns);
+        let x = g_mixed
+            .terms
+            .iter()
+            .position(|t| t.label == id("tr"))
+            .unwrap();
+        let b = g_plain.terms.iter().find(|t| t.label == id("tr")).unwrap();
+        let a = &g_mixed.terms[x];
+        assert!((a.derived_ns - 0.5 * b.derived_ns).abs() <= 1e-9 * b.derived_ns.abs());
+        assert!((a.saving_ns - (a.derived_ns + want)).abs() <= 1e-6 * a.saving_ns);
+        // A pair tree serving one of tr's contexts takes that context's share from tr's tree.
+        let p = mine[0];
+        let q = g_mixed.context_query(p.a, p.b).unwrap();
+        assert_eq!(g_mixed.query_cost(q), mixed.base_ns[q]);
+        assert_eq!(g_mixed.query_weight(q), w);
+        let before = g_mixed.gain(x);
+        g_mixed.serve(q, 1.0);
+        assert_eq!(g_mixed.query_cost(q), 1.0);
+        let lost = w * (mixed.base_ns[q] - tm.tree_ns(&c, 200.0, f64::from(p.joint), true));
+        assert!((before - g_mixed.gain(x) - lost).abs() <= 1e-6 * lost.abs());
     }
 }

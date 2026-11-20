@@ -2099,7 +2099,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         let xs = &base_ns[r];
         xs.iter().sum::<f64>() / xs.len().max(1) as f64
     };
-    let mean = part_mean(0..base_ns.len());
+    let mean = match (&sample, &tree_sample) {
+        (Some(s), _) => s.mean_base_ns(),
+        (_, Some(s)) => s.mean_base_ns(),
+        _ => unreachable!("one sample"),
+    };
     let (mean_derived, mean_pairs) = (
         part_mean(0..a.queries.min(base_ns.len())),
         part_mean(a.queries.min(base_ns.len())..base_ns.len()),
