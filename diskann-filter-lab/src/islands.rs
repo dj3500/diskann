@@ -388,6 +388,56 @@ pub(crate) fn draw_query(
     true
 }
 
+/// The smallest clause of a drawn query (its index and its upper bound `s_min`, the summed
+/// postings of its labels) and the query's estimated match count `M`: every `stride`-th member
+/// of the smallest clause (each member once: counted at the first of the clause's labels in its
+/// row) checked against the other clauses, scaled to `s_min` (at least 1).
+pub(crate) fn query_matches(
+    labels: &LabelStore,
+    model: &QueryModel,
+    kl: &[u32],
+    clauses: &[(usize, usize)],
+) -> (usize, u64, f64) {
+    let size = |&(a, b): &(usize, usize)| -> u64 {
+        kl[a..b].iter().map(|&l| labels.posting_len(l) as u64).sum()
+    };
+    let (jmin, s_min) = clauses
+        .iter()
+        .enumerate()
+        .map(|(j, r)| (j, size(r)))
+        .min_by_key(|&(_, s)| s)
+        .expect("a clause");
+    let m = if clauses.len() == 1 {
+        s_min as f64
+    } else {
+        let (a0, b0) = clauses[jmin];
+        let cl0 = &kl[a0..b0];
+        let stride = (s_min as usize).div_ceil(model.cap).max(1);
+        let (mut seen, mut hit, mut pos) = (0u64, 0u64, 0usize);
+        for (x, &l) in cl0.iter().enumerate() {
+            let post = labels.postings(l);
+            let first = (stride - pos % stride) % stride;
+            for &v in post.iter().skip(first).step_by(stride) {
+                let vr = labels.row(v);
+                if cl0[..x].iter().any(|&e| vr.binary_search(&e).is_ok()) {
+                    continue;
+                }
+                seen += 1;
+                if clauses
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &(a, b))| j == jmin || meets(vr, &kl[a..b]))
+                {
+                    hit += 1;
+                }
+            }
+            pos += post.len();
+        }
+        (hit as f64 * s_min as f64 / seen.max(1) as f64).max(1.0)
+    };
+    (jmin, s_min, m)
+}
+
 impl QuerySample {
     /// Draws the queries and computes their cost terms (with up to `threads` threads; the
     /// result does not depend on the thread count).
@@ -419,46 +469,7 @@ impl QuerySample {
                     continue;
                 }
                 let (kl, clauses): (&Vec<u32>, &Vec<(usize, usize)>) = (kl, clauses);
-                let size = |&(a, b): &(usize, usize)| -> u64 {
-                    kl[a..b].iter().map(|&l| labels.posting_len(l) as u64).sum()
-                };
-                let (jmin, s_min) = clauses
-                    .iter()
-                    .enumerate()
-                    .map(|(j, r)| (j, size(r)))
-                    .min_by_key(|&(_, s)| s)
-                    .expect("a clause");
-                // Match count: every `stride`-th member of the smallest clause (each member
-                // once: counted at the first of the clause's labels in its row) checked
-                // against the other clauses.
-                let m = if clauses.len() == 1 {
-                    s_min as f64
-                } else {
-                    let (a0, b0) = clauses[jmin];
-                    let cl0 = &kl[a0..b0];
-                    let stride = (s_min as usize).div_ceil(model.cap).max(1);
-                    let (mut seen, mut hit, mut pos) = (0u64, 0u64, 0usize);
-                    for (x, &l) in cl0.iter().enumerate() {
-                        let post = labels.postings(l);
-                        let first = (stride - pos % stride) % stride;
-                        for &v in post.iter().skip(first).step_by(stride) {
-                            let vr = labels.row(v);
-                            if cl0[..x].iter().any(|&e| vr.binary_search(&e).is_ok()) {
-                                continue;
-                            }
-                            seen += 1;
-                            if clauses
-                                .iter()
-                                .enumerate()
-                                .all(|(j, &(a, b))| j == jmin || meets(vr, &kl[a..b]))
-                            {
-                                hit += 1;
-                            }
-                        }
-                        pos += post.len();
-                    }
-                    (hit as f64 * s_min as f64 / seen.max(1) as f64).max(1.0)
-                };
+                let (_, s_min, m) = query_matches(labels, &model, kl, clauses);
                 let rho_min = s_min as f64 / nf;
                 let checks = if clauses.len() > 1 {
                     s_min as f64 * c.pred(rho_min)

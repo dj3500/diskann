@@ -537,6 +537,41 @@ struct SelectArgs {
     /// them; the floor's label pruning is applied as when counting.
     #[arg(long)]
     load_candidates: Option<PathBuf>,
+    /// Whose auxiliary structures: `hybrid` (islands and combination postings, valued against
+    /// the exact path and the graph route) or `graph` (track G: a router tree per label and a
+    /// pair tree per label pair, valued against the graph router alone; writes the trees'
+    /// labels, `sel-b<B>.trees.txt`, for `flab steiner --labels-file`, and the pairs).
+    #[arg(long, value_enum, default_value = "hybrid")]
+    track: SelectTrack,
+    /// `--track graph`: reference router frontier `F` of the tree-route cost (the declared
+    /// frontier table's at a target recall of about 0.9).
+    #[arg(long, default_value_t = 512.0)]
+    tree_frontier: f64,
+    /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
+    #[arg(long, default_value_t = 26.0)]
+    tree_fanout: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SelectTrack {
+    Hybrid,
+    Graph,
+}
+
+/// Degree bound of a graph file (`graph.flab`, a directory holding one, or a DiskANN index).
+fn graph_degree_bound(path: &Path) -> Result<usize> {
+    let p = if path.is_dir() {
+        path.join("graph.flab")
+    } else {
+        path.to_owned()
+    };
+    if container::peek_magic(&p).ok().as_ref() == Some(graph::MAGIC) {
+        let r = container::Reader::open(&p, graph::MAGIC)?;
+        Ok(r.params()[2] as usize)
+    } else {
+        let mut f = std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
+        Ok(diskann_io::Header::read(&mut f)?.max_degree as usize)
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1943,10 +1978,44 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         fresh: a.fresh,
         ..Default::default()
     };
+    let graph_track = a.track == SelectTrack::Graph;
+    let tree_model = if graph_track {
+        let r_max = graph_degree_bound(&a.graph)?;
+        let mut bf = std::fs::File::open(&base_file)?;
+        let (_, dim) = diskann_io::read_bin_header(&mut bf)?;
+        Some(diskann_filter_lab::select_g::TreeModel {
+            k: a.k,
+            frontier: a.tree_frontier,
+            fanout: a.tree_fanout,
+            router_bytes: diskann_filter_lab::select_g::TreeModel::router_bytes_of(
+                r_max,
+                dim * T::DTYPE.size(),
+            ),
+        })
+    } else {
+        None
+    };
     let t = Instant::now();
-    let sample = islands::QuerySample::build(&store, &costs, a.k, model, a.threads);
+    let (sample, tree_sample) = match &tree_model {
+        Some(tm) => (
+            None,
+            Some(diskann_filter_lab::select_g::TreeSample::build(
+                &store, &costs, tm, model, a.threads,
+            )),
+        ),
+        None => (
+            Some(islands::QuerySample::build(
+                &store, &costs, a.k, model, a.threads,
+            )),
+            None,
+        ),
+    };
     let sample_s = secs(t);
-    let mean = sample.mean_base_ns();
+    let mean = match (&sample, &tree_sample) {
+        (Some(s), _) => s.mean_base_ns(),
+        (_, Some(s)) => s.mean_base_ns(),
+        _ => unreachable!("one sample"),
+    };
     let floor = a.kappa * mean / index_bytes as f64;
     println!(
         "{} base-derived queries in {sample_s:.1} s; mean cost {mean:.0} ns; index {:.2} GiB; floor {floor:.3e} ns per query per byte (kappa {})",
@@ -1957,6 +2026,10 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let t = Instant::now();
     // Labels whose bound on any pair's value reaches the floor (all of them when `kappa` is 0).
     let bound_keep = |f: &[f64]| -> Vec<bool> {
+        if graph_track {
+            // The bound is the exact path's; track G's pairs are valued against the router.
+            return vec![true; store.n_labels()];
+        }
         let f_max = f.iter().copied().fold(0.0, f64::max);
         (0..store.n_labels() as u32)
             .map(|l| select::pair_value_bound(&store, &costs, &model, f, f_max, l) >= floor)
@@ -1987,7 +2060,12 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     if let Some(path) = &a.save_candidates {
         write_candidates(path, &store, a.singleton, &f, &cands)?;
     }
-    let values = select::pair_values(&store, &costs, a.k, &model, &f, &cands);
+    let values = match &tree_model {
+        Some(tm) => {
+            diskann_filter_lab::select_g::pair_tree_values(&store, &costs, tm, &model, &f, &cands)
+        }
+        None => select::pair_values(&store, &costs, a.k, &model, &f, &cands),
+    };
     let pairs_s = secs(t);
     println!(
         "{n_keep} of {} labels can pass the floor; {} co-occurring pairs in different categories, {} with a positive saving, in {pairs_s:.1} s{}",
@@ -2036,15 +2114,26 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             model,
         };
         let t = Instant::now();
-        let sel = select::select(&store, &sample, &values, &params);
+        let sel = match (&sample, &tree_sample, &tree_model) {
+            (Some(sample), _, _) => select::select(&store, sample, &values, &params),
+            (_, Some(ts), Some(tm)) => select::select_with(
+                &store,
+                || diskann_filter_lab::select_g::TreeGreedy::new(ts, &store, tm),
+                &values,
+                &params,
+            ),
+            _ => unreachable!("one sample"),
+        };
         let select_s = secs(t);
         let best = &sel.best;
         println!(
-            "budget {b} B/point: {} islands ({:.1} MiB, {:.0} ns per query), {} pairs (T {:?}, {} big labels, {:.1} MiB incl. matrix, {:.0} ns per query); expected saving {:.0} of {mean:.0} ns, {:.1} MiB; cut {:.3e}; {select_s:.1} s",
+            "budget {b} B/point: {} {} ({:.1} MiB, {:.0} ns per query), {} {} (T {:?}, {} big labels, {:.1} MiB incl. matrix, {:.0} ns per query); expected saving {:.0} of {mean:.0} ns, {:.1} MiB; cut {:.3e}; {select_s:.1} s",
             best.islands.len(),
+            if graph_track { "trees" } else { "islands" },
             best.island_bytes as f64 / (1u64 << 20) as f64,
             best.island_saving_ns,
             sel.pairs.len(),
+            if graph_track { "pair trees" } else { "pairs" },
             best.t_big,
             sel.big_labels.len(),
             (best.bytes() - best.island_bytes) as f64 / (1u64 << 20) as f64,
@@ -2072,6 +2161,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "labels_passing_bound": n_keep,
         "pair_candidates": cands.len(),
         "pair_values": values.len(),
+        "track": if graph_track { "graph" } else { "hybrid" },
+        "tree_model": tree_model,
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
@@ -2094,8 +2185,10 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         r["bytes"] = json!(sel.best.bytes());
         r["expected_saving_ns"] = json!(sel.best.saving_ns());
         r["runs"] = json!(sel.runs);
-        r["island_names"] = json!(names);
-        r["island_sizes"] = json!(sizes);
+        // `--track graph`: the per-label kind is the router trees.
+        let kind = if graph_track { "tree" } else { "island" };
+        r[format!("{kind}_names")] = json!(names);
+        r[format!("{kind}_sizes")] = json!(sizes);
         r["n_pairs"] = json!(sel.pairs.len());
         r["n_big"] = json!(sel.big_labels.len());
         r["build"] = extra;
@@ -2112,9 +2205,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         println!("dry run in {:.1} s", secs(t0));
         return Ok(());
     }
-    // Islands: the union once, then each budget's subset.
+    // Islands: the union once, then each budget's subset (`--track graph`: none; the trees'
+    // labels are written for `flab steiner --labels-file`).
     let mut all: Vec<u32> = sels
         .iter()
+        .filter(|_| !graph_track)
         .flat_map(|(_, _, s, _)| s.best.islands.iter().copied())
         .collect();
     all.sort_unstable();
@@ -2146,6 +2241,12 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     };
     for (b, params, sel, select_s) in &sels {
         let mut build = json!({});
+        if graph_track {
+            let out = a.out_dir.join(format!("sel-b{}.trees.txt", tag(*b)));
+            let text: String = sel.best.islands.iter().map(|l| format!("{l}\n")).collect();
+            std::fs::write(&out, text)?;
+            build["trees"] = json!({ "output": out, "labels": sel.best.islands.len() });
+        }
         if let Some((union, per_island, wall)) = &built_islands {
             if !sel.best.islands.is_empty() {
                 let ix = union.subset(&sel.best.islands);

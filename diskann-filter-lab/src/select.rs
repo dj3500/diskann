@@ -69,6 +69,44 @@ use crate::{
     pairs,
 };
 
+/// A per-label kind valued on the query sample, as the greedy sees it: candidates by expected
+/// saving per query per byte (islands, [`IslandGreedy`]; track G's router trees,
+/// [`crate::select_g::TreeGreedy`]).
+pub trait LabelKind {
+    /// The best remaining candidate (its saving per query per byte and its index).
+    fn peek(&mut self) -> Option<(f64, usize)>;
+    /// Takes the peeked candidate; returns its marginal saving per query (ns).
+    fn take(&mut self, x: usize) -> f64;
+    /// Drops the peeked candidate.
+    fn skip(&mut self, x: usize);
+    /// Bytes of candidate `x`.
+    fn bytes(&self, x: usize) -> u64;
+    /// Label of candidate `x`.
+    fn label(&self, x: usize) -> u32;
+}
+
+impl LabelKind for IslandGreedy<'_> {
+    fn peek(&mut self) -> Option<(f64, usize)> {
+        IslandGreedy::peek(self)
+    }
+
+    fn take(&mut self, x: usize) -> f64 {
+        IslandGreedy::take(self, x)
+    }
+
+    fn skip(&mut self, x: usize) {
+        IslandGreedy::skip(self, x);
+    }
+
+    fn bytes(&self, x: usize) -> u64 {
+        self.terms[x].bytes
+    }
+
+    fn label(&self, x: usize) -> u32 {
+        self.terms[x].label
+    }
+}
+
 /// A candidate pair: labels `a < b` in different categories, their joint posting size `j` and
 /// `g_ab` (see the module documentation).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -232,6 +270,14 @@ pub struct PairValue {
     pub value: f64,
 }
 
+/// Probability per query of the context `{a} ∧ {b}` of a candidate pair (`P_ab` of the module
+/// documentation).
+pub fn context_prob(model: &QueryModel, f: &[f64], p: &PairCand) -> f64 {
+    let fr = model.fresh;
+    let (own, other) = ((1.0 - fr) * (1.0 - fr), 1.0 - (1.0 - fr) * (1.0 - fr));
+    0.25 * (own * p.g + other * f[p.a as usize] * f[p.b as usize])
+}
+
 /// The value terms of the candidates with a positive saving, by decreasing value.
 pub fn pair_values(
     labels: &LabelStore,
@@ -243,8 +289,6 @@ pub fn pair_values(
 ) -> Vec<PairValue> {
     let n = labels.n_points();
     let nf = n as f64;
-    let fr = model.fresh;
-    let (own, other) = ((1.0 - fr) * (1.0 - fr), 1.0 - (1.0 - fr) * (1.0 - fr));
     let mut out: Vec<PairValue> = cands
         .iter()
         .filter_map(|&p| {
@@ -257,7 +301,7 @@ pub fn pair_values(
             if !saving_ns.is_finite() || saving_ns <= 0.0 {
                 return None;
             }
-            let prob = 0.25 * (own * p.g + other * f[p.a as usize] * f[p.b as usize]);
+            let prob = context_prob(model, f, &p);
             let bytes = pair_bytes(p.joint);
             Some(PairValue {
                 cand: p,
@@ -349,9 +393,9 @@ pub struct Selection {
 /// The greedy over islands (from `sample`) and pairs (`values`, by decreasing value) of labels of
 /// at least `t` points (none if `t` is `None`) within `params.budget_bytes`, the matrix of the
 /// `big` candidate labels of at least `t` points charged first.
-fn run(
+fn run<G: LabelKind>(
     labels: &LabelStore,
-    sample: &QuerySample,
+    kind: impl Fn() -> G,
     values: &[PairValue],
     cand_labels: &[u32],
     params: &Params,
@@ -384,7 +428,7 @@ fn run(
         None => false,
     };
     let mut left = params.budget_bytes - fixed;
-    let mut gr = IslandGreedy::new(sample, labels, params.r, |_| true);
+    let mut gr = kind();
     let mut pi = 0usize;
     let mut cut = f64::INFINITY;
     loop {
@@ -404,7 +448,7 @@ fn run(
             if key < params.floor {
                 break;
             }
-            let bytes = gr.terms[x].bytes;
+            let bytes = gr.bytes(x);
             if bytes > left {
                 gr.skip(x);
                 continue;
@@ -412,7 +456,7 @@ fn run(
             left -= bytes;
             out.island_saving_ns += gr.take(x);
             out.island_bytes += bytes;
-            out.islands.push(gr.terms[x].label);
+            out.islands.push(gr.label(x));
             cut = key;
         } else {
             let v = &values[pi];
@@ -448,6 +492,23 @@ pub fn select(
     values: &[PairValue],
     params: &Params,
 ) -> Selection {
+    select_with(
+        labels,
+        || IslandGreedy::new(sample, labels, params.r, |_| true),
+        values,
+        params,
+    )
+}
+
+/// [`select`] with another per-label kind than the islands (e.g. track G's router trees,
+/// [`crate::select_g`]); `values` are the pair kind's terms (combination postings, or pair
+/// trees), by decreasing value.
+pub fn select_with<G: LabelKind>(
+    labels: &LabelStore,
+    kind: impl Fn() -> G,
+    values: &[PairValue],
+    params: &Params,
+) -> Selection {
     let cand_labels: Vec<u32> = values
         .iter()
         .flat_map(|v| [v.cand.a, v.cand.b])
@@ -471,7 +532,7 @@ pub fn select(
     }
     let runs: Vec<Run> = ts
         .iter()
-        .map(|&t| run(labels, sample, values, &cand_labels, params, t))
+        .map(|&t| run(labels, &kind, values, &cand_labels, params, t))
         .collect();
     let best = runs
         .iter()

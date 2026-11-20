@@ -155,6 +155,10 @@ pub struct SteinerArgs {
     /// Only labels with at most this many members get routers: a number or `n/<k>`.
     #[arg(long, default_value = "n/100")]
     pub max_size: String,
+    /// `tree`: give routers to exactly the labels listed in this file (one label id per line,
+    /// e.g. `flab select --track graph`'s `trees.txt`) instead of the size range.
+    #[arg(long, conflicts_with = "pairs")]
+    pub labels_file: Option<PathBuf>,
     /// Router vectors.
     #[arg(long, value_enum, default_value = "centroid")]
     pub router: RouterVector,
@@ -192,6 +196,33 @@ pub fn run(args: &SteinerArgs) -> Result<()> {
         DType::U8 => run_typed::<u8>(args),
         DType::F32 => run_typed::<f32>(args),
     }
+}
+
+/// The label ids of a list file (one per line; blank lines and `#` comments ignored), sorted and
+/// deduplicated, each below `n_labels`.
+pub fn read_label_list(path: &std::path::Path, n_labels: usize) -> Result<Vec<u32>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the label list {}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.split('#').next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        let l: u32 = t
+            .parse()
+            .with_context(|| format!("{}:{}: not a label id: {t:?}", path.display(), i + 1))?;
+        ensure!(
+            (l as usize) < n_labels,
+            "{}:{}: label {l} out of range ({n_labels} labels)",
+            path.display(),
+            i + 1
+        );
+        out.push(l);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 fn parse_size(s: &str, n: usize) -> Result<usize> {
@@ -699,12 +730,21 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         None => labels.posting_len(x),
     };
     let n_items = px.as_ref().map_or(labels.n_labels(), PairIndex::n_pairs);
-    let selected: Vec<u32> = (0..n_items as u32)
-        .filter(|&x| {
-            let s = size_of(x);
-            s > args.min_size && s <= max_size
-        })
-        .collect();
+    let selected: Vec<u32> = match &args.labels_file {
+        Some(path) => {
+            ensure!(
+                args.construction == Construction::Tree,
+                "--labels-file selects the labels of --construction tree"
+            );
+            read_label_list(path, labels.n_labels())?
+        }
+        None => (0..n_items as u32)
+            .filter(|&x| {
+                let s = size_of(x);
+                s > args.min_size && s <= max_size
+            })
+            .collect(),
+    };
     let d = base.ncols();
     let mut leaf = vec![0u32; n];
     if matches!(args.construction, Construction::Tree | Construction::Pairs)
@@ -774,7 +814,7 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         "tool": "flab steiner",
         "dataset": args.dataset, "graph": args.graph, "starts": args.starts,
         "construction": format!("{:?}", args.construction).to_lowercase(),
-        "block": b, "min_size": args.min_size, "max_size": max_size,
+        "block": b, "min_size": args.min_size, "max_size": max_size, "labels_file": args.labels_file,
         "router": format!("{:?}", args.router).to_lowercase(), "keep_starts": args.keep_starts,
         "partition": format!("{:?}", args.partition).to_lowercase(), "kmeans_iters": args.kmeans_iters,
         "kmeans_sample": args.kmeans_sample,
