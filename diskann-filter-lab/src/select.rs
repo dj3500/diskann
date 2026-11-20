@@ -93,6 +93,23 @@ pub trait LabelKind {
     fn bytes(&self, x: usize) -> u64;
     /// Label of candidate `x`.
     fn label(&self, x: usize) -> u32;
+    /// The sample query of the pair context `{a} ∧ {b}` (`None` without pair contexts). A pair
+    /// item's saving on its context is then shared with this kind: valued against the
+    /// context's current cost ([`Self::query_cost`]) and, when the pair is taken, lowering it
+    /// ([`Self::serve`]), so that the two kinds do not both count one query's saving.
+    fn context_query(&self, _a: u32, _b: u32) -> Option<usize> {
+        None
+    }
+    /// Current cost (ns) of sample query `q` with the items taken.
+    fn query_cost(&self, _q: usize) -> f64 {
+        0.0
+    }
+    /// Workload weight of sample query `q`.
+    fn query_weight(&self, _q: usize) -> f64 {
+        0.0
+    }
+    /// An item of another kind serves sample query `q` at `cost`.
+    fn serve(&mut self, _q: usize, _cost: f64) {}
 }
 
 impl LabelKind for IslandGreedy<'_> {
@@ -114,6 +131,40 @@ impl LabelKind for IslandGreedy<'_> {
 
     fn label(&self, x: usize) -> u32 {
         self.terms[x].label
+    }
+
+    fn context_query(&self, a: u32, b: u32) -> Option<usize> {
+        IslandGreedy::context_query(self, a, b)
+    }
+
+    fn query_cost(&self, q: usize) -> f64 {
+        IslandGreedy::query_cost(self, q)
+    }
+
+    fn query_weight(&self, q: usize) -> f64 {
+        IslandGreedy::query_weight(self, q)
+    }
+
+    fn serve(&mut self, q: usize, cost: f64) {
+        IslandGreedy::serve(self, q, cost);
+    }
+}
+
+/// `f64` with a total order (the pairs' heap).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Key(f64);
+
+impl Eq for Key {}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&o.0)
     }
 }
 
@@ -332,7 +383,8 @@ pub struct Params {
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct PairValue {
     pub cand: PairCand,
-    /// Probability per query of its context `{a} ∧ {b}`.
+    /// Probability per query of its context `{a} ∧ {b}` among the base-derived part of the
+    /// workload ([`context_prob`]).
     pub prob: f64,
     /// Saving of the `pair` plan on the context (ns).
     pub saving_ns: f64,
@@ -341,15 +393,16 @@ pub struct PairValue {
     pub value: f64,
 }
 
-/// Probability per query of the context `{a} ∧ {b}` of a candidate pair (`P_ab` of the module
-/// documentation): `(1 − μ)` times its probability among base-derived queries plus `μ / N`
-/// from the pair contexts (`μ = model.uniform`, `N = model.contexts`).
+/// Probability per query of the context `{a} ∧ {b}` of a candidate pair among the base-derived
+/// part of the workload (`(1 − μ)·P_ab`, `P_ab` of the module documentation; `μ =
+/// model.uniform` when the workload has pair contexts). The pair-context part (`μ / N`) is
+/// valued on the sample's context query, shared with the per-label kind (see [`LabelKind`]).
 pub fn context_prob(model: &QueryModel, f: &[f64], p: &PairCand) -> f64 {
     let fr = model.fresh;
     let (own, other) = ((1.0 - fr) * (1.0 - fr), 1.0 - (1.0 - fr) * (1.0 - fr));
     let derived = 0.25 * (own * p.g + other * f[p.a as usize] * f[p.b as usize]);
     if model.uniform > 0.0 && model.contexts > 0 {
-        (1.0 - model.uniform) * derived + model.uniform / model.contexts as f64
+        (1.0 - model.uniform) * derived
     } else {
         derived
     }
@@ -513,7 +566,6 @@ fn run<G: LabelKind>(
     };
     let mut left = params.budget_bytes - fixed;
     let mut gr = kind();
-    let mut pi = 0usize;
     let mut cut = f64::INFINITY;
     // Mean cost per query and index bytes with the items taken (the matrix charged first).
     let (mut t_cur, mut b_cur) = (params.mean_ns, (params.index_bytes + fixed) as f64);
@@ -523,17 +575,68 @@ fn run<G: LabelKind>(
         Stop::Budget => params.floor,
         Stop::Elasticity => t / b,
     };
-    loop {
-        while pi < values.len() && !eligible(&values[pi]) {
-            pi += 1;
+    // A pair's marginal saving per query: its base-derived part (`prob · saving`) plus, on its
+    // pair context (if the per-label kind holds it), the context's weight times how much the
+    // pair plan lowers the context's current cost (`cost`: the pair plan's cost there).
+    let terms: Vec<(Option<usize>, f64, f64, f64)> = values
+        .iter()
+        .map(|v| {
+            let fixed = v.prob * v.saving_ns;
+            match gr.context_query(v.cand.a, v.cand.b) {
+                Some(q) => (
+                    Some(q),
+                    gr.query_weight(q),
+                    gr.query_cost(q) - v.saving_ns,
+                    fixed,
+                ),
+                None => (None, 0.0, 0.0, fixed),
+            }
+        })
+        .collect();
+    let pair_gain = |gr: &G, i: usize| -> f64 {
+        let (q, w, cost, fixed) = terms[i];
+        fixed + q.map_or(0.0, |q| w * (gr.query_cost(q) - cost).max(0.0))
+    };
+    // The eligible pairs by value (ties: in the order of `values`), re-evaluated lazily: a
+    // value only falls as items are taken.
+    let mut heap: std::collections::BinaryHeap<(Key, std::cmp::Reverse<usize>)> = (0..values.len())
+        .filter(|&i| eligible(&values[i]))
+        .map(|i| {
+            (
+                Key(pair_gain(&gr, i) / values[i].bytes as f64),
+                std::cmp::Reverse(i),
+            )
+        })
+        .collect();
+    let peek_pair = |heap: &mut std::collections::BinaryHeap<(Key, std::cmp::Reverse<usize>)>,
+                     gr: &G|
+     -> Option<(f64, usize)> {
+        loop {
+            let &(Key(key), std::cmp::Reverse(i)) = heap.peek()?;
+            let g = pair_gain(gr, i);
+            let now = g / values[i].bytes as f64;
+            if now < key * (1.0 - 1e-12) {
+                heap.pop();
+                if g > 0.0 {
+                    heap.push((Key(now), std::cmp::Reverse(i)));
+                }
+                continue;
+            }
+            if g <= 0.0 {
+                heap.pop();
+                continue;
+            }
+            return Some((now, i));
         }
+    };
+    loop {
         let isl = gr.peek();
-        let pv = values.get(pi).map(|v| v.value);
+        let pv = peek_pair(&mut heap, &gr);
         let take_island = match (isl, pv) {
             (None, None) => break,
             (Some(_), None) => true,
             (None, Some(_)) => false,
-            (Some((ki, _)), Some(kp)) => ki >= kp,
+            (Some((ki, _)), Some((kp, _))) => ki >= kp,
         };
         if take_island {
             let (key, x) = isl.expect("an island");
@@ -554,28 +657,31 @@ fn run<G: LabelKind>(
             b_cur += bytes as f64;
             cut = key;
         } else {
-            let v = &values[pi];
-            if v.value < threshold(t_cur, b_cur) {
-                // The pairs are by decreasing value: none of the rest passes (with the
-                // elasticity rule, the threshold changes only when an item is taken, and the
-                // islands left are worth less than this pair).
+            let (key, i) = pv.expect("a pair");
+            if key < threshold(t_cur, b_cur) {
+                // The best item fails: with the elasticity rule the threshold changes only when
+                // an item is taken; with the floor no pair left passes it.
                 if params.stop == Stop::Elasticity {
                     break;
                 }
-                pi = values.len();
+                heap.clear();
                 continue;
             }
+            heap.pop();
+            let v = &values[i];
             if v.bytes <= left {
                 left -= v.bytes;
-                let g = v.prob * v.saving_ns;
+                let g = pair_gain(&gr, i);
                 out.pair_saving_ns += g;
                 out.pair_bytes += v.bytes;
-                out.pairs.push(pi);
+                out.pairs.push(i);
                 t_cur -= g;
                 b_cur += v.bytes as f64;
-                cut = v.value;
+                cut = key;
+                if let (Some(q), _, cost, _) = terms[i] {
+                    gr.serve(q, cost);
+                }
             }
-            pi += 1;
         }
     }
     out.islands.sort_unstable();
@@ -907,11 +1013,12 @@ mod tests {
     }
 
     #[test]
-    fn the_mixed_workload_adds_equally_weighted_pair_contexts() {
+    fn the_mixed_workload_holds_every_pair_context_with_its_weight() {
         let s = store();
         let c = UnitCosts::default();
         let (counts, f) = label_weights(&s, 0.5, 2);
         let contexts = pair_contexts(&s, &counts, 0.5, 2);
+        let n_ctx = contexts.len();
         let derived = QueryModel {
             n_queries: 3_000,
             seed: 9,
@@ -920,29 +1027,34 @@ mod tests {
         };
         let mixed = QueryModel {
             uniform: 0.5,
-            contexts: contexts.len() as u64,
+            contexts: n_ctx as u64,
             ..derived
         };
-        assert_eq!(mixed.n_pair_queries(), 3_000);
+        assert_eq!(mixed.n_pair_queries(), n_ctx);
         let one = QuerySample::build(&s, &c, 10, derived, 2);
         let two = QuerySample::build_mixed(&s, &c, 10, mixed, &contexts, 3);
-        assert_eq!(two.base_ns.len(), 6_000);
-        // The base-derived half is the base-derived sample; the pair contexts are `{a} ∧ {b}`
-        // with `M = j`, priced like the pairs' closed form.
+        assert_eq!(two.base_ns.len(), 3_000 + n_ctx);
+        // The base-derived part is the base-derived sample; each pair context is `{a} ∧ {b}`
+        // with `M = j`, priced like the pairs' closed form, weighted μ / N.
         assert_eq!(&two.base_ns[..3_000], &one.base_ns[..]);
         let nf = s.n_points() as f64;
-        for qi in 3_000..3_050 {
-            let p = &contexts[islands::pair_context_draw(&mixed, qi)];
+        for (i, p) in contexts.iter().enumerate() {
+            let q = two.context_query(p.a, p.b).expect("a context query");
+            assert_eq!(q, 3_000 + i);
             let sz = s.posting_len(p.a).min(s.posting_len(p.b)) as f64;
             let m = f64::from(p.joint);
             let exact = sz * c.pred(sz / nf) + m * c.dist(m / nf);
             let base = islands::postfilter_nominal(&c, 10, 10, m / nf, s.n_points(), 1).1;
-            assert!((two.base_ns[qi] - exact.min(base)).abs() < 1e-9 * exact.min(base));
+            assert!((two.base_ns[q] - exact.min(base)).abs() <= 1e-9 * exact.min(base));
+            assert!((two.weight(q) - 0.5 / n_ctx as f64).abs() < 1e-18);
         }
-        // Context probabilities: (1 − μ) of the base-derived one plus μ / N.
+        assert!((two.weight(0) - 0.5 / 3_000.0).abs() < 1e-18);
+        let mean_ctx = two.base_ns[3_000..].iter().sum::<f64>() / n_ctx as f64;
+        assert!((two.mean_base_ns() - 0.5 * (one.mean_base_ns() + mean_ctx)).abs() < 1e-6);
+        // Context probabilities: the base-derived part only, (1 − μ) of it.
         for p in contexts.iter().take(20) {
-            let want = 0.5 * context_prob(&derived, &f, p) + 0.5 / contexts.len() as f64;
-            assert!((context_prob(&mixed, &f, p) - want).abs() < 1e-15);
+            let want = 0.5 * context_prob(&derived, &f, p);
+            assert!((context_prob(&mixed, &f, p) - want).abs() < 1e-18);
         }
         // A thread count does not change the sample.
         let three = QuerySample::build_mixed(&s, &c, 10, mixed, &contexts, 1);
@@ -1010,5 +1122,57 @@ mod tests {
         assert!(none.best.islands.is_empty() && none.pairs.is_empty());
         let big = select(&s, &sample, &values, &params(1 << 40, Stop::Elasticity));
         assert_eq!(big.best.islands, all.best.islands);
+    }
+
+    #[test]
+    fn pairs_and_islands_share_a_pair_context_s_saving() {
+        let s = store();
+        let c = UnitCosts::default();
+        let (counts, f) = label_weights(&s, 0.5, 2);
+        let contexts = pair_contexts(&s, &counts, 0.5, 2);
+        let model = QueryModel {
+            n_queries: 4_000,
+            seed: 13,
+            cap: 512,
+            uniform: 0.5,
+            contexts: contexts.len() as u64,
+            ..Default::default()
+        };
+        let sample = QuerySample::build_mixed(&s, &c, 10, model, &contexts, 2);
+        let cands: Vec<PairCand> = contexts
+            .iter()
+            .filter(|p| is_candidate_label(&s, p.a) && is_candidate_label(&s, p.b))
+            .copied()
+            .collect();
+        let values = pair_values(&s, &c, 10, &model, &f, &cands);
+        let mean = sample.mean_base_ns();
+        let params = Params {
+            k: 10,
+            r: 8,
+            budget_bytes: u64::MAX / 4,
+            model,
+            stop: Stop::Budget,
+            mean_ns: mean,
+            index_bytes: 1 << 30,
+            ..Default::default()
+        };
+        let sel = select(&s, &sample, &values, &params);
+        let best = &sel.best;
+        assert!(!best.islands.is_empty() && !best.pairs.is_empty());
+        // A lower bound on the cost with everything built: every query at its cheapest island,
+        // every pair context at its pair plan if cheaper; the pairs' base-derived savings are
+        // counted apart (not shared). The selection's model cost is not below it: no saving
+        // is counted twice on a pair context.
+        let mut floor = sample.island_floor_ns();
+        let mut derived = 0.0;
+        for &i in &best.pairs {
+            let v = &values[i];
+            derived += v.prob * v.saving_ns;
+            let q = sample.context_query(v.cand.a, v.cand.b).expect("a context");
+            floor[q] = floor[q].min(sample.base_ns[q] - v.saving_ns);
+        }
+        let bound = sample.weighted_mean(&floor) - derived;
+        assert!(best.t_ns >= bound - 1e-6 * mean, "{} < {bound}", best.t_ns);
+        assert!(best.t_ns > 0.0);
     }
 }
