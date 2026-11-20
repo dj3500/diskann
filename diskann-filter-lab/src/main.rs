@@ -73,6 +73,10 @@ enum Command {
     /// within a memory budget, for the `island` route of the cost crossover).
     #[command(subcommand)]
     Islands(IslandsCommand),
+    /// One selector for the auxiliary structures: combination postings and per-label
+    /// sub-graphs chosen together by expected saving per query per byte on base-derived queries
+    /// under one memory budget (writes `pairs.flab` / `islands.flab` files and a report).
+    Select(SelectArgs),
     /// Measure the unit costs of the cost model on this machine and dataset (JSON).
     Calibrate(CalibrateArgs),
     /// Add the tree effort curve of a Steiner graph's router trees (`flab steiner`) to a
@@ -471,6 +475,60 @@ enum IslandsCommand {
     },
 }
 
+#[derive(Args)]
+struct SelectArgs {
+    /// Dataset directory (`base.u8bin` or `base.fbin`, `labels.flab`).
+    #[arg(long)]
+    dataset: PathBuf,
+    /// Unit costs of the cost model (`flab calibrate` output).
+    #[arg(long)]
+    calibration: PathBuf,
+    /// The graph file the index searches: with the base vectors and the label store, its
+    /// bytes are the index bytes of the value floor.
+    #[arg(long)]
+    graph: PathBuf,
+    /// Memory budgets in bytes per data point (one selection each).
+    #[arg(short, long, value_delimiter = ',', required = true)]
+    budget: Vec<f64>,
+    /// Value floor: an item must speed the workload up by at least `kappa` times the fraction by
+    /// which it grows the index (expected saving per query per byte at least
+    /// `kappa · mean cost / index bytes`; 0: no floor).
+    #[arg(long, default_value_t = 1.0)]
+    kappa: f64,
+    /// Answers `K` of the cost terms.
+    #[arg(short, long, default_value_t = 10)]
+    k: usize,
+    /// Degree bound `R` of the islands.
+    #[arg(long, default_value_t = 32)]
+    r: usize,
+    #[arg(long, default_value_t = 64)]
+    l_build: usize,
+    #[arg(long, default_value_t = 1.2)]
+    alpha: f32,
+    #[arg(short, long, default_value_t = 2)]
+    threads: usize,
+    /// Output directory (created if needed).
+    #[arg(long)]
+    out_dir: PathBuf,
+    /// Base-derived queries of the workload.
+    #[arg(long, default_value_t = 200_000)]
+    queries: usize,
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    /// Probability that a kept category's clause is a single label (else a random subset).
+    #[arg(long, default_value_t = 0.5)]
+    singleton: f64,
+    /// Probability that a kept category's clause comes from another data point.
+    #[arg(long, default_value_t = 0.0)]
+    fresh: f64,
+    /// Select only: write the reports without building the structures.
+    #[arg(long)]
+    dry_run: bool,
+    /// Predicate sets whose coverage by the selected pairs is reported (diagnostics only).
+    #[arg(long, value_delimiter = ',')]
+    report: Vec<PathBuf>,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum OrderArg {
     /// Unchanged ids (a copy in the lab's formats).
@@ -657,6 +715,10 @@ fn main() -> Result<()> {
                 DType::F32 => islands_command::<f32>(c),
             }
         }
+        Command::Select(a) => match DType::from_path(&run::data::base_file(&a.dataset)?)? {
+            DType::U8 => select_command::<u8>(a),
+            DType::F32 => select_command::<f32>(a),
+        },
         Command::Calibrate(a) => {
             let opts = calibrate::Options {
                 reps: a.reps,
@@ -1769,6 +1831,284 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
             out.display()
         );
     }
+    Ok(())
+}
+
+fn file_bytes(p: &Path) -> Result<u64> {
+    Ok(std::fs::metadata(p)
+        .with_context(|| format!("size of {}", p.display()))?
+        .len())
+}
+
+fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> Result<()> {
+    use diskann_filter_lab::select;
+    let t0 = Instant::now();
+    let store = LabelStore::read(&a.dataset.join("labels.flab"))?;
+    let costs = run::read_costs(&a.calibration)?;
+    std::fs::create_dir_all(&a.out_dir)?;
+    let base_file = run::data::base_file(&a.dataset)?;
+    let index_bytes = file_bytes(&base_file)?
+        + file_bytes(&a.dataset.join("labels.flab"))?
+        + file_bytes(&a.graph)?;
+    let n = store.n_points();
+    let model = islands::QueryModel {
+        n_queries: a.queries,
+        seed: a.seed,
+        singleton: a.singleton,
+        fresh: a.fresh,
+        ..Default::default()
+    };
+    let t = Instant::now();
+    let sample = islands::QuerySample::build(&store, &costs, a.k, model, a.threads);
+    let sample_s = secs(t);
+    let mean = sample.mean_base_ns();
+    let floor = a.kappa * mean / index_bytes as f64;
+    println!(
+        "{} base-derived queries in {sample_s:.1} s; mean cost {mean:.0} ns; index {:.2} GiB; floor {floor:.3e} ns per query per byte (kappa {})",
+        a.queries,
+        index_bytes as f64 / (1u64 << 30) as f64,
+        a.kappa
+    );
+    let t = Instant::now();
+    let (counts, f) = select::label_weights(&store, a.singleton, a.threads);
+    let f_max = f.iter().copied().fold(0.0, f64::max);
+    let keep: Vec<bool> = (0..store.n_labels() as u32)
+        .map(|l| select::pair_value_bound(&store, &costs, &model, &f, f_max, l) >= floor)
+        .collect();
+    let n_keep = keep.iter().filter(|&&k| k).count();
+    let cands = select::pair_candidates(
+        &store,
+        &counts,
+        a.singleton,
+        |l| keep[l as usize],
+        a.threads,
+    );
+    drop(counts);
+    let values = select::pair_values(&store, &costs, a.k, &model, &f, &cands);
+    let pairs_s = secs(t);
+    println!(
+        "{n_keep} of {} labels can pass the floor; {} co-occurring pairs in different categories, {} with a positive saving, in {pairs_s:.1} s",
+        store.n_labels(),
+        cands.len(),
+        values.len()
+    );
+    let mut tsv = String::from("a\tb\tsize_a\tsize_b\tjoint\tprob\tsaving_ns\tbytes\tvalue\n");
+    for v in values.iter().take(200_000) {
+        tsv += &format!(
+            "{}\t{}\t{}\t{}\t{}\t{:.4e}\t{:.0}\t{}\t{:.4e}\n",
+            v.cand.a,
+            v.cand.b,
+            store.posting_len(v.cand.a),
+            store.posting_len(v.cand.b),
+            v.cand.joint,
+            v.prob,
+            v.saving_ns,
+            v.bytes,
+            v.value
+        );
+    }
+    std::fs::write(a.out_dir.join("pair-values.tsv"), tsv)?;
+    let preds = a
+        .report
+        .iter()
+        .map(|p| {
+            let ps = PredicateSet::read(p)?;
+            ps.check_dictionary(&store)?;
+            Ok((p.clone(), ps))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tag = |b: f64| format!("{b}");
+    let mut sels = Vec::new();
+    for &b in &a.budget {
+        ensure!(b >= 0.0 && b.is_finite(), "budgets must be non-negative");
+        let params = select::Params {
+            k: a.k,
+            r: a.r,
+            budget_bytes: (b * n as f64) as u64,
+            floor,
+            model,
+        };
+        let t = Instant::now();
+        let sel = select::select(&store, &sample, &values, &params);
+        let select_s = secs(t);
+        let best = &sel.best;
+        println!(
+            "budget {b} B/point: {} islands ({:.1} MiB, {:.0} ns per query), {} pairs (T {:?}, {} big labels, {:.1} MiB incl. matrix, {:.0} ns per query); expected saving {:.0} of {mean:.0} ns, {:.1} MiB; cut {:.3e}; {select_s:.1} s",
+            best.islands.len(),
+            best.island_bytes as f64 / (1u64 << 20) as f64,
+            best.island_saving_ns,
+            sel.pairs.len(),
+            best.t_big,
+            sel.big_labels.len(),
+            (best.bytes() - best.island_bytes) as f64 / (1u64 << 20) as f64,
+            best.pair_saving_ns,
+            best.saving_ns(),
+            best.bytes() as f64 / (1u64 << 20) as f64,
+            best.cut
+        );
+        sels.push((b, params, sel, select_s));
+    }
+    let common = json!({
+        "dataset": a.dataset,
+        "calibration": a.calibration,
+        "graph": a.graph,
+        "n_points": n,
+        "index_bytes": index_bytes,
+        "kappa": a.kappa,
+        "floor_ns_per_query_byte": floor,
+        "mean_cost_ns": mean,
+        "model": model,
+        "k": a.k, "r": a.r, "l_build": a.l_build, "alpha": a.alpha,
+        "threads": a.threads,
+        "sample_s": sample_s,
+        "pairs_s": pairs_s,
+        "labels_passing_bound": n_keep,
+        "pair_candidates": cands.len(),
+        "pair_values": values.len(),
+    });
+    let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
+        let mut r = common.clone();
+        let names: Vec<&str> = sel
+            .best
+            .islands
+            .iter()
+            .map(|&l| store.label_name(l))
+            .collect();
+        let sizes: Vec<usize> = sel
+            .best
+            .islands
+            .iter()
+            .map(|&l| store.posting_len(l))
+            .collect();
+        r["budget_bytes_per_point"] = json!(b);
+        r["budget_bytes"] = json!((b * n as f64) as u64);
+        r["select_s"] = json!(select_s);
+        r["best"] = json!(sel.best);
+        r["bytes"] = json!(sel.best.bytes());
+        r["expected_saving_ns"] = json!(sel.best.saving_ns());
+        r["runs"] = json!(sel.runs);
+        r["island_names"] = json!(names);
+        r["island_sizes"] = json!(sizes);
+        r["n_pairs"] = json!(sel.pairs.len());
+        r["n_big"] = json!(sel.big_labels.len());
+        r["build"] = extra;
+        r
+    };
+    if a.dry_run {
+        for (b, _, sel, select_s) in &sels {
+            let r = report_of(*b, sel, *select_s, Value::Null);
+            std::fs::write(
+                a.out_dir.join(format!("sel-b{}.selection.json", tag(*b))),
+                serde_json::to_string_pretty(&r)? + "\n",
+            )?;
+        }
+        println!("dry run in {:.1} s", secs(t0));
+        return Ok(());
+    }
+    // Islands: the union once, then each budget's subset.
+    let mut all: Vec<u32> = sels
+        .iter()
+        .flat_map(|(_, _, s, _)| s.best.islands.iter().copied())
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    let built_islands = if all.is_empty() {
+        None
+    } else {
+        let base = Matrix::<T>::read_bin(&base_file)?;
+        let params = diskann_filter_lab::build::BuildParams {
+            rule: diskann_filter_lab::build::PruneRule::Alpha {
+                r: a.r,
+                alpha: a.alpha,
+            },
+            l_build: a.l_build,
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let (union, stats, per_island) =
+            IslandIndex::build(&base, &store, &all, &params, a.threads)?;
+        let wall = secs(t);
+        println!(
+            "{} islands ({} members, {:.1} MiB) in {wall:.1} s wall, {:.1} s summed over islands",
+            stats.islands,
+            stats.members,
+            stats.bytes as f64 / (1u64 << 20) as f64,
+            per_island.iter().sum::<f64>()
+        );
+        Some((union, per_island, wall))
+    };
+    for (b, params, sel, select_s) in &sels {
+        let mut build = json!({});
+        if let Some((union, per_island, wall)) = &built_islands {
+            if !sel.best.islands.is_empty() {
+                let ix = union.subset(&sel.best.islands);
+                let out = a.out_dir.join(format!("sel-b{}.islands.flab", tag(*b)));
+                ix.write(&out)?;
+                ensure!(
+                    IslandIndex::read(&out)? == ix,
+                    "{} does not read back",
+                    out.display()
+                );
+                ix.check(&store)?;
+                let cpu: f64 = all
+                    .iter()
+                    .zip(per_island)
+                    .filter(|(l, _)| sel.best.islands.binary_search(l).is_ok())
+                    .map(|(_, s)| s)
+                    .sum();
+                build["islands"] = json!({
+                    "output": out, "islands": ix.n_islands(), "members": ix.n_members(),
+                    "edges": ix.n_edges(), "bytes": ix.bytes(), "build_cpu_s": cpu,
+                    "build_wall_s_union": wall,
+                });
+            }
+        }
+        if let (Some(t_big), false) = (sel.best.t_big, sel.pairs.is_empty()) {
+            let t = Instant::now();
+            let (ix, stats) = PairIndex::build_selected(
+                &store,
+                t_big,
+                &sel.big_labels,
+                &sel.pairs,
+                params.budget_bytes,
+                sel.best.cut,
+                a.threads,
+            )?;
+            let wall = secs(t);
+            let out = a.out_dir.join(format!("sel-b{}.pairs.flab", tag(*b)));
+            ix.write(&out)?;
+            ensure!(
+                PairIndex::read(&out)? == ix,
+                "{} does not read back",
+                out.display()
+            );
+            ix.check_sample(&store, 97)?;
+            let cov: Vec<Value> = preds
+                .iter()
+                .map(|(path, ps)| pair_coverage(&ix, &store, ps, path))
+                .collect();
+            println!(
+                "budget {b}: pairs T {t_big}, {} big labels, {} stored ({} entries), {:.1} MiB in {wall:.1} s",
+                stats.n_big,
+                stats.stored_pairs,
+                stats.stored_entries,
+                stats.bytes as f64 / (1u64 << 20) as f64
+            );
+            for c in &cov {
+                println!("  {c}");
+            }
+            build["pairs"] = json!({
+                "output": out, "stats": stats, "build_wall_s": wall, "threads": a.threads,
+                "coverage": cov,
+            });
+        }
+        let r = report_of(*b, sel, *select_s, build);
+        std::fs::write(
+            a.out_dir.join(format!("sel-b{}.json", tag(*b))),
+            serde_json::to_string_pretty(&r)? + "\n",
+        )?;
+    }
+    println!("done in {:.1} s", secs(t0));
     Ok(())
 }
 

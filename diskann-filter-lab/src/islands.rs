@@ -225,6 +225,10 @@ pub struct QueryModel {
     /// Probability that a kept category's clause is a single label of the point (else a random
     /// non-empty subset of its labels in the category).
     pub singleton: f64,
+    /// Probability that a kept category's clause is drawn from another data point (uniform,
+    /// independent of the query's point) instead of the query's point: 0 keeps the categories
+    /// of a query as correlated as in the data, 1 makes them independent.
+    pub fresh: f64,
 }
 
 impl Default for QueryModel {
@@ -234,6 +238,7 @@ impl Default for QueryModel {
             seed: 1,
             cap: 4096,
             singleton: 0.5,
+            fresh: 0.0,
         }
     }
 }
@@ -291,6 +296,98 @@ pub struct QueryGain {
     pub order: Option<u32>,
 }
 
+/// Draws base-derived query `qi` of `model` (see [`QueryModel`]): its labels into `kl` (clause by
+/// clause, each clause's labels increasing as in the source row) and the clauses' ranges of `kl`
+/// into `clauses`; `cats` is scratch. Returns `false` (no query) for a point without labels.
+pub(crate) fn draw_query(
+    labels: &LabelStore,
+    model: &QueryModel,
+    qi: usize,
+    kl: &mut Vec<u32>,
+    clauses: &mut Vec<(usize, usize)>,
+    cats: &mut Vec<(usize, usize, bool)>,
+) -> bool {
+    let n = labels.n_points();
+    let h = mix(model.seed ^ mix(qi as u64));
+    let p = (h % n as u64) as u32;
+    let row = labels.row(p);
+    if row.is_empty() {
+        return false;
+    }
+    // The point's categories (contiguous in its sorted row: a category's label ids
+    // are contiguous); each kept with probability ½ (one at random if none), its
+    // clause one of the point's labels in it (probability `singleton`) or a random
+    // non-empty subset of them (each kept with probability ½).
+    cats.clear();
+    let mut z = mix(h);
+    let mut any = false;
+    let mut a = 0;
+    while a < row.len() {
+        let cat = labels.category(row[a]);
+        let mut b = a + 1;
+        while b < row.len() && labels.category(row[b]) == cat {
+            b += 1;
+        }
+        z = mix(z);
+        let keep = z & 1 == 1;
+        any |= keep;
+        cats.push((a, b, keep));
+        a = b;
+    }
+    if !any {
+        z = mix(z);
+        let f = (z % cats.len() as u64) as usize;
+        cats[f].2 = true;
+    }
+    kl.clear();
+    clauses.clear();
+    for &(a, b, keep) in cats.iter() {
+        if !keep {
+            continue;
+        }
+        // The clause's source: the point's labels in the category, or (probability
+        // `fresh`) those of another point drawn uniformly, if it has some.
+        let mut src = &row[a..b];
+        if model.fresh > 0.0 {
+            z = mix(z);
+            if ((z >> 11) as f64 / (1u64 << 53) as f64) < model.fresh {
+                z = mix(z);
+                let other = labels.row((z % n as u64) as u32);
+                let r = labels.category_labels(labels.category(row[a]));
+                let (x0, x1) = (
+                    other.partition_point(|&l| l < r.start),
+                    other.partition_point(|&l| l < r.end),
+                );
+                if x0 < x1 {
+                    src = &other[x0..x1];
+                }
+            }
+        }
+        let start = kl.len();
+        z = mix(z);
+        let u = (z >> 11) as f64 / (1u64 << 53) as f64;
+        if u < model.singleton {
+            z = mix(z);
+            kl.push(src[(z % src.len() as u64) as usize]);
+        } else {
+            for (x, &l) in src.iter().enumerate() {
+                if x % 64 == 0 {
+                    z = mix(z);
+                }
+                if (z >> (x % 64)) & 1 == 1 {
+                    kl.push(l);
+                }
+            }
+            if kl.len() == start {
+                z = mix(z);
+                kl.push(src[(z % src.len() as u64) as usize]);
+            }
+        }
+        clauses.push((start, kl.len()));
+    }
+    true
+}
+
 impl QuerySample {
     /// Draws the queries and computes their cost terms (with up to `threads` threads; the
     /// result does not depend on the thread count).
@@ -317,65 +414,9 @@ impl QuerySample {
             let mut base = Vec::new();
             let mut recs = Vec::new();
             for qi in ci * chunk..((ci + 1) * chunk).min(model.n_queries) {
-                let h = mix(model.seed ^ mix(qi as u64));
-                let p = (h % n as u64) as u32;
-                let row = labels.row(p);
-                if row.is_empty() {
+                if !draw_query(labels, &model, qi, kl, clauses, cats) {
                     base.push(0.0);
                     continue;
-                }
-                // The point's categories (contiguous in its sorted row: a category's label ids
-                // are contiguous); each kept with probability ½ (one at random if none), its
-                // clause one of the point's labels in it (probability `singleton`) or a random
-                // non-empty subset of them (each kept with probability ½).
-                cats.clear();
-                let mut z = mix(h);
-                let mut any = false;
-                let mut a = 0;
-                while a < row.len() {
-                    let cat = labels.category(row[a]);
-                    let mut b = a + 1;
-                    while b < row.len() && labels.category(row[b]) == cat {
-                        b += 1;
-                    }
-                    z = mix(z);
-                    let keep = z & 1 == 1;
-                    any |= keep;
-                    cats.push((a, b, keep));
-                    a = b;
-                }
-                if !any {
-                    z = mix(z);
-                    let f = (z % cats.len() as u64) as usize;
-                    cats[f].2 = true;
-                }
-                kl.clear();
-                clauses.clear();
-                for &(a, b, keep) in cats.iter() {
-                    if !keep {
-                        continue;
-                    }
-                    let start = kl.len();
-                    z = mix(z);
-                    let u = (z >> 11) as f64 / (1u64 << 53) as f64;
-                    if u < model.singleton {
-                        z = mix(z);
-                        kl.push(row[a + (z % (b - a) as u64) as usize]);
-                    } else {
-                        for (x, &l) in row[a..b].iter().enumerate() {
-                            if x % 64 == 0 {
-                                z = mix(z);
-                            }
-                            if (z >> (x % 64)) & 1 == 1 {
-                                kl.push(l);
-                            }
-                        }
-                        if kl.len() == start {
-                            z = mix(z);
-                            kl.push(row[a + (z % (b - a) as u64) as usize]);
-                        }
-                    }
-                    clauses.push((start, kl.len()));
                 }
                 let (kl, clauses): (&Vec<u32>, &Vec<(usize, usize)>) = (kl, clauses);
                 let size = |&(a, b): &(usize, usize)| -> u64 {
@@ -470,84 +511,21 @@ impl QuerySample {
         r: usize,
         keep: impl Fn(u32) -> bool,
     ) -> (Vec<u32>, Vec<QueryGain>) {
-        let nq = self.base_ns.len().max(1) as f64;
-        let mut cur = self.base_ns.clone();
-        // Candidate ranges of `recs`.
-        let mut cands: Vec<(u32, usize, usize)> = Vec::new();
-        let mut i = 0;
-        while i < self.recs.len() {
-            let l = self.recs[i].0;
-            let mut j = i;
-            while j < self.recs.len() && self.recs[j].0 == l {
-                j += 1;
-            }
-            if keep(l) {
-                cands.push((l, i, j));
-            }
-            i = j;
-        }
-        let gain = |cur: &[f64], a: usize, b: usize| -> f64 {
-            self.recs[a..b]
-                .iter()
-                .map(|&(_, q, isl)| (cur[q as usize] - f64::from(isl)).max(0.0))
-                .sum()
-        };
-        let mut terms: Vec<QueryGain> = cands
-            .iter()
-            .map(|&(l, a, b)| {
-                let s = labels.posting_len(l);
-                QueryGain {
-                    label: l,
-                    size: s,
-                    queries: (b - a) as u32,
-                    alone_ns: gain(&cur, a, b) / nq,
-                    marginal_ns: 0.0,
-                    bytes: island_bytes(s, r),
-                    order: None,
-                }
-            })
-            .collect();
-        // Lazy greedy on saving per byte (savings only shrink as islands are taken).
-        let mut heap: std::collections::BinaryHeap<(OrdF64, std::cmp::Reverse<u32>, usize)> = terms
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.alone_ns > 0.0)
-            .map(|(x, t)| {
-                (
-                    OrdF64(t.alone_ns / t.bytes as f64),
-                    std::cmp::Reverse(t.label),
-                    x,
-                )
-            })
-            .collect();
+        let mut gr = IslandGreedy::new(self, labels, r, keep);
         let mut used = 0u64;
-        let mut order = 0u32;
         let mut out = Vec::new();
-        while let Some((OrdF64(key), lab, x)) = heap.pop() {
-            let (_, a, b) = cands[x];
-            let g = gain(&cur, a, b) / nq;
-            let now = g / terms[x].bytes as f64;
-            if now < key * (1.0 - 1e-12) {
-                if g > 0.0 {
-                    heap.push((OrdF64(now), lab, x));
-                }
+        while let Some((_, x)) = gr.peek() {
+            let bytes = gr.terms[x].bytes;
+            if used + bytes > budget_bytes {
+                gr.skip(x);
                 continue;
             }
-            if g <= 0.0 || used + terms[x].bytes > budget_bytes {
-                continue;
-            }
-            used += terms[x].bytes;
-            terms[x].marginal_ns = g;
-            terms[x].order = Some(order);
-            order += 1;
-            out.push(terms[x].label);
-            for &(_, q, isl) in &self.recs[a..b] {
-                let c = &mut cur[q as usize];
-                *c = c.min(f64::from(isl));
-            }
+            used += bytes;
+            gr.take(x);
+            out.push(gr.terms[x].label);
         }
         out.sort_unstable();
-        (out, terms)
+        (out, gr.terms)
     }
 
     /// Expected cost per query (ns) without islands.
@@ -571,6 +549,146 @@ impl PartialOrd for OrdF64 {
 impl Ord for OrdF64 {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
         self.0.total_cmp(&o.0)
+    }
+}
+
+/// Step-wise lazy greedy over the island candidates of a [`QuerySample`]: candidates by
+/// expected saving per query per byte given the islands already taken (a query keeps its
+/// cheapest route; savings only shrink as islands are taken, so a candidate is re-evaluated
+/// only when it reaches the top). Used by [`QuerySample::select`] and by the unified selector
+/// ([`crate::select`]).
+pub struct IslandGreedy<'s> {
+    sample: &'s QuerySample,
+    nq: f64,
+    cur: Vec<f64>,
+    /// Candidate label and its range of the sample's records.
+    cands: Vec<(u32, usize, usize)>,
+    /// Every candidate's terms (`marginal_ns`, `order` set when taken).
+    pub terms: Vec<QueryGain>,
+    heap: std::collections::BinaryHeap<(OrdF64, std::cmp::Reverse<u32>, usize)>,
+    taken: u32,
+}
+
+impl<'s> IslandGreedy<'s> {
+    /// Candidates: the labels with island records accepted by `keep`, islands of degree bound `r`.
+    pub fn new(
+        sample: &'s QuerySample,
+        labels: &LabelStore,
+        r: usize,
+        keep: impl Fn(u32) -> bool,
+    ) -> Self {
+        let recs = &sample.recs;
+        let mut cands: Vec<(u32, usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < recs.len() {
+            let l = recs[i].0;
+            let mut j = i;
+            while j < recs.len() && recs[j].0 == l {
+                j += 1;
+            }
+            if keep(l) {
+                cands.push((l, i, j));
+            }
+            i = j;
+        }
+        let mut g = Self {
+            sample,
+            nq: sample.base_ns.len().max(1) as f64,
+            cur: sample.base_ns.clone(),
+            cands,
+            terms: Vec::new(),
+            heap: std::collections::BinaryHeap::new(),
+            taken: 0,
+        };
+        g.terms = (0..g.cands.len())
+            .map(|x| {
+                let (l, a, b) = g.cands[x];
+                let s = labels.posting_len(l);
+                QueryGain {
+                    label: l,
+                    size: s,
+                    queries: (b - a) as u32,
+                    alone_ns: g.gain(x),
+                    marginal_ns: 0.0,
+                    bytes: island_bytes(s, r),
+                    order: None,
+                }
+            })
+            .collect();
+        g.heap = g
+            .terms
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.alone_ns > 0.0)
+            .map(|(x, t)| {
+                (
+                    OrdF64(t.alone_ns / t.bytes as f64),
+                    std::cmp::Reverse(t.label),
+                    x,
+                )
+            })
+            .collect();
+        g
+    }
+
+    /// Expected saving per query (ns) of candidate `x` given the islands taken.
+    fn gain(&self, x: usize) -> f64 {
+        let (_, a, b) = self.cands[x];
+        self.sample.recs[a..b]
+            .iter()
+            .map(|&(_, q, isl)| (self.cur[q as usize] - f64::from(isl)).max(0.0))
+            .sum::<f64>()
+            / self.nq
+    }
+
+    /// The best remaining candidate (its current saving per query per byte and its index),
+    /// re-evaluated; candidates whose saving fell to 0 are dropped.
+    pub fn peek(&mut self) -> Option<(f64, usize)> {
+        loop {
+            let &(OrdF64(key), lab, x) = self.heap.peek()?;
+            let g = self.gain(x);
+            let now = g / self.terms[x].bytes as f64;
+            if now < key * (1.0 - 1e-12) {
+                self.heap.pop();
+                if g > 0.0 {
+                    self.heap.push((OrdF64(now), lab, x));
+                }
+                continue;
+            }
+            if g <= 0.0 {
+                self.heap.pop();
+                continue;
+            }
+            return Some((now, x));
+        }
+    }
+
+    /// Takes candidate `x` (the one [`Self::peek`] returned): its island serves the queries it
+    /// makes cheaper. Returns its marginal saving per query (ns).
+    pub fn take(&mut self, x: usize) -> f64 {
+        let top = self.heap.pop().map(|e| e.2);
+        debug_assert_eq!(top, Some(x), "take the peeked candidate");
+        let g = self.gain(x);
+        self.terms[x].marginal_ns = g;
+        self.terms[x].order = Some(self.taken);
+        self.taken += 1;
+        let (_, a, b) = self.cands[x];
+        for &(_, q, isl) in &self.sample.recs[a..b] {
+            let c = &mut self.cur[q as usize];
+            *c = c.min(f64::from(isl));
+        }
+        g
+    }
+
+    /// Drops candidate `x` (the one [`Self::peek`] returned) without taking it.
+    pub fn skip(&mut self, x: usize) {
+        let top = self.heap.pop().map(|e| e.2);
+        debug_assert_eq!(top, Some(x), "skip the peeked candidate");
+    }
+
+    /// Expected cost per query (ns) with the islands taken.
+    pub fn mean_cost_ns(&self) -> f64 {
+        self.cur.iter().sum::<f64>() / self.nq
     }
 }
 
@@ -1091,6 +1209,7 @@ mod tests {
             seed: 7,
             cap: 512,
             singleton: 0.5,
+            fresh: 0.0,
         };
         let one = QuerySample::build(&s, &c, 10, model, 1);
         let three = QuerySample::build(&s, &c, 10, model, 3);

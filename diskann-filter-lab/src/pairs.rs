@@ -160,7 +160,8 @@ pub struct PairIndex {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PairStats {
     pub budget_bytes: u64,
-    pub prior: Prior,
+    /// The ranking of a budgeted build (`None`: an explicit selection, [`PairIndex::build_selected`]).
+    pub prior: Option<Prior>,
     pub t_big: u64,
     pub n_big: usize,
     pub big_entries: u64,
@@ -543,7 +544,7 @@ impl PairIndex {
         };
         let stats_of = |ix: &Self, k: usize, cooc_pairs: u64| PairStats {
             budget_bytes: budgets[k],
-            prior,
+            prior: Some(prior),
             t_big: ix.t_big,
             n_big: ix.n_big,
             big_entries: sizes.iter().filter(|&&s| s >= ix.t_big).sum(),
@@ -570,6 +571,140 @@ impl PairIndex {
             (last, st)
         }));
         out
+    }
+
+    /// Combination postings of an explicit selection (the unified selector, [`crate::select`]):
+    /// the big labels `big_labels` (increasing ids, each of at least `t` points), the
+    /// co-occurrence matrix of their pairs in different categories (pairs of one category are
+    /// marked co-occurring, so a lookup answers [`Joint::Unknown`] for them, never
+    /// [`Joint::Empty`]) and the joint postings of the `selected` pairs (big labels in different
+    /// categories). One pass over the big labels' postings, rows in parallel (the result does not
+    /// depend on the thread count). `budget_bytes` and `ratio` (the selection's cut) are recorded
+    /// in the statistics.
+    pub fn build_selected(
+        labels: &LabelStore,
+        t: u64,
+        big_labels: &[u32],
+        selected: &[(u32, u32)],
+        budget_bytes: u64,
+        ratio: f64,
+        threads: usize,
+    ) -> Result<(Self, PairStats)> {
+        ensure!(
+            big_labels.windows(2).all(|w| w[0] < w[1]),
+            "big labels must increase"
+        );
+        let nl = labels.n_labels();
+        let mut big = vec![NONE; nl];
+        for (i, &l) in big_labels.iter().enumerate() {
+            ensure!(
+                (l as usize) < nl && labels.posting_len(l) as u64 >= t,
+                "label {l} is not a label of at least {t} points"
+            );
+            big[l as usize] = i as u32;
+        }
+        let nb = big_labels.len();
+        let words = nb.div_ceil(64);
+        let mut by_row: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        for &(a, b) in selected {
+            let (x, y) = (big[a as usize], big[b as usize]);
+            ensure!(
+                x != NONE && y != NONE && labels.category(a) != labels.category(b),
+                "selected pair ({a}, {b}) is not two big labels of different categories"
+            );
+            let (r, c) = if x < y { (x, y) } else { (y, x) };
+            by_row[r as usize].push(c);
+        }
+        for v in &mut by_row {
+            v.sort_unstable();
+            v.dedup();
+        }
+        let rows = parallel::par_map(
+            nb,
+            threads,
+            || vec![NONE; nb],
+            |r, slot| {
+                let a = big_labels[r];
+                let cat = labels.category(a);
+                let mut bits = vec![0u64; words];
+                for c in r + 1..nb {
+                    if labels.category(big_labels[c]) != cat {
+                        break;
+                    }
+                    bits[c / 64] |= 1u64 << (c % 64);
+                }
+                let partners = &by_row[r];
+                for (x, &c) in partners.iter().enumerate() {
+                    slot[c as usize] = x as u32;
+                }
+                let mut lists: Vec<Vec<u32>> = vec![Vec::new(); partners.len()];
+                let end = labels.category_labels(cat).end;
+                for &p in labels.postings(a) {
+                    let row = labels.row(p);
+                    for &l in &row[row.partition_point(|&x| x < end)..] {
+                        let c = big[l as usize];
+                        if c != NONE {
+                            bits[c as usize / 64] |= 1u64 << (c % 64);
+                            let x = slot[c as usize];
+                            if x != NONE {
+                                lists[x as usize].push(p);
+                            }
+                        }
+                    }
+                }
+                for &c in partners {
+                    slot[c as usize] = NONE;
+                }
+                (bits, lists)
+            },
+        );
+        let mut cooc = vec![0u64; nb * words];
+        let mut row_offsets = Vec::with_capacity(nb + 1);
+        row_offsets.push(0u64);
+        let (mut partners, mut list_offsets, mut points) = (Vec::new(), vec![0u64], Vec::new());
+        let mut cooc_pairs = 0u64;
+        for (r, (bits, lists)) in rows.into_iter().enumerate() {
+            cooc_pairs += bits.iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
+            cooc[r * words..(r + 1) * words].copy_from_slice(&bits);
+            for (&c, list) in by_row[r].iter().zip(lists) {
+                partners.push(c);
+                points.extend_from_slice(&list);
+                list_offsets.push(points.len() as u64);
+            }
+            row_offsets.push(partners.len() as u64);
+        }
+        let ix = Self {
+            n_points: labels.n_points(),
+            dict_hash: labels.dict_hash(),
+            t_big: t,
+            ratio,
+            big,
+            n_big: nb,
+            words,
+            cooc,
+            row_offsets,
+            partners,
+            list_offsets,
+            points,
+        };
+        let stats = PairStats {
+            budget_bytes,
+            prior: None,
+            t_big: t,
+            n_big: nb,
+            big_entries: big_labels
+                .iter()
+                .map(|&l| labels.posting_len(l) as u64)
+                .sum(),
+            cooc_pairs,
+            stored_pairs: ix.partners.len() as u64,
+            stored_entries: ix.points.len() as u64,
+            ratio,
+            matrix_bytes: (nb * words * 8) as u64,
+            bytes: ix.bytes(),
+            postings_bytes: 4 * labels.n_entries() as u64,
+        };
+        Ok((ix, stats))
     }
 
     /// The index of an earlier step of a chain built at this index's `T` (see
