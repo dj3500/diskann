@@ -47,8 +47,9 @@
 //! a member as the query point, and label pairs by joint size), each at the time its class's
 //! Pareto frontier reaches the reference recall `R` (interpolated between classes in log size);
 //! a route whose class never reaches `R` costs [`UNREACHABLE_NS`], so a label the router cannot
-//! serve gets a must-have tree. A base-derived query is priced by the member curves (the tree at
-//! `K·s/M` members), an independent single label by the independent ones, a pair context by the
+//! serve gets a must-have tree. A base-derived query is priced by the member curves (the router
+//! of a conjunction by the member-placed pair curves `Q` where measured, by its match count; the
+//! tree at `K·s/M` members), an independent single label by the independent ones, a pair context by the
 //! pair curves at its joint size (the router, and the tree of its smaller label) and a pair tree
 //! by the independent tree curve at its joint size on its pair context, by the member curves on
 //! base-derived queries.
@@ -174,8 +175,9 @@ pub struct CurveClass {
 
 /// Track G's two routes measured per label-size class on calibration queries (B2i): `U` a single
 /// label with an independent query point, `D` a single label with a member as the query point,
-/// `P` a cross-category label pair (classes by joint size) with an independent query point; the
-/// router alone on the base graph, the tree route on a tree per sampled label.
+/// `P` a cross-category label pair (classes by joint size) with an independent query point, `Q`
+/// the same pairs with a member of the joint as the query point; the router alone on the base
+/// graph, the tree route on a tree per sampled label (for a pair, its smaller label's).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct RouteCurves {
     #[serde(rename = "U")]
@@ -184,6 +186,8 @@ pub struct RouteCurves {
     pub d: Vec<CurveClass>,
     #[serde(rename = "P", default)]
     pub p: Vec<CurveClass>,
+    #[serde(rename = "Q", default)]
+    pub q: Vec<CurveClass>,
 }
 
 /// Which route of a [`CurveClass`].
@@ -289,9 +293,14 @@ impl Pricing<'_> {
         RouteCurves::price(classes, route, k, size, self.tm.recall).unwrap_or(UNREACHABLE_NS)
     }
 
-    /// A base-derived (data-like) query with `m` matches: the router.
-    pub fn router_derived(&self, m: f64) -> f64 {
+    /// A base-derived (data-like) query with `m` matches: the router — for a conjunction
+    /// (`multi`: more than one clause) by the member-placed pair curves where measured, else by
+    /// the single labels'.
+    pub fn router_derived(&self, m: f64, multi: bool) -> f64 {
         match self.curves {
+            Some(cv) if multi && !cv.q.is_empty() => {
+                self.priced(&cv.q, Route::Router, self.tm.k, m)
+            }
             Some(cv) => self.priced(&cv.d, Route::Router, self.tm.k, m),
             None => self.tm.router_ns(self.c, m, self.n),
         }
@@ -481,7 +490,7 @@ impl TreeSample {
                         continue;
                     }
                     let (jmin, _, m) = query_matches(labels, &model, kl, clauses);
-                    base.push(pr.router_derived(m));
+                    base.push(pr.router_derived(m, clauses.len() > 1));
                     let (a, b) = clauses[jmin];
                     let mut nonempty = kl[a..b].iter().filter(|&&l| labels.posting_len(l) > 0);
                     if let (Some(&l), None) = (nonempty.next(), nonempty.next()) {
@@ -717,7 +726,8 @@ impl<'s> TreeGreedy<'s> {
                             f[l] / 2.0 * beta * sigma
                         } else {
                             let sf = s as f64;
-                            f[l] / 2.0 * (pr.router_derived(sf) - pr.tree_derived(sf, sf, false))
+                            f[l] / 2.0
+                                * (pr.router_derived(sf, false) - pr.tree_derived(sf, sf, false))
                         };
                         Some(wd * per_query)
                     })
@@ -890,7 +900,7 @@ pub fn pair_tree_values(
                     // the router fails); counting from the router would count a query a label
                     // tree makes answerable twice.
                     let s = labels.posting_len(p.a).min(labels.posting_len(p.b));
-                    let mut alt = pr.router_derived(j);
+                    let mut alt = pr.router_derived(j, true);
                     if s < pr.n {
                         alt = alt.min(pr.tree_derived(s as f64, j, true));
                     }
@@ -1241,6 +1251,8 @@ mod tests {
             u: classes.clone(),
             d: classes.clone(),
             p: classes,
+            // Conjunctions placed at a member: the router never reaches 0.96.
+            q: vec![class(5_000.0, 0.5)],
         };
         let pr = Pricing {
             tm,
@@ -1250,6 +1262,10 @@ mod tests {
         };
         assert_eq!(pr.router_label(200.0), UNREACHABLE_NS);
         assert_eq!(pr.router_label(5_000.0), 1_000.0);
+        // A base-derived conjunction is priced by the member-placed pair curves, a single label by
+        // the member curves.
+        assert_eq!(pr.router_derived(5_000.0, false), 1_000.0);
+        assert_eq!(pr.router_derived(5_000.0, true), UNREACHABLE_NS);
         assert!((pr.tree_label(200.0) - 50.0).abs() < 1e-9);
         // A diluted clause: K' = K·s/m between 10 and 100 members, then ∝ K' up to the whole tree.
         assert!((pr.tree_derived(2_000.0, 2_000.0, false) - 50.0).abs() < 1e-9);
@@ -1339,6 +1355,7 @@ mod tests {
             u: classes(50.0),
             d: classes(50.0),
             p: classes(500.0),
+            q: Vec::new(),
         };
         let pr = Pricing {
             tm,
