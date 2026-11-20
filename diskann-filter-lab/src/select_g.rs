@@ -50,7 +50,8 @@
 //! serve gets a must-have tree. A base-derived query is priced by the member curves (the tree at
 //! `K·s/M` members), an independent single label by the independent ones, a pair context by the
 //! pair curves at its joint size (the router, and the tree of its smaller label) and a pair tree
-//! by the independent tree curve at its joint size.
+//! by the independent tree curve at its joint size on its pair context, by the member curves on
+//! base-derived queries.
 //!
 //! **Bytes**: a tree over `s` members has `⌈(s − 1)/(b̄ − 1)⌉` routers (at least one), each a
 //! graph row, a vector and a kind byte (`router_bytes`); a pair tree adds its pair's list and
@@ -359,6 +360,15 @@ impl Pricing<'_> {
         match self.curves {
             Some(cv) => self.priced(&cv.u, Route::Tree, self.tm.k, j),
             None => self.tm.tree_ns(self.c, j, j, false),
+        }
+    }
+
+    /// A base-derived query `{a} ∧ {b}` (a member of the joint as the query point) on the pair
+    /// tree of joint `j` (the member curves; without curves, [`Self::pair_tree`]).
+    pub fn pair_tree_derived(&self, j: f64) -> f64 {
+        match self.curves {
+            Some(cv) => self.priced(&cv.d, Route::Tree, self.tm.k, j),
+            None => self.pair_tree(j),
         }
     }
 }
@@ -848,8 +858,15 @@ impl LabelKind for TreeGreedy<'_> {
     }
 }
 
-/// The pair-tree terms of the candidate pairs with a positive saving, by decreasing value (the
-/// selector's pair kind; see the module documentation).
+/// The pair-tree terms of the candidate pairs with a positive saving on their pair context, by
+/// decreasing value (the selector's pair kind; see the module documentation).
+///
+/// A pair tree saves `saving_ns` on its pair context (an independent query point: router vs pair
+/// tree on the pair curves) but, with calibrated routes, a different amount `s_D` on a
+/// base-derived query `{a} ∧ {b}`, whose point is a member of the joint (router vs pair tree on
+/// the member curves; negative where the router serves members faster). The selector values the
+/// base-derived part as `prob · saving_ns`, so `prob` here is the base-derived probability
+/// ([`context_prob`]) scaled by `s_D / saving_ns` (unscaled without curves: one saving).
 pub fn pair_tree_values(
     pr: &Pricing,
     model: &QueryModel,
@@ -864,7 +881,13 @@ pub fn pair_tree_values(
             if !saving_ns.is_finite() || saving_ns <= 0.0 {
                 return None;
             }
-            let prob = context_prob(model, f, &p);
+            let prob = match pr.curves {
+                Some(_) => {
+                    let s_d = pr.router_derived(j) - pr.pair_tree_derived(j);
+                    context_prob(model, f, &p) * s_d / saving_ns
+                }
+                None => context_prob(model, f, &p),
+            };
             let bytes = pair_bytes(p.joint) + pr.tm.tree_bytes(p.joint as usize);
             Some(PairValue {
                 cand: p,
@@ -1263,5 +1286,64 @@ mod tests {
             (t.saving_ns - t.derived_ns - want).abs() <= 1e-6 * want,
             "{t:?} {want}"
         );
+    }
+
+    #[test]
+    fn a_pair_tree_saves_on_member_queries_what_the_member_curves_say() {
+        let s = store();
+        let c = costs();
+        let tm = TreeModel {
+            k: 10,
+            recall: 0.96,
+            frontier: 4096.0,
+            curve: false,
+            fanout: 26.0,
+            router_bytes: 400,
+        };
+        let class = |size: f64, router: f64, ns: f64| CurveClass {
+            size,
+            router: [
+                ("10".to_string(), vec![[router, ns]]),
+                ("100".to_string(), vec![[router, ns]]),
+            ]
+            .into_iter()
+            .collect(),
+            tree: [
+                ("10".to_string(), vec![[1.0, 50.0]]),
+                ("100".to_string(), vec![[1.0, 50.0]]),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        // Independently placed pairs: the router never reaches 0.96; member queries: 100 ns.
+        let cv = RouteCurves {
+            u: vec![class(1.0, 0.5, 1_000.0), class(1e6, 0.5, 1_000.0)],
+            d: vec![class(1.0, 1.0, 100.0), class(1e6, 1.0, 100.0)],
+            p: vec![class(1.0, 0.5, 1_000.0), class(1e6, 0.5, 1_000.0)],
+        };
+        let pr = Pricing {
+            tm,
+            c: &c,
+            curves: Some(&cv),
+            n: s.n_points(),
+        };
+        let (counts, f) = select::label_weights(&s, 0.5, 2);
+        let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
+        let model = QueryModel {
+            n_queries: 1_000,
+            seed: 3,
+            uniform: 0.5,
+            contexts: contexts.len() as u64,
+            ..QueryModel::default()
+        };
+        let values = pair_tree_values(&pr, &model, &f, &contexts);
+        assert!(!values.is_empty());
+        for v in &values {
+            // On its context the pair tree makes the query answerable; on a member query it saves
+            // 100 − 50 ns, so its base-derived part is P_D · 50 ns, not P_D · 10⁹.
+            assert!((v.saving_ns - (UNREACHABLE_NS - 50.0)).abs() < 1e-6);
+            let p_d = context_prob(&model, &f, &v.cand);
+            assert!((v.prob * v.saving_ns - p_d * 50.0).abs() <= 1e-9 * p_d * 50.0);
+        }
     }
 }
