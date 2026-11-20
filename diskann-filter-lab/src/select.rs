@@ -9,28 +9,28 @@
 //! one memory budget, with the unit costs of the cost model. Categories are read as the label
 //! store's groups only; no query log is read.
 //!
-//! **Workload.** A fixed mixture of two components ([`QueryModel`]), the same for every kind of
-//! candidate: with weight `1 − μ`, **data-like** queries (`D`), the base-derived queries of the
+//! **Workload** ([`crate::workload`]; one definition for every kind of candidate). A fixed
+//! mixture: with weight `1 − μ`, **data-like** queries (`D`), the base-derived queries of the
 //! islands' `queries` selection — a data point drawn uniformly, each of its categories kept with
 //! probability ½, a kept category's clause one of the point's labels in it (probability
 //! `singleton`) or a random subset of them (optionally, with probability `fresh`, drawn from
-//! another data point), the query vector that point's: queries that look like the data; with
-//! weight `μ`, **independent** queries (`U`) — with probability ½ a label drawn uniformly among
-//! the `L` labels that occur, as the query `{ℓ}`, otherwise a pair of labels of different
-//! categories drawn uniformly among the `N` pairs that co-occur, as the query `{a} ∧ {b}` —
-//! with a query vector drawn uniformly among the data points, independently of the labels: any
-//! label or pair, from anywhere. (`μ = ½` hedges between the two and is not tuned; `μ = 0` is
-//! the base-derived workload alone.) An island serves a query through a single-label clause; a
-//! pair `(a, b)` through two single-label clauses `{a} ∧ {b}` in different categories (the
-//! `pair` plan's exact cover).
+//! another data point), the query vector that point's; with weight `μ`, **independent** queries
+//! (`U`) — conjunctions of `k` single-label clauses of distinct categories, `k` uniform in
+//! `1..=min(3, C)`, drawn by a uniform walk on the label co-occurrence structure (the first label
+//! uniformly within a uniformly drawn category, each next one uniformly among the distinct
+//! labels of unused categories that co-occur with all labels drawn so far), with a query vector
+//! drawn independently of the labels. (`μ = ½` hedges between "queries look like the data" and
+//! "any label combination, from anywhere" and is not tuned; `μ = 0` is the base-derived workload
+//! alone.) An island serves a query through a single-label clause; a pair `(a, b)` through two
+//! single-label clauses `{a}`, `{b}` in different categories (the `pair` plan's exact cover).
 //!
 //! **Islands** are valued on a sample of this workload ([`QuerySample::build_mixed`]:
-//! `n_queries` base-derived queries, weight `(1 − μ)/n_queries` each, and `U`'s support
-//! exhaustively — every pair context, weight `μ/2 / N`, and every single label, weight
-//! `μ/2 / L` — so `U` enters in expectation, without sampling noise; per query the cost of its
-//! best route without auxiliary structures and of the island of each single-label clause). The
-//! costs do not depend on the query vector; [`crate::islands::draw_independent`] draws `U`'s
-//! queries i.i.d. with their vectors (seeded), for measurements on concrete queries.
+//! `n_queries` base-derived queries, weight `(1 − μ)/n_queries` each, and `U` as weighted
+//! queries — its one- and two-label parts exactly, its three-label part as `n_queries` walks;
+//! [`crate::workload::independent`]; per query the cost of its best route without auxiliary
+//! structures and of the island of each single-label clause). The costs do not depend on the
+//! query vector; [`crate::workload::Walk::draw`] draws `U` i.i.d. with its vectors (seeded),
+//! for measurements on concrete queries.
 //!
 //! **Pairs** are too many, and each drawn too rarely, for a sample of base-derived queries (a
 //! pair whose joint posting holds `j` points is drawn with probability ∝ `j/n`), so their value
@@ -54,8 +54,10 @@
 //!
 //! (the scan of the smaller clause or the post-filter route `base` at rate `M/n`, against the
 //! joint posting read with a residual clause checked), at `4·(j + 3)` bytes; on `U` a pair is
-//! valued on its own pair context of the sample, against that query's current cost (which a
-//! taken island or pair lowers: one cost per query, shared by the kinds). Only pairs that
+//! valued on every sample query holding both its labels (two or three labels:
+//! [`pair_plan_ns`] — its list read with the other clauses checked, the matches' distances),
+//! against that query's current cost, which a taken island or pair lowers (one cost per query,
+//! shared by the kinds; of several stored pairs the cheapest counts). Only pairs that
 //! co-occur are candidates (a query of the workload has a match), of labels of at least
 //! [`pairs::T_MIN`] points. On `D`, a pair is valued against the routes without auxiliary
 //! structures (not modelled: a base-derived query served by both kinds).
@@ -101,11 +103,19 @@ pub trait LabelKind {
     fn bytes(&self, x: usize) -> u64;
     /// Label of candidate `x`.
     fn label(&self, x: usize) -> u32;
-    /// The sample query of the pair context `{a} ∧ {b}` (`None` without pair contexts). A pair
-    /// item's saving on its context is then shared with this kind: valued against the
-    /// context's current cost ([`Self::query_cost`]) and, when the pair is taken, lowering it
-    /// ([`Self::serve`]), so that the two kinds do not both count one query's saving.
-    fn context_query(&self, _a: u32, _b: u32) -> Option<usize> {
+    /// The workload's independent queries `U` this kind's sample holds, and the sample index
+    /// of the first (`None` without them; [`crate::workload::Independent`], the same for every
+    /// kind). A pair item serves the queries holding both its labels
+    /// ([`crate::workload::Independent::pair_queries`]): its saving there is shared with this
+    /// kind — valued against each query's current cost ([`Self::query_cost`]) and, when the
+    /// pair is taken, lowering it ([`Self::serve`]) — so that no query's saving counts twice.
+    fn independent(&self) -> Option<(&crate::workload::Independent, usize)> {
+        None
+    }
+    /// Cost (ns) of sample query `q` when the pair `(a, b)` (`joint` points) is stored and
+    /// serves it (`None`: it does not). The kernel takes, of several stored pairs, the one with
+    /// the fewest points: [`Self::serve`] keeps the cheapest.
+    fn pair_cost(&self, _q: usize, _a: u32, _b: u32, _joint: u32) -> Option<f64> {
         None
     }
     /// Current cost (ns) of sample query `q` with the items taken.
@@ -141,8 +151,11 @@ impl LabelKind for IslandGreedy<'_> {
         self.terms[x].label
     }
 
-    fn context_query(&self, a: u32, b: u32) -> Option<usize> {
-        IslandGreedy::context_query(self, a, b)
+    fn independent(&self) -> Option<(&crate::workload::Independent, usize)> {
+        IslandGreedy::independent(self)
+    }
+    fn pair_cost(&self, q: usize, _a: u32, _b: u32, joint: u32) -> Option<f64> {
+        IslandGreedy::pair_cost(self, q, joint)
     }
 
     fn query_cost(&self, q: usize) -> f64 {
@@ -189,6 +202,15 @@ pub struct PairCand {
 /// Bytes of a stored pair (its list and its directory entry).
 pub fn pair_bytes(joint: u32) -> u64 {
     4 * (u64::from(joint) + 3)
+}
+
+/// Cost (ns) of the `pair` plan on a query served by a stored pair of `joint` points (on `n`
+/// points) with `m` matches: the pair's list read with the query's other clauses checked
+/// (`gallop_cold + j·pred(j/n)`), the matches' distances (`m·dist(m/n)`).
+pub fn pair_plan_ns(c: &UnitCosts, n: usize, joint: u32, m: f64) -> f64 {
+    let nf = n as f64;
+    let j = f64::from(joint);
+    c.gallop_cold() + j * c.pred(j / nf) + m * c.dist(m / nf)
 }
 
 /// Fixed bytes of the combination postings with `nb` big labels on a store of `nl` labels:
@@ -403,16 +425,14 @@ pub struct PairValue {
 
 /// Probability per query of the context `{a} ∧ {b}` of a candidate pair among the base-derived
 /// part of the workload (`(1 − μ)·P_ab`, `P_ab` of the module documentation; `μ =
-/// model.uniform` when the workload has independent queries). The pair-context part (`μ/2 / N`)
-/// is valued on the sample's context query, shared with the per-label kind (see
-/// [`LabelKind`]).
+/// model.uniform`). The independent queries' part is valued on the sample's queries holding the
+/// pair, shared with the per-label kind (see [`LabelKind`]).
 pub fn context_prob(model: &QueryModel, f: &[f64], p: &PairCand) -> f64 {
     let fr = model.fresh;
     let (own, other) = ((1.0 - fr) * (1.0 - fr), 1.0 - (1.0 - fr) * (1.0 - fr));
     let derived = 0.25 * (own * p.g + other * f[p.a as usize] * f[p.b as usize]);
-    let (wd, _, _) = model.shares();
-    if wd < 1.0 {
-        wd * derived
+    if model.uniform > 0.0 {
+        (1.0 - model.uniform) * derived
     } else {
         derived
     }
@@ -436,7 +456,7 @@ pub fn pair_values(
             let m = f64::from(p.joint);
             let exact = s * c.pred(s / nf) + m * c.dist(m / nf);
             let base = crate::islands::postfilter_nominal(c, k, k, m / nf, n, 1).1;
-            let pair = c.gallop_cold() + m * (c.pred(m / nf) + c.dist(m / nf));
+            let pair = pair_plan_ns(c, n, p.joint, m);
             let saving_ns = exact.min(base) - pair;
             if !saving_ns.is_finite() || saving_ns <= 0.0 {
                 return None;
@@ -585,27 +605,35 @@ fn run<G: LabelKind>(
         Stop::Budget => params.floor,
         Stop::Elasticity => t / b,
     };
-    // A pair's marginal saving per query: its base-derived part (`prob · saving`) plus, on its
-    // pair context (if the per-label kind holds it), the context's weight times how much the
-    // pair plan lowers the context's current cost (`cost`: the pair plan's cost there).
-    let terms: Vec<(Option<usize>, f64, f64, f64)> = values
-        .iter()
-        .map(|v| {
-            let fixed = v.prob * v.saving_ns;
-            match gr.context_query(v.cand.a, v.cand.b) {
-                Some(q) => (
-                    Some(q),
-                    gr.query_weight(q),
-                    gr.query_cost(q) - v.saving_ns,
-                    fixed,
-                ),
-                None => (None, 0.0, 0.0, fixed),
+    // A pair's marginal saving per query: its base-derived part (`prob · saving`) plus, on each
+    // independent query holding both its labels (if the per-label kind holds them), the query's
+    // weight times how much the pair plan lowers the query's current cost (`cost`: the pair
+    // plan's cost there).
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(values.len());
+    let mut served: Vec<(usize, f64, f64)> = Vec::new();
+    {
+        let ind = gr.independent();
+        for v in values {
+            let start = served.len();
+            if let Some((u, first)) = ind {
+                for i in u.pair_queries(v.cand.a, v.cand.b) {
+                    let q = first + i;
+                    if let Some(cost) = gr.pair_cost(q, v.cand.a, v.cand.b, v.cand.joint) {
+                        served.push((q, gr.query_weight(q), cost));
+                    }
+                }
             }
-        })
-        .collect();
+            ranges.push((start, served.len()));
+        }
+    }
     let pair_gain = |gr: &G, i: usize| -> f64 {
-        let (q, w, cost, fixed) = terms[i];
-        fixed + q.map_or(0.0, |q| w * (gr.query_cost(q) - cost).max(0.0))
+        let v = &values[i];
+        let (a, b) = ranges[i];
+        v.prob * v.saving_ns
+            + served[a..b]
+                .iter()
+                .map(|&(q, w, cost)| w * (gr.query_cost(q) - cost).max(0.0))
+                .sum::<f64>()
     };
     // The eligible pairs by value (ties: in the order of `values`), re-evaluated lazily: a
     // value only falls as items are taken.
@@ -688,7 +716,8 @@ fn run<G: LabelKind>(
                 t_cur -= g;
                 b_cur += v.bytes as f64;
                 cut = key;
-                if let (Some(q), _, cost, _) = terms[i] {
+                let (a, b) = ranges[i];
+                for &(q, _, cost) in &served[a..b] {
                     gr.serve(q, cost);
                 }
             }
@@ -1023,12 +1052,11 @@ mod tests {
     }
 
     #[test]
-    fn the_mixed_workload_holds_every_pair_context_with_its_weight() {
+    fn the_mixed_workload_weights_the_independent_queries_by_their_probability() {
         let s = store();
         let c = UnitCosts::default();
         let (counts, f) = label_weights(&s, 0.5, 2);
         let contexts = pair_contexts(&s, &counts, 0.5, 2);
-        let n_ctx = contexts.len();
         let derived = QueryModel {
             n_queries: 3_000,
             seed: 9,
@@ -1037,138 +1065,141 @@ mod tests {
         };
         let mixed = QueryModel {
             uniform: 0.5,
-            contexts: n_ctx as u64,
+            contexts: contexts.len() as u64,
             ..derived
         };
-        assert_eq!(mixed.n_pair_queries(), n_ctx);
+        let u = std::sync::Arc::new(crate::workload::independent(&s, &contexts, &mixed, 3));
+        assert_eq!(
+            u.queries,
+            crate::workload::independent(&s, &contexts, &mixed, 1).queries
+        );
         let one = QuerySample::build(&s, &c, 10, derived, 2);
-        let two = QuerySample::build_mixed(&s, &c, 10, mixed, &contexts, 3);
-        assert_eq!(two.base_ns.len(), 3_000 + n_ctx);
-        // The base-derived part is the base-derived sample; each pair context is `{a} ∧ {b}`
-        // with `M = j`, priced like the pairs' closed form, weighted μ / N.
+        let two = QuerySample::build_mixed(&s, &c, 10, mixed, Some(u.clone()), 3);
+        assert_eq!(two.base_ns.len(), 3_000 + u.len());
+        // The base-derived part is the base-derived sample; an independent query of labels L is
+        // priced like a base-derived one with those single-label clauses and its `M`, weighted
+        // μ times its probability.
         assert_eq!(&two.base_ns[..3_000], &one.base_ns[..]);
         let nf = s.n_points() as f64;
-        for (i, p) in contexts.iter().enumerate() {
-            let q = two.context_query(p.a, p.b).expect("a context query");
-            assert_eq!(q, 3_000 + i);
-            let sz = s.posting_len(p.a).min(s.posting_len(p.b)) as f64;
-            let m = f64::from(p.joint);
-            let exact = sz * c.pred(sz / nf) + m * c.dist(m / nf);
+        for (i, w) in u.queries.iter().enumerate().step_by(7) {
+            let q = 3_000 + i;
+            let sz = w.labels.iter().map(|&l| s.posting_len(l)).min().unwrap() as f64;
+            let m = w.joint;
+            let checks = if w.labels.len() > 1 {
+                sz * c.pred(sz / nf)
+            } else {
+                0.0
+            };
+            let exact = checks + m * c.dist(m / nf);
             let base = islands::postfilter_nominal(&c, 10, 10, m / nf, s.n_points(), 1).1;
             assert!((two.base_ns[q] - exact.min(base)).abs() <= 1e-9 * exact.min(base));
-            assert!((two.weight(q) - 0.5 / n_ctx as f64).abs() < 1e-18);
+            assert!((two.weight(q) - 0.5 * w.weight).abs() < 1e-18);
         }
         assert!((two.weight(0) - 0.5 / 3_000.0).abs() < 1e-18);
-        let mean_ctx = two.base_ns[3_000..].iter().sum::<f64>() / n_ctx as f64;
-        assert!((two.mean_base_ns() - 0.5 * (one.mean_base_ns() + mean_ctx)).abs() < 1e-6);
+        let total: f64 = (0..two.base_ns.len()).map(|q| two.weight(q)).sum();
+        assert!((total - 1.0).abs() < 1e-9);
+        let mean_u: f64 = u
+            .queries
+            .iter()
+            .enumerate()
+            .map(|(i, w)| w.weight * two.base_ns[3_000 + i])
+            .sum();
+        assert!((two.mean_base_ns() - 0.5 * (one.mean_base_ns() + mean_u)).abs() < 1e-6);
         // Context probabilities: the base-derived part only, (1 − μ) of it.
         for p in contexts.iter().take(20) {
             let want = 0.5 * context_prob(&derived, &f, p);
             assert!((context_prob(&mixed, &f, p) - want).abs() < 1e-18);
         }
         // A thread count does not change the sample.
-        let three = QuerySample::build_mixed(&s, &c, 10, mixed, &contexts, 1);
+        let three = QuerySample::build_mixed(&s, &c, 10, mixed, Some(u), 1);
         assert_eq!(two.base_ns, three.base_ns);
     }
 
     #[test]
-    fn the_independent_queries_are_single_labels_and_pair_contexts_from_anywhere() {
+    fn the_independent_queries_are_a_walk_on_the_co_occurrence_structure() {
         let s = store();
-        let c = UnitCosts::default();
-        let (counts, f) = label_weights(&s, 0.5, 2);
+        let (counts, _) = label_weights(&s, 0.5, 2);
         let contexts = pair_contexts(&s, &counts, 0.5, 2);
-        let singles = islands::single_label_support(&s);
-        let (n_ctx, n_one) = (contexts.len(), singles.len());
-        assert_eq!(n_one, s.n_labels());
-        let pairs_only = QueryModel {
-            n_queries: 2_000,
+        let model = QueryModel {
+            n_queries: 20_000,
             seed: 5,
             cap: 512,
             uniform: 0.5,
-            contexts: n_ctx as u64,
+            contexts: contexts.len() as u64,
             ..Default::default()
         };
-        let model = QueryModel {
-            single_labels: n_one as u64,
-            ..pairs_only
-        };
-        assert_eq!(model.shares(), (0.5, 0.25, 0.25));
-        let v1 = QuerySample::build_mixed(&s, &c, 10, pairs_only, &contexts, 2);
-        let v2 = QuerySample::build_mixed(&s, &c, 10, model, &contexts, 3);
-        assert_eq!(v2.base_ns.len(), 2_000 + n_ctx + n_one);
-        assert_eq!(v2.n_independent(), (n_ctx, n_one));
-        // The base-derived queries and the pair contexts are those of the pairs-only workload;
-        // each single label is `{ℓ}` with `M = |P_ℓ|` (no check), weighted μ/2 / L.
-        assert_eq!(&v2.base_ns[..2_000 + n_ctx], &v1.base_ns[..]);
-        let nf = s.n_points() as f64;
-        for (i, &l) in singles.iter().enumerate() {
-            let q = v2.single_query(l).expect("a single-label query");
-            assert_eq!(q, 2_000 + n_ctx + i);
-            assert_eq!(v2.part(q), islands::Part::Single);
-            let m = s.posting_len(l) as f64;
-            let exact = m * c.dist(m / nf);
-            let base = islands::postfilter_nominal(&c, 10, 10, m / nf, s.n_points(), 1).1;
-            assert!((v2.base_ns[q] - exact.min(base)).abs() <= 1e-9 * exact.min(base));
-            assert!((v2.weight(q) - 0.25 / n_one as f64).abs() < 1e-18);
-        }
-        let q_ctx = v2.context_query(contexts[0].a, contexts[0].b).unwrap();
-        assert_eq!(v2.part(q_ctx), islands::Part::Pair);
-        assert!((v2.weight(q_ctx) - 0.25 / n_ctx as f64).abs() < 1e-18);
-        let total: f64 = (0..v2.base_ns.len()).map(|q| v2.weight(q)).sum();
+        let u = crate::workload::independent(&s, &contexts, &model, 2);
+        let walk = crate::workload::Walk::new(&s, &contexts);
+        assert_eq!(u.k_max, 3);
+        assert_eq!(
+            (u.n_single, u.n_pair, u.n_walk),
+            (s.n_labels(), contexts.len(), 20_000)
+        );
+        let total: f64 = u.queries.iter().map(|q| q.weight).sum();
         assert!((total - 1.0).abs() < 1e-9);
-        let (md, mp, ms) = v2.part_means(&v2.base_ns);
-        assert!((v2.mean_base_ns() - (0.5 * md + 0.25 * mp + 0.25 * ms)).abs() < 1e-6);
-        // The pairs' base-derived part does not depend on how `U` is split.
-        for p in contexts.iter().take(20) {
-            assert_eq!(
-                context_prob(&model, &f, p),
-                context_prob(&pairs_only, &f, p)
-            );
+        // Every query: labels sorted, of distinct categories, carried together by some point;
+        // the pair index finds it under each of its pairs.
+        for (i, q) in u.queries.iter().enumerate() {
+            assert!(q.labels.windows(2).all(|w| w[0] < w[1]));
+            let mut cats: Vec<u32> = q.labels.iter().map(|&l| s.category(l)).collect();
+            cats.dedup();
+            assert_eq!(cats.len(), q.labels.len());
+            let (p0, rest) = q.labels.split_first().unwrap();
+            assert!(s
+                .postings(*p0)
+                .iter()
+                .any(|&p| rest.iter().all(|l| s.row(p).binary_search(l).is_ok())));
+            for (x, &a) in q.labels.iter().enumerate() {
+                for &b in &q.labels[x + 1..] {
+                    assert!(u.pair_queries(a, b).any(|j| j == i));
+                }
+            }
         }
-        // Single labels serve islands: some label's island is cheaper on its own query.
-        let gr = IslandGreedy::new(&v2, &s, 32, |_| true);
-        assert!(gr.terms.iter().any(|t| t.alone_ns > 0.0));
+        // The one- and two-label parts are exact: their weights equal the walk's frequencies
+        // (i.i.d. draws; the three-label part holds a third of the mass, every walk of three
+        // labels completes on this store).
+        let draws = 300_000;
+        let mut freq = std::collections::HashMap::<Vec<u32>, f64>::new();
+        let mut n_three = 0usize;
+        for i in 0..draws {
+            let d = walk.draw(&model, i).unwrap();
+            let l: Vec<u32> = d.clauses.iter().map(|c| c[0]).collect();
+            if l.len() == 3 {
+                n_three += 1;
+            } else {
+                *freq.entry(l).or_default() += 1.0 / draws as f64;
+            }
+        }
+        assert!((n_three as f64 / draws as f64 - 1.0 / 3.0).abs() < 0.01);
+        let mut tv = 0.0;
+        for q in &u.queries[..u.n_single + u.n_pair] {
+            tv += (freq.get(&q.labels).copied().unwrap_or(0.0) - q.weight).abs();
+        }
+        assert!(tv < 0.03, "total variation {tv}");
         // Vectors: a base-derived query searches from its own point (which matches it); an
         // independent one from a point drawn independently of its labels.
         for i in 0..200 {
-            let d = islands::draw_data(&s, &model, i).expect("a labelled point");
-            assert_eq!(d.point, v2.point(i));
+            let d = crate::workload::draw_data(&s, &model, i).expect("a labelled point");
             let row = s.row(d.point);
             assert!(d
                 .clauses
                 .iter()
                 .all(|cl| cl.iter().any(|l| row.binary_search(l).is_ok())));
         }
-        let (mut n_single, mut n_match) = (0, 0);
-        let draws = 4_000;
-        for i in 0..draws {
-            let u = islands::draw_independent(&s, &model, &contexts, &singles, i).unwrap();
-            match u.part {
-                islands::Part::Single => {
-                    n_single += 1;
-                    assert_eq!(u.clauses.len(), 1);
-                    assert!(singles.binary_search(&u.clauses[0][0]).is_ok());
-                }
-                islands::Part::Pair => {
-                    let (a, b) = (u.clauses[0][0], u.clauses[1][0]);
-                    assert!(contexts.iter().any(|p| (p.a, p.b) == (a, b)));
-                }
-                islands::Part::Data => unreachable!(),
-            }
-            let row = s.row(u.point);
-            n_match += u
-                .clauses
-                .iter()
-                .all(|cl| cl.iter().any(|l| row.binary_search(l).is_ok()))
-                as usize;
-        }
-        // Half single labels; the points match their predicates only at the labels' rates.
-        assert!((n_single as f64 / draws as f64 - 0.5).abs() < 0.05);
-        assert!((n_match as f64) < 0.5 * draws as f64);
-        assert_eq!(
-            islands::draw_independent(&s, &model, &contexts, &singles, 7),
-            islands::draw_independent(&s, &model, &contexts, &singles, 7)
+        let n_match = (0..4_000)
+            .filter(|&i| {
+                let d = walk.draw(&model, i).unwrap();
+                let row = s.row(d.point);
+                d.clauses
+                    .iter()
+                    .all(|cl| cl.iter().any(|l| row.binary_search(l).is_ok()))
+            })
+            .count();
+        assert!(
+            n_match < 2_000,
+            "{n_match} of 4000 points match their predicates"
         );
+        assert_eq!(walk.draw(&model, 7), walk.draw(&model, 7));
     }
 
     #[test]
@@ -1185,7 +1216,8 @@ mod tests {
             contexts: contexts.len() as u64,
             ..Default::default()
         };
-        let sample = QuerySample::build_mixed(&s, &c, 10, model, &contexts, 2);
+        let u = crate::workload::independent(&s, &contexts, &model, 2);
+        let sample = QuerySample::build_mixed(&s, &c, 10, model, Some(std::sync::Arc::new(u)), 2);
         let cands: Vec<PairCand> = contexts
             .iter()
             .filter(|p| is_candidate_label(&s, p.a) && is_candidate_label(&s, p.b))
@@ -1235,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn pairs_and_islands_share_a_pair_context_s_saving() {
+    fn pairs_and_islands_share_an_independent_query_s_saving() {
         let s = store();
         let c = UnitCosts::default();
         let (counts, f) = label_weights(&s, 0.5, 2);
@@ -1248,7 +1280,8 @@ mod tests {
             contexts: contexts.len() as u64,
             ..Default::default()
         };
-        let sample = QuerySample::build_mixed(&s, &c, 10, model, &contexts, 2);
+        let u = std::sync::Arc::new(crate::workload::independent(&s, &contexts, &model, 2));
+        let sample = QuerySample::build_mixed(&s, &c, 10, model, Some(u.clone()), 2);
         let cands: Vec<PairCand> = contexts
             .iter()
             .filter(|p| is_candidate_label(&s, p.a) && is_candidate_label(&s, p.b))
@@ -1270,17 +1303,25 @@ mod tests {
         let best = &sel.best;
         assert!(!best.islands.is_empty() && !best.pairs.is_empty());
         // A lower bound on the cost with everything built: every query at its cheapest island,
-        // every pair context at its pair plan if cheaper; the pairs' base-derived savings are
-        // counted apart (not shared). The selection's model cost is not below it: no saving
-        // is counted twice on a pair context.
+        // every independent query holding a taken pair at that pair's plan if cheaper; the
+        // pairs' base-derived savings are counted apart (not shared). The selection's model
+        // cost is not below it: no saving is counted twice on a query.
         let mut floor = sample.island_floor_ns();
         let mut derived = 0.0;
+        let mut served = 0;
         for &i in &best.pairs {
             let v = &values[i];
             derived += v.prob * v.saving_ns;
-            let q = sample.context_query(v.cand.a, v.cand.b).expect("a context");
-            floor[q] = floor[q].min(sample.base_ns[q] - v.saving_ns);
+            for j in u.pair_queries(v.cand.a, v.cand.b) {
+                let q = sample.n_data + j;
+                let cost = sample
+                    .pair_cost(q, v.cand.joint)
+                    .expect("an independent query");
+                floor[q] = floor[q].min(cost);
+                served += usize::from(u.queries[j].labels.len() == 3);
+            }
         }
+        assert!(served > 0, "a taken pair serves some three-label query");
         let bound = sample.weighted_mean(&floor) - derived;
         assert!(best.t_ns >= bound - 1e-6 * mean, "{} < {bound}", best.t_ns);
         assert!(best.t_ns > 0.0);
