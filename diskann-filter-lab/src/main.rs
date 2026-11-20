@@ -584,6 +584,9 @@ struct SelectArgs {
     /// is a must-have) or `at-max` (its time at the highest measured level).
     #[arg(long, value_enum, default_value = "must")]
     unreachable: SelectUnreachable,
+    /// `--track graph`: also select pair trees (`false`: router trees per label only).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pair_trees: bool,
     /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
     #[arg(long, default_value_t = 26.0)]
     tree_fanout: f64,
@@ -2295,6 +2298,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         .copied()
         .collect();
     let values = match &pricing {
+        Some(_) if !a.pair_trees => Vec::new(),
         Some(pr) => diskann_filter_lab::select_g::pair_tree_values(pr, &store, &model, &f, &cands),
         None => select::pair_values(&store, &costs, a.k, &model, &f, &cands),
     };
@@ -2450,6 +2454,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "tree_model": tree_model,
         "route_curves": a.route_curves,
         "unreachable": if a.unreachable == SelectUnreachable::AtMax { "at-max" } else { "must" },
+        "pair_trees": a.pair_trees,
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
