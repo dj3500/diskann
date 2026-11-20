@@ -21,6 +21,11 @@
 //!   of the subgraph its members induce (the member nearest to the component's centroid);
 //!   with several such components, a b-ary tree of routers over these entries whose root
 //!   becomes a start of the label. The label's previous starts are kept.
+//! - `pairs`: a tree (as `tree`) over the joint members of every selected stored pair of a
+//!   combination-postings file (`--pairs`; a pseudo-label for the conjunction of two labels),
+//!   appended to the base graph (typically a graph that already has label trees); the label
+//!   starts are kept and the roots go to `pair_roots.flab` (one per directory slot of the
+//!   pairs file, `u32::MAX` without a tree), the starts of the kernel's `tree_pairs` route.
 //!
 //! Router vectors: the centroid of the router's data-point descendants (`centroid`), or the
 //! descendant nearest to that centroid (`medoid`: a member's vector, as for a router that would
@@ -33,14 +38,64 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 
 use crate::{
+    container,
     diag::{row_f32, rp_leaves, scc},
     graph::{AuxKind, AuxNodes, Graph},
     labels::LabelStore,
+    pairs::PairIndex,
     parallel::par_map,
     run::data::{dataset_dtype, load_graph},
     starts::Starts,
     vectors::{DType, Element, Matrix},
 };
+
+/// Magic of `pair_roots.flab` (the roots of the pair trees by directory slot).
+pub const PAIR_ROOTS_MAGIC: &[u8; 8] = b"FLABPRT\0";
+const PAIR_ROOTS_VERSION: u32 = 1;
+
+/// Writes `pair_roots.flab`: params `[n_pairs, n_entries, dict_hash, n_points]` of the pairs
+/// file, then the root of every directory slot (`u32::MAX`: no tree).
+pub fn write_pair_roots(path: &std::path::Path, px: &PairIndex, roots: &[u32]) -> Result<()> {
+    ensure!(roots.len() == px.n_pairs(), "one root per stored pair");
+    let params = [
+        px.n_pairs() as u64,
+        px.n_entries() as u64,
+        px.dict_hash(),
+        px.n_points() as u64,
+        0,
+        0,
+        0,
+        0,
+    ];
+    container::write(
+        container::create(path)?,
+        PAIR_ROOTS_MAGIC,
+        PAIR_ROOTS_VERSION,
+        &params,
+        &[bytemuck::cast_slice(roots)],
+    )
+    .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Reads `pair_roots.flab` and checks that it belongs to the pairs file `px`.
+pub fn read_pair_roots(path: &std::path::Path, px: &PairIndex) -> Result<Vec<u32>> {
+    let mut r = container::Reader::open(path, PAIR_ROOTS_MAGIC)
+        .with_context(|| format!("loading pair roots from {}", path.display()))?;
+    ensure!(
+        r.version() == PAIR_ROOTS_VERSION,
+        "unsupported pair roots version"
+    );
+    let [n_pairs, n_entries, dict_hash, n_points, ..] = *r.params();
+    ensure!(
+        n_pairs as usize == px.n_pairs()
+            && n_entries as usize == px.n_entries()
+            && dict_hash == px.dict_hash()
+            && n_points as usize == px.n_points(),
+        "{} was built for another combination-postings file",
+        path.display()
+    );
+    r.section(0, px.n_pairs())
+}
 
 /// Construction of `flab steiner`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -49,6 +104,8 @@ pub enum Construction {
     Tree,
     /// Per-label routers over one entry per source component of the induced subgraph.
     Connector,
+    /// Trees over the joint members of the stored pairs of a combination-postings file.
+    Pairs,
 }
 
 /// How a `tree` partitions a label's members.
@@ -86,6 +143,9 @@ pub struct SteinerArgs {
     /// Construction.
     #[arg(long, value_enum, default_value = "tree")]
     pub construction: Construction,
+    /// `pairs`: the combination-postings file (`flab pairs build`) whose stored pairs get trees.
+    #[arg(long)]
+    pub pairs: Option<PathBuf>,
     /// Fan-out `b` of the routers (leaf chunks of `b` members).
     #[arg(long, default_value_t = 32)]
     pub block: usize,
@@ -415,7 +475,7 @@ fn label_routers<T: Element>(
     local: &mut [u32],
 ) -> (Vec<(Vec<Child>, RouterVec)>, Vec<u32>) {
     match construction {
-        Construction::Tree => match kmeans {
+        Construction::Tree | Construction::Pairs => match kmeans {
             Some((iters, sample, seed)) if members.len() > b => {
                 let d = base.ncols();
                 let mut vecs = vec![0f32; members.len() * d];
@@ -478,6 +538,8 @@ struct Assembled {
     graph: Graph,
     /// (label, start) pairs, deduplicated in order.
     pairs: Vec<(u32, u32)>,
+    /// `pairs`: the root of every directory slot's tree (`u32::MAX`: none).
+    pair_roots: Vec<u32>,
     labels_with_routers: usize,
     routers: usize,
     router_edges: u64,
@@ -497,6 +559,7 @@ fn assemble<T: Element>(
     construction: Construction,
     keep_starts: bool,
     b: usize,
+    n_slots: usize,
 ) -> Result<Assembled> {
     let n = g0.n_data();
     let n0 = g0.n_nodes();
@@ -530,6 +593,7 @@ fn assemble<T: Element>(
     let mut next = n0 as u32;
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let mut with_routers = vec![false; n_labels];
+    let mut pair_roots = vec![u32::MAX; n_slots];
     let mut router_edges = 0u64;
     let mut nbr: Vec<u32> = Vec::new();
     let base_starts = |l: u32| -> &[u32] {
@@ -571,6 +635,11 @@ fn assemble<T: Element>(
                 }
                 pairs.extend(lr.point_starts.iter().map(|&s| (l, s)));
             }
+            Construction::Pairs => {
+                if let Some(r) = root {
+                    pair_roots[l as usize] = r;
+                }
+            }
         }
     }
     ensure!(next as usize == n + n_aux, "router count mismatch");
@@ -584,6 +653,7 @@ fn assemble<T: Element>(
     Ok(Assembled {
         graph: g,
         pairs,
+        pair_roots,
         labels_with_routers: with_routers.iter().filter(|&&x| x).count(),
         routers: n_routers,
         router_edges,
@@ -611,15 +681,35 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
     }
     let b = args.block.max(2);
     let max_size = parse_size(&args.max_size, n)?;
-    let selected: Vec<u32> = (0..labels.n_labels() as u32)
-        .filter(|&l| {
-            let s = labels.posting_len(l);
+    let px = match (args.construction, &args.pairs) {
+        (Construction::Pairs, Some(p)) => {
+            let px = PairIndex::read(p)?;
+            ensure!(
+                px.dict_hash() == labels.dict_hash() && px.n_points() == n,
+                "the combination postings belong to another label store"
+            );
+            Some(px)
+        }
+        (Construction::Pairs, None) => anyhow::bail!("--construction pairs needs --pairs"),
+        _ => None,
+    };
+    // Labels, or for `pairs` the directory slots of the stored pairs.
+    let size_of = |x: u32| match &px {
+        Some(px) => px.slot_list(x as usize).len(),
+        None => labels.posting_len(x),
+    };
+    let n_items = px.as_ref().map_or(labels.n_labels(), PairIndex::n_pairs);
+    let selected: Vec<u32> = (0..n_items as u32)
+        .filter(|&x| {
+            let s = size_of(x);
             s > args.min_size && s <= max_size
         })
         .collect();
     let d = base.ncols();
     let mut leaf = vec![0u32; n];
-    if args.construction == Construction::Tree && args.partition == Partition::Order {
+    if matches!(args.construction, Construction::Tree | Construction::Pairs)
+        && args.partition == Partition::Order
+    {
         let all: Vec<u32> = (0..n as u32).collect();
         rp_leaves(&base, &all, args.order_block, args.seed, &mut leaf);
     }
@@ -635,11 +725,15 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
                 args.kmeans_sample,
                 args.seed ^ u64::from(l),
             ));
+            let members = match &px {
+                Some(px) => px.slot_list(l as usize),
+                None => labels.postings(l),
+            };
             let (routers, point_starts) = label_routers(
                 args.construction,
                 g0,
                 &base,
-                labels.postings(l),
+                members,
                 &leaf,
                 b,
                 args.router,
@@ -664,11 +758,15 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         args.construction,
         args.keep_starts,
         b,
+        if px.is_some() { n_items } else { 0 },
     )?;
     let mut starts = Starts::new(&a.graph);
     starts.set_label_starts(&labels, &a.pairs)?;
     a.graph.write(&args.out_dir.join("graph.flab"))?;
     starts.write(&args.out_dir.join("starts.flab"))?;
+    if let Some(px) = &px {
+        write_pair_roots(&args.out_dir.join("pair_roots.flab"), px, &a.pair_roots)?;
+    }
     let elem = std::mem::size_of::<T>();
     let r_max = a.graph.r_max();
     let (n_aux, router_edges) = (a.routers, a.router_edges);
@@ -683,6 +781,7 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         "order_block": args.order_block, "seed": args.seed, "threads": args.threads,
         "n_data": n, "base_aux": g0.n_aux(), "r_max": r_max,
         "labels_selected": selected.len(),
+        "pairs": args.pairs, "pairs_with_trees": a.pair_roots.iter().filter(|&&r| r != u32::MAX).count(),
         "labels_with_routers": a.labels_with_routers,
         "routers": n_aux, "router_edges": router_edges,
         "label_start_entries": a.pairs.len(),
@@ -940,6 +1039,7 @@ mod tests {
             construction,
             keep_starts,
             2,
+            0,
         )
         .unwrap();
         // The base graph's rows are unchanged and none of its nodes links to a router.
@@ -972,6 +1072,59 @@ mod tests {
         let (_, _, kept) = augment(Construction::Tree, true);
         assert_eq!(starts_of(&kept, id("a=1"))[1..], [3]);
         assert_eq!(a.graph.starts(), &[12]);
+    }
+
+    #[test]
+    fn pair_trees_reach_exactly_their_joint_members_and_keep_the_label_starts() {
+        let (base, g0, labels, st0) = toy();
+        let leaf: Vec<u32> = (0..12).collect();
+        let (mut row, mut local) = (vec![0f32; 1], vec![u32::MAX; 12]);
+        // Two pseudo-labels (directory slots 0 and 1 of a pairs file with 3 stored pairs).
+        let joints: [(u32, Vec<u32>); 2] = [(0, vec![0, 3, 6]), (2, vec![9, 11])];
+        let per_slot: Vec<LabelRouters> = joints
+            .iter()
+            .map(|(slot, members)| {
+                let (routers, point_starts) = label_routers(
+                    Construction::Pairs,
+                    &g0,
+                    &base,
+                    members,
+                    &leaf,
+                    2,
+                    RouterVector::Centroid,
+                    None,
+                    &mut row,
+                    &mut local,
+                );
+                LabelRouters {
+                    label: *slot,
+                    routers,
+                    point_starts,
+                }
+            })
+            .collect();
+        let a = assemble(
+            &g0,
+            &base,
+            labels.n_labels(),
+            &st0,
+            &per_slot,
+            Construction::Pairs,
+            false,
+            2,
+            3,
+        )
+        .unwrap();
+        assert_eq!(a.pair_roots[1], u32::MAX);
+        for (slot, members) in &joints {
+            let r = a.pair_roots[*slot as usize];
+            assert!(r >= 13);
+            assert_eq!(&reached(&a.graph, r).0, members);
+        }
+        // The label starts stay the base table's.
+        for l in 0..labels.n_labels() as u32 {
+            assert_eq!(starts_of(&a, l), st0.label_starts(l));
+        }
     }
 
     #[test]

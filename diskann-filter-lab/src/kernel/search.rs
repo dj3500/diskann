@@ -41,7 +41,7 @@ use crate::{
     bitsets::LabelBitsets,
     graph::{Graph, NodeVectors},
     labels::LabelStore,
-    pairs::{Cover, PairIndex},
+    pairs::{Cover, PairIndex, TreeCover},
     predicate::Cnf,
     sketches::LabelSketches,
     starts::Starts,
@@ -86,6 +86,9 @@ pub struct Index<'a, T> {
     pub sketches: Option<&'a LabelSketches>,
     /// Combination postings of `labels` (the exact path's `pair` plan).
     pub pairs: Option<&'a PairIndex>,
+    /// Roots of the pair trees by directory slot of `pairs` (`u32::MAX`: no tree; the
+    /// `tree_pairs` route).
+    pub pair_roots: Option<&'a [u32]>,
 }
 
 /// One query: its vector, predicate and, with a label view, the view's predicate.
@@ -374,6 +377,12 @@ pub struct Plan {
     /// `tree_route = "cost"`: member children per router (sampled), the members a tree search
     /// checks per router it expands.
     tree_kappa: f64,
+    /// `tree_pairs`: the pair-tree route's plans (one, or one per member check under
+    /// `tree_route = "cost"`, in `tree_checks`' order).
+    tree_pair: Vec<Plan>,
+    /// The plan is a pair-tree route's: its checks skip the covered clause pair
+    /// (`Searcher::pair_skip`).
+    pair_members: bool,
 }
 
 impl Plan {
@@ -468,7 +477,7 @@ impl Plan {
                     ix.sample.is_some(),
                     "the start source `{s}` needs a start table with a sample"
                 ),
-                StartSource::Aux => {}
+                StartSource::Aux | StartSource::Extra => {}
             }
         }
         if kernel.scorer.needs_pilot() {
@@ -555,6 +564,22 @@ impl Plan {
             .into_iter()
             .map(|k| tree_plan(k, ix))
             .collect::<Result<_>>()?;
+        let tree_pair: Vec<Plan> = kernel
+            .pair_kernels()
+            .into_iter()
+            .map(|k| {
+                tree_plan(k, ix).map(|mut p| {
+                    p.pair_members = true;
+                    p
+                })
+            })
+            .collect::<Result<_>>()?;
+        if kernel.tree_pairs {
+            ensure!(
+                ix.pairs.is_some() && ix.pair_roots.is_some(),
+                "tree_pairs needs combination postings (pairs_sidecar) and their tree roots (pair_roots)"
+            );
+        }
         let tree_kappa = if kernel.tree_route == TreeRoute::Cost {
             ensure!(
                 costs.is_some() && ix.bitsets.is_some(),
@@ -585,6 +610,8 @@ impl Plan {
                 .transpose()?,
             tree_checks,
             tree_kappa,
+            tree_pair,
+            pair_members: false,
             tree_fanout: if kernel.tree_choice == TreeChoice::Cost {
                 let (n, a) = (ix.graph.n_data() as u32, ix.graph.n_aux() as u32);
                 let edges: usize = (n..n + a).map(|v| ix.graph.degree(v)).sum();
@@ -606,6 +633,7 @@ impl Plan {
                 || self.kernel.exact_plans.contains(ExactPlan::RowAnd)))
             || self.tree.as_ref().is_some_and(|t| t.needs_dense())
             || self.tree_checks.iter().any(Plan::needs_dense)
+            || self.tree_pair.iter().any(Plan::needs_dense)
     }
 
     /// The same plan without its hand-specialized fast path (every query runs the
@@ -764,6 +792,10 @@ pub struct Searcher {
     /// Start nodes appended to the configured starts of every graph search (untimed
     /// diagnostics, e.g. oracle entries); empty in normal runs.
     pub extra_starts: Vec<u32>,
+    /// Clause positions a pair-tree route's members satisfy by construction (checks skip them).
+    pair_skip: u64,
+    /// Scratch of the pair-tree cover.
+    tree_cover: TreeCover,
 }
 
 impl Searcher {
@@ -804,6 +836,8 @@ impl Searcher {
             pbeam: PackedBeam::default(),
             trace: None,
             extra_starts: Vec::new(),
+            pair_skip: 0,
+            tree_cover: TreeCover::default(),
         }
     }
 
@@ -855,7 +889,14 @@ impl Searcher {
         assert_eq!(ids.len(), dists.len());
         let mut tree_candidate = false;
         if let Some(tp) = plan.tree.as_deref() {
-            if !self.tree_eligible(tp, ix, q) {
+            let eligible = self.tree_eligible(tp, ix, q);
+            if !plan.tree_pair.is_empty() {
+                if let Some(ctr) = self.pair_route(plan, ix, q, l, eligible, ids, dists, reference)
+                {
+                    return ctr;
+                }
+            }
+            if !eligible {
             } else if plan.kernel.tree_choice == TreeChoice::Cost {
                 tree_candidate = true;
             } else {
@@ -870,8 +911,10 @@ impl Searcher {
                         self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
                     }
                 };
-                let choice = (!plan.tree_checks.is_empty())
-                    .then(|| self.tree_check_choice(plan, ix, l_tree));
+                let choice = (!plan.tree_checks.is_empty()).then(|| {
+                    let u = self.compiled.min_upper_bound();
+                    self.tree_check_choice(plan, ix, l_tree, 1, u)
+                });
                 let tp = choice.map_or(tp, |(i, _)| &plan.tree_checks[i]);
                 let mut ctr = self.search(tp, ix, q, l_tree, ids, dists, reference);
                 if let Some((i, cost)) = choice {
@@ -909,6 +952,9 @@ impl Searcher {
         }
         if plan.cstar_members {
             self.compiled.residual_nav();
+        }
+        if plan.pair_members {
+            self.compiled.residual_nav_except(self.pair_skip);
         }
         let stat = (plan.eval == EvalMode::StaticBits).then(|| {
             let b = ix
@@ -1432,6 +1478,8 @@ impl Searcher {
         plan: &Plan,
         ix: &Index<'_, T>,
         l_tree: usize,
+        skip: u64,
+        members: u64,
     ) -> (usize, f64) {
         let (Some(c), Some(b)) = (plan.costs.as_ref(), ix.bitsets) else {
             return (0, 0.0);
@@ -1440,13 +1488,13 @@ impl Searcher {
         q.split_static(ix.labels, b, b.theta(), false);
         let n = ix.graph.n_data() as f64;
         let m = (plan.tree_kappa * l_tree as f64)
-            .min(q.min_upper_bound() as f64)
+            .min(members as f64)
             .max(1.0);
         let rho = m / n;
         let nc = q.n_clauses();
         let full = if nc >= 64 { u64::MAX } else { (1u64 << nc) - 1 };
         let row = c.member(&MemberWork::of_mask(q, false, full), rho);
-        let stat = c.member(&MemberWork::of_mask(q, true, full & !1), rho);
+        let stat = c.member(&MemberWork::of_mask(q, true, full & !skip), rho);
         let bit = c.member(
             &MemberWork {
                 words: 1.0,
@@ -1470,6 +1518,83 @@ impl Searcher {
             .min_by(|&x, &y| costs[x].total_cmp(&costs[y]))
             .unwrap_or(0);
         (i, costs[i])
+    }
+
+    /// `tree_pairs`: answers `q` (compiled by [`Self::tree_eligible`]) on the pair trees when
+    /// a clause pair of it is exactly covered by them ([`PairIndex::tree_cover`]) with fewer
+    /// members than c\* (or c\* is not tree-eligible): starts the covering pairs' roots, checks
+    /// the clauses outside the pair (`pair_skip`), the tree route's list size; `None` otherwise.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs of `search`"
+    )]
+    fn pair_route<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        eligible: bool,
+        ids: &mut [u32],
+        dists: &mut [f32],
+        reference: Option<u64>,
+    ) -> Option<Counters> {
+        let (Some(px), Some(roots)) = (ix.pairs, ix.pair_roots) else {
+            return None;
+        };
+        let cq = &self.compiled;
+        if cq.is_empty() || cq.n_clauses() < 2 {
+            return None;
+        }
+        let found = px.tree_cover(
+            cq.n_clauses(),
+            |j| cq.clause(j),
+            |l| ix.labels.posting_len(l),
+            |s| roots[s] != u32::MAX,
+            &mut self.tree_cover,
+        );
+        let tc = &self.tree_cover;
+        if !found || tc.j >= 64 || (eligible && tc.members >= cq.min_upper_bound()) {
+            return None;
+        }
+        let (skip, members, lookups) = ((1u64 << tc.i) | (1u64 << tc.j), tc.members, tc.lookups);
+        self.extra_starts.clear();
+        self.extra_starts.extend(tc.slots.iter().map(|&s| roots[s]));
+        let mut pc = Counters {
+            timing: plan.kernel.phase_times,
+            ..Counters::default()
+        };
+        let l_tree = match plan.kernel.tree_effort {
+            TreeEffort::List => l,
+            TreeEffort::Fixed(f) => f as usize,
+            TreeEffort::Curve | TreeEffort::Capped => {
+                self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
+            }
+        };
+        let (i, cost) = if plan.tree_pair.len() > 1 {
+            self.tree_check_choice(plan, ix, l_tree, skip, members)
+        } else {
+            (0, 0.0)
+        };
+        self.pair_skip = skip;
+        let mut ctr = self.search(&plan.tree_pair[i], ix, q, l_tree, ids, dists, reference);
+        self.pair_skip = 0;
+        self.extra_starts.clear();
+        ctr.n_probe += pc.n_probe;
+        ctr.t_probe_ns += pc.t_probe_ns;
+        ctr.route = Route::Tree;
+        // The pair-tree route (110; 111 row scan, 112 static bits, 113 bitmap under
+        // `tree_route = "cost"`), its directory lookups and members.
+        ctr.plan = 110
+            + if plan.tree_pair.len() > 1 {
+                1 + i as u64
+            } else {
+                0
+            };
+        ctr.est_graph_ns = cost.round() as u64;
+        ctr.n_pair_lookups = lookups;
+        ctr.a_hat = members;
+        Some(ctr)
     }
 
     /// `tree_choice = cost`: the tree route's list size when its model cost is below the cost
@@ -1801,7 +1926,7 @@ fn start_count<T: Element>(kernel: &Kernel, ix: &Index<'_, T>, q: &Compiled) -> 
                 .sum(),
             StartSource::Sample(k) => *k,
             StartSource::Aux => ix.graph.n_aux(),
-            StartSource::LabelSmallest => 0,
+            StartSource::LabelSmallest | StartSource::Extra => 0,
         };
     }
     n

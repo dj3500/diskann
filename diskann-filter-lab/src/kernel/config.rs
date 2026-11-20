@@ -39,6 +39,8 @@ pub enum StartSource {
     Sample(usize),
     /// Every auxiliary node.
     Aux,
+    /// None of its own: only the searcher's extra starts (the pair-tree route's roots).
+    Extra,
 }
 
 /// Whether starts obey the admission rule.
@@ -505,6 +507,10 @@ pub struct Kernel {
     /// router-tree search from c\*'s starts: `starts = "label(c*)"`, forced starts, only
     /// routers expanded), so checks cover the other clauses only (off by default).
     pub cstar_members: bool,
+    /// `tree_pairs = "on"`: a query whose clause pair is exactly covered by pair trees
+    /// (`flab steiner --construction pairs`; the run's `pairs_sidecar` and `pair_roots`) with
+    /// fewer members than c\* searches those trees (off by default).
+    pub tree_pairs: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -706,6 +712,7 @@ impl Default for Kernel {
             tree_effort: TreeEffort::List,
             tree_choice: TreeChoice::Always,
             cstar_members: false,
+            tree_pairs: false,
         }
     }
 }
@@ -750,7 +757,8 @@ impl StartSource {
             ("product", []) => Self::LabelAll,
             ("sample", [k]) => Self::Sample(num(k, "sample size")?),
             ("aux", []) => Self::Aux,
-            _ => bail!("unknown start source {s:?} (global, label(c*), label(all), product, sample(k), aux)"),
+            ("extra", []) => Self::Extra,
+            _ => bail!("unknown start source {s:?} (global, label(c*), label(all), product, sample(k), aux, extra)"),
         })
     }
 
@@ -768,6 +776,7 @@ impl fmt::Display for StartSource {
             Self::LabelAll => write!(f, "label(all)"),
             Self::Sample(k) => write!(f, "sample({k})"),
             Self::Aux => write!(f, "aux"),
+            Self::Extra => write!(f, "extra"),
         }
     }
 }
@@ -1269,6 +1278,13 @@ impl Kernel {
                     v => bail!("unknown cstar_members {v:?} (on, off)"),
                 }
             }
+            "tree_pairs" => {
+                self.tree_pairs = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown tree_pairs {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1453,6 +1469,11 @@ impl Kernel {
             "static_bitsets = \"off\" excludes tree_route = \"bitmap\", \"static_bits\" and \"cost\" (their member checks use the static bitsets)"
         );
         ensure!(
+            !self.tree_pairs
+                || (self.tree_route != TreeRoute::Off && self.tree_choice == TreeChoice::Always),
+            "tree_pairs = \"on\" needs the tree route with tree_choice = always"
+        );
+        ensure!(
             self.tree_route != TreeRoute::Cost
                 || (self.tree_choice == TreeChoice::Always && self.exact.is_planned()),
             "tree_route = \"cost\" needs tree_choice = always and a planned exact path (its unit costs)"
@@ -1576,6 +1597,9 @@ impl Kernel {
         if self.cstar_members {
             j["cstar_members"] = json!("on");
         }
+        if self.tree_pairs {
+            j["tree_pairs"] = json!("on");
+        }
         j
     }
 
@@ -1593,6 +1617,28 @@ impl Kernel {
                     ..self.clone()
                 }
                 .tree_kernel()
+            })
+            .collect()
+    }
+
+    /// The kernels of the pair-tree route (`tree_pairs`): the tree route's kernel (or, under
+    /// `tree_route = "cost"`, each of `tree_check_kernels`) started only at the searcher's
+    /// extra starts (the covering pairs' roots); their checks cover the clauses outside the
+    /// covered pair (set per query), not via `cstar_members`.
+    pub fn pair_kernels(&self) -> Vec<Kernel> {
+        if !self.tree_pairs {
+            return Vec::new();
+        }
+        let ks = if self.tree_route == TreeRoute::Cost {
+            self.tree_check_kernels()
+        } else {
+            self.tree_kernel().into_iter().collect()
+        };
+        ks.into_iter()
+            .map(|k| Kernel {
+                starts: vec![StartSource::Extra],
+                cstar_members: false,
+                ..k
             })
             .collect()
     }

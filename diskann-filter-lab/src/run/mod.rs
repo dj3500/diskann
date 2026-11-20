@@ -460,6 +460,16 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             .as_ref()
             .map_or(Value::Null, |p| pair_files[p].1.clone())
     };
+    // Roots of the pair trees per file (untimed sidecars; `tree_pairs`).
+    let mut pair_root_files: BTreeMap<PathBuf, Vec<u32>> = BTreeMap::new();
+    for c in &exp.configs {
+        if let (Some(path), Some(px)) = (&c.pair_roots, &c.pairs_sidecar) {
+            if !pair_root_files.contains_key(path) {
+                let roots = crate::build::steiner::read_pair_roots(path, &pair_files[px].0)?;
+                pair_root_files.insert(path.clone(), roots);
+            }
+        }
+    }
 
     // Indices, plans and per-row queries.
     let mut indices = Vec::new();
@@ -496,6 +506,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             costs: c.calibration.as_ref().map(|p| &cost_files[p].0),
             sketches: c.sketches_sidecar.as_ref().map(|p| &sketch_files[p].0),
             pairs: c.pairs_sidecar.as_ref().map(|p| &pair_files[p].0),
+            pair_roots: c.pair_roots.as_ref().map(|p| &pair_root_files[p][..]),
         };
         let mut plan = Plan::new(&c.kernel, &ix).with_context(|| format!("config {:?}", c.name))?;
         if !exp.fast_paths {
@@ -625,6 +636,9 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             });
             if c.pairs_sidecar.is_some() {
                 hash_input["pairs"] = pairs_doc(c)["source"].clone();
+            }
+            if let Some(p) = &c.pair_roots {
+                hash_input["pair_roots"] = json!(p);
             }
             let config_hash = format!("{:016x}", fnv1a(hash_input.to_string().as_bytes()));
             let safe: String = c

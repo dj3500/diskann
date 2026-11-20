@@ -547,6 +547,7 @@ pub fn calibrate<T: Element>(
             costs: None,
             sketches: None,
             pairs: None,
+            pair_roots: None,
         };
         let mut eager = Kernel {
             collector: Coll::Heap,

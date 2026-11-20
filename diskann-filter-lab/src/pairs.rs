@@ -220,6 +220,23 @@ impl Cover {
     }
 }
 
+/// An exact cover of a query's clause pair `(i, j)` by stored pairs that have a router tree
+/// (`PairIndex::tree_cover`): every label pair of the two clauses is empty or such a stored
+/// pair, so the trees' members are exactly the points satisfying both clauses.
+#[derive(Debug, Clone, Default)]
+pub struct TreeCover {
+    pub valid: bool,
+    pub i: usize,
+    pub j: usize,
+    /// Directory slots of the stored pairs (their trees' roots are the starts).
+    pub slots: Vec<usize>,
+    /// Sum of their joint posting sizes.
+    pub members: u64,
+    /// Directory lookups made.
+    pub lookups: u64,
+    scratch: Vec<usize>,
+}
+
 /// Largest product of clause sizes examined per clause pair (bounds the planning work).
 pub const MAX_LOOKUPS: usize = 64;
 
@@ -716,6 +733,90 @@ impl PairIndex {
     #[inline]
     pub fn list(&self, start: u64, end: u64) -> &[u32] {
         &self.points[start as usize..end as usize]
+    }
+
+    /// The directory slot of the stored pair whose list starts at `start` (stored lists are
+    /// never empty, so the offsets increase strictly).
+    #[inline]
+    pub fn slot_of(&self, start: u64) -> usize {
+        self.list_offsets.partition_point(|&o| o < start)
+    }
+
+    /// The stored points of directory slot `s`.
+    #[inline]
+    pub fn slot_list(&self, s: usize) -> &[u32] {
+        self.list(self.list_offsets[s], self.list_offsets[s + 1])
+    }
+
+    /// The clause pair of a query with `n_clauses` clauses (`clause(i)`: its labels) whose
+    /// label pairs are all empty or stored with a router tree (`has_tree(slot)`), with the
+    /// fewest members, into `out`; labels with empty postings are skipped (`posting_len`);
+    /// clause pairs with more than [`MAX_LOOKUPS`] label pairs are not examined. Returns
+    /// whether such a clause pair exists.
+    pub fn tree_cover<'c>(
+        &self,
+        n_clauses: usize,
+        clause: impl Fn(usize) -> &'c [u32],
+        posting_len: impl Fn(u32) -> usize,
+        has_tree: impl Fn(usize) -> bool,
+        out: &mut TreeCover,
+    ) -> bool {
+        out.valid = false;
+        out.slots.clear();
+        out.members = 0;
+        out.lookups = 0;
+        let mut best = u64::MAX;
+        for i in 0..n_clauses {
+            let ci = clause(i);
+            for j in (i + 1)..n_clauses {
+                let cj = clause(j);
+                if ci.len() * cj.len() > MAX_LOOKUPS {
+                    continue;
+                }
+                out.scratch.clear();
+                let (mut sum, mut ok) = (0u64, true);
+                'pairs: for &a in ci {
+                    if posting_len(a) == 0 {
+                        continue;
+                    }
+                    for &b in cj {
+                        if posting_len(b) == 0 {
+                            continue;
+                        }
+                        out.lookups += 1;
+                        match self.joint(a, b) {
+                            Joint::Empty => {}
+                            Joint::Stored(s, e) => {
+                                let slot = self.slot_of(s);
+                                if !has_tree(slot) {
+                                    ok = false;
+                                    break 'pairs;
+                                }
+                                out.scratch.push(slot);
+                                sum += e - s;
+                            }
+                            Joint::Unknown => {
+                                ok = false;
+                                break 'pairs;
+                            }
+                        }
+                        if sum >= best {
+                            ok = false;
+                            break 'pairs;
+                        }
+                    }
+                }
+                if ok && sum < best {
+                    best = sum;
+                    out.valid = true;
+                    out.i = i;
+                    out.j = j;
+                    out.members = sum;
+                    std::mem::swap(&mut out.slots, &mut out.scratch);
+                }
+            }
+        }
+        out.valid
     }
 
     /// The clause pair with the fewest candidates (see [`Cover`]) of a query with `n_clauses`

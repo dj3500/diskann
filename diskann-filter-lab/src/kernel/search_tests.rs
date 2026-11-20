@@ -191,6 +191,7 @@ impl Fixture {
             costs: None,
             sketches: None,
             pairs: None,
+            pair_roots: None,
         }
     }
 
@@ -809,6 +810,7 @@ fn run_line(
         costs: None,
         sketches: None,
         pairs: None,
+        pair_roots: None,
     };
     let plan = Plan::new(kernel, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -950,6 +952,7 @@ fn exact_duplicates_follow_the_upstream_tie_rule() {
         costs: None,
         sketches: None,
         pairs: None,
+        pair_roots: None,
     };
     let plan = Plan::new(&k, &ix).unwrap();
     let mut st = Searcher::for_index(&ix, &[&plan]);
@@ -1047,6 +1050,7 @@ fn the_tree_route_serves_tree_eligible_queries() {
         costs: None,
         sketches: None,
         pairs: None,
+        pair_roots: None,
     };
     let mut pb = PredicateSetBuilder::new(&labels);
     pb.push(&[vec!["x=1"]]);
@@ -1120,6 +1124,7 @@ fn the_static_bits_tree_route_checks_only_the_other_clauses() {
         costs: None,
         sketches: None,
         pairs: None,
+        pair_roots: None,
     };
     let mut pb = PredicateSetBuilder::new(&labels);
     pb.push(&[vec!["x=1"], vec!["y=1"]]);
@@ -1241,6 +1246,7 @@ fn the_cost_tree_route_picks_the_cheapest_member_check() {
             costs: Some(costs),
             sketches: Some(&sketches),
             pairs: None,
+            pair_roots: None,
         };
         let k = kernel(&[
             ("starts", "label(c*)+global"),
@@ -1272,6 +1278,121 @@ fn the_cost_tree_route_picks_the_cheapest_member_check() {
     // The cost route needs a planned exact path (its unit costs) and tree_choice = always.
     let mut k = Kernel::default();
     k.set("tree_route", "cost").unwrap();
+    assert!(k.validate().is_err());
+}
+
+#[test]
+fn the_pair_tree_route_searches_the_conjunctions_tree() {
+    use crate::pairs::PairIndex;
+    // 200 points on a line: `x=1` on 0..100, `x=2` on 100..200, `y=1` on 80..200, `y=2` on
+    // 0..80; the conjunction `x=1 & y=1` holds on 80..100 only (20 points).
+    let n = 200usize;
+    let base = Matrix::from_slice(&(0..n).map(|i| i as f32).collect::<Vec<_>>(), n, 1);
+    let mut b = LabelStoreBuilder::new();
+    for i in 0..n {
+        let x = if i < 100 { "x=1" } else { "x=2" };
+        let y = if i >= 80 { "y=1" } else { "y=2" };
+        b.push_point([("x", x), ("y", y)]).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let id = |s: &str| labels.name_index()[s];
+    let (px, _) = PairIndex::build(&labels, 1 << 20, 1);
+    let crate::pairs::Joint::Stored(js, je) = px.joint(id("x=1"), id("y=1")) else {
+        panic!("the pair x=1 & y=1 is stored");
+    };
+    assert_eq!(px.list(js, je), (80..100).collect::<Vec<u32>>());
+    // Routers: 200 over `x=1`'s members (its label tree), 201 over the conjunction's.
+    let aux = AuxNodes::new(
+        vec![AuxKind::Router; 2],
+        &Matrix::from_slice(&[50.0f32, 90.0], 2, 1),
+    )
+    .unwrap();
+    let mut g = Graph::new(n, 100, aux).unwrap();
+    for i in 0..n as u32 {
+        let nb: Vec<u32> = [i.checked_sub(1), (i + 1 < n as u32).then_some(i + 1)]
+            .into_iter()
+            .flatten()
+            .collect();
+        g.set_neighbors(i, &nb).unwrap();
+    }
+    g.set_neighbors(200, &(0..100).collect::<Vec<u32>>())
+        .unwrap();
+    g.set_neighbors(201, &(80..100).collect::<Vec<u32>>())
+        .unwrap();
+    g.set_starts(vec![0]).unwrap();
+    let mut st = Starts::new(&g);
+    st.set_label_starts(
+        &labels,
+        &[
+            (id("x=1"), 200),
+            (id("x=2"), 150),
+            (id("y=1"), 150),
+            (id("y=2"), 40),
+        ],
+    )
+    .unwrap();
+    let mut roots = vec![u32::MAX; px.n_pairs()];
+    roots[px.slot_of(js)] = 201;
+    let no_roots = vec![u32::MAX; px.n_pairs()];
+    let bitsets = LabelBitsets::build(&labels, 1);
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let costs = super::cost::UnitCosts::default();
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    let preds = pb.finish();
+    let run = |route: &str, pairs: bool, roots: &[u32]| {
+        let ix = Index {
+            graph: &g,
+            vectors: g.vectors(&base).unwrap(),
+            labels: &labels,
+            global: &[0],
+            label_starts: Some(&st),
+            sample: None,
+            label_view: false,
+            view_postings: None,
+            eps_min: 0.5,
+            bitsets: Some(&bitsets),
+            costs: Some(&costs),
+            sketches: Some(&sketches),
+            pairs: Some(&px),
+            pair_roots: Some(roots),
+        };
+        let mut edits = vec![
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("crossover", "graph"),
+            ("exact", "planned"),
+            ("estimates", "sketch"),
+            ("tree_route", route),
+        ];
+        if pairs {
+            edits.push(("tree_pairs", "on"));
+        }
+        let plan = Plan::new(&kernel(&edits), &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
+        let q = Query {
+            vector: &[90.3f32],
+            cnf: preds.get(0),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 8, &mut ids, &mut d, None);
+        assert_eq!(ids, [90, 91, 89], "{route} {pairs}");
+        assert_eq!(ctr.route, Route::Tree);
+        (ctr.plan, ctr.n_pred, ctr.n_aux_expand)
+    };
+    // The label tree checks x=1's 100 members; the pair tree only the conjunction's 20.
+    let (plan, label_checks, _) = run("row_scan", false, &roots);
+    assert_eq!((plan, label_checks), (0, 100));
+    let (plan, pair_checks, expanded) = run("row_scan", true, &roots);
+    assert_eq!((plan, pair_checks, expanded), (110, 20, 1));
+    // Without a tree for the pair, the label tree route.
+    assert_eq!(run("row_scan", true, &no_roots).0, 0);
+    // Under the cost route the pair route picks its check too (111–113).
+    assert!((111..=113).contains(&run("cost", true, &roots).0));
+    // tree_pairs needs the tree route.
+    let mut k = Kernel::default();
+    k.set("tree_pairs", "on").unwrap();
     assert!(k.validate().is_err());
 }
 
@@ -1328,6 +1449,7 @@ fn tree_index<'a>(
         costs: None,
         sketches: None,
         pairs: None,
+        pair_roots: None,
     }
 }
 
@@ -3000,6 +3122,7 @@ fn by_rate_late_rescues_a_search_that_missed_the_query() {
         costs: Some(&costs),
         sketches: Some(&sketches),
         pairs: None,
+        pair_roots: None,
     };
     let plans: Vec<Plan> = ["by_rate_late", "by_rate", "by_rate_both", "by_rate_both_k"]
         .into_iter()
