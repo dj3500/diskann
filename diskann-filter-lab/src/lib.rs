@@ -37,3 +37,4 @@ pub mod starts;
 pub mod text;
 pub mod upstream;
 pub mod vectors;
+pub mod workload;

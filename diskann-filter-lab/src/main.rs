@@ -27,6 +27,7 @@ use diskann_filter_lab::{
     starts::{self, Starts},
     text,
     vectors::{self, DType, Element, Matrix},
+    workload,
 };
 use serde_json::{json, Value};
 
@@ -2028,8 +2029,8 @@ fn read_candidates(
 }
 
 /// `flab select --dump-workload M`: the workload's first `M` base-derived queries and `M`
-/// independent queries drawn i.i.d. ([`islands::draw_independent`]), as query sets of the
-/// vectors of their points (gathered from the base file) and their predicates.
+/// independent queries drawn i.i.d. ([`workload::Walk::draw`]), as query sets of the vectors of
+/// their points (gathered from the base file) and their predicates.
 fn dump_workload<T: diskann_filter_lab::build::BuildElement>(
     a: &SelectArgs,
     store: &LabelStore,
@@ -2039,12 +2040,7 @@ fn dump_workload<T: diskann_filter_lab::build::BuildElement>(
     m: usize,
 ) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let singles = islands::single_label_support(store);
-    let model = islands::QueryModel {
-        single_labels: singles.len() as u64,
-        contexts: contexts.len() as u64,
-        ..*model
-    };
+    let walk = workload::Walk::new(store, contexts);
     let ext = base_file
         .extension()
         .and_then(|e| e.to_str())
@@ -2066,13 +2062,13 @@ fn dump_workload<T: diskann_filter_lab::build::BuildElement>(
         (
             "d",
             (0..m)
-                .filter_map(|i| islands::draw_data(store, &model, i))
+                .filter_map(|i| workload::draw_data(store, model, i))
                 .collect::<Vec<_>>(),
         ),
         (
             "u",
             (0..m)
-                .filter_map(|i| islands::draw_independent(store, &model, contexts, &singles, i))
+                .filter_map(|i| walk.draw(model, i))
                 .collect::<Vec<_>>(),
         ),
     ] {
@@ -2216,7 +2212,6 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let count_s = secs(t);
     if a.uniform > 0.0 {
         model.contexts = contexts.len() as u64;
-        model.single_labels = islands::single_label_support(&store).len() as u64;
     }
     if let Some(m) = a.dump_workload {
         ensure!(
@@ -2225,28 +2220,43 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         );
         dump_workload::<T>(&a, &store, &base_file, &model, &contexts, m)?;
     }
-    let mixed: &[select::PairCand] = if a.uniform > 0.0 { &contexts } else { &[] };
+    let t = Instant::now();
+    let independent = (a.uniform > 0.0)
+        .then(|| std::sync::Arc::new(workload::independent(&store, &contexts, &model, a.threads)));
+    let walk_s = secs(t);
     let t = Instant::now();
     let (sample, tree_sample) = match &pricing {
         Some(pr) => (
             None,
             Some(diskann_filter_lab::select_g::TreeSample::build_mixed(
-                &store, pr, model, mixed, a.threads,
+                &store,
+                pr,
+                model,
+                independent.clone(),
+                a.threads,
             )),
         ),
         None => (
             Some(islands::QuerySample::build_mixed(
-                &store, &costs, a.k, model, mixed, a.threads,
+                &store,
+                &costs,
+                a.k,
+                model,
+                independent.clone(),
+                a.threads,
             )),
             None,
         ),
     };
     let sample_s = secs(t);
-    let (mean, (mean_derived, mean_pairs, mean_singles)) = match (&sample, &tree_sample) {
+    let (mean, (mean_derived, mean_u)) = match (&sample, &tree_sample) {
         (Some(s), _) => (s.mean_base_ns(), s.part_means(&s.base_ns)),
         (_, Some(s)) => (s.mean_base_ns(), s.part_means(&s.base_ns)),
         _ => unreachable!("one sample"),
     };
+    let (n_single, n_pair, n_walk) = independent
+        .as_deref()
+        .map_or((0, 0, 0), |u| (u.n_single, u.n_pair, u.n_walk));
     let stop = match a.stop {
         StopArg::Elasticity => select::Stop::Elasticity,
         StopArg::Budget => select::Stop::Budget,
@@ -2256,11 +2266,12 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         select::Stop::Elasticity => 0.0,
     };
     println!(
-        "{} base-derived queries, {} pair contexts (of {}) and {} single labels in {sample_s:.1} s; mean cost {mean:.0} ns ({mean_derived:.0}, {mean_pairs:.0} and {mean_singles:.0}); index {:.2} GiB; stop {}{}",
+        "{} base-derived queries; independent: {n_single} labels, {n_pair} co-occurring pairs (of {}), {n_walk} three-label walks ({walk_s:.1} s); sample in {sample_s:.1} s; mean cost {mean:.0} ns (base-derived {mean_derived:.0}; independent 1/2/3 labels {:.0} / {:.0} / {:.0}); index {:.2} GiB; stop {}{}",
         a.queries,
-        model.n_pair_queries(),
         contexts.len(),
-        model.n_single_queries(),
+        mean_u[0],
+        mean_u[1],
+        mean_u[2],
         index_bytes as f64 / (1u64 << 30) as f64,
         match stop {
             select::Stop::Elasticity => "elasticity",
@@ -2438,10 +2449,13 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "floor_ns_per_query_byte": floor,
         "mean_cost_ns": mean,
         "mean_cost_derived_ns": mean_derived,
-        "mean_cost_pair_contexts_ns": mean_pairs,
-        "mean_cost_single_labels_ns": mean_singles,
+        "mean_cost_independent_ns": mean_u,
         "pair_contexts": contexts.len(),
-        "single_labels": model.n_single_queries(),
+        "independent": {
+            "labels": n_single, "pairs": n_pair, "walks": n_walk,
+            "k_max": independent.as_deref().map_or(0, |u| u.k_max),
+            "seconds": walk_s,
+        },
         "model": model,
         "k": a.k, "r": a.r, "l_build": a.l_build, "alpha": a.alpha,
         "threads": a.threads,
