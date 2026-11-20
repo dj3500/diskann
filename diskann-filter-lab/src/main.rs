@@ -527,6 +527,14 @@ struct SelectArgs {
     /// Predicate sets whose coverage by the selected pairs is reported (diagnostics only).
     #[arg(long, value_delimiter = ',')]
     report: Vec<PathBuf>,
+    /// Write the pair candidates (labels, joint sizes, context weights; counted without a
+    /// floor's pruning when `--kappa 0`) to this file, for `--load-candidates`.
+    #[arg(long)]
+    save_candidates: Option<PathBuf>,
+    /// Read the pair candidates from a file written by `--save-candidates` (same label store and
+    /// `--singleton`) instead of counting them.
+    #[arg(long)]
+    load_candidates: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1840,6 +1848,81 @@ fn file_bytes(p: &Path) -> Result<u64> {
         .len())
 }
 
+const CANDS_MAGIC: u64 = 0x5345_4c43_414e_4431; // "SELCAND1"
+
+/// Writes the pair candidates of `flab select` (header: magic, points, labels, singleton,
+/// count; then `f` per label, then `(a, b, joint, g)` per candidate, little-endian).
+fn write_candidates(
+    path: &Path,
+    store: &LabelStore,
+    singleton: f64,
+    f: &[f64],
+    cands: &[diskann_filter_lab::select::PairCand],
+) -> Result<()> {
+    let mut b: Vec<u8> = Vec::with_capacity(40 + 8 * f.len() + 20 * cands.len());
+    for x in [
+        CANDS_MAGIC,
+        store.n_points() as u64,
+        store.n_labels() as u64,
+        singleton.to_bits(),
+        cands.len() as u64,
+    ] {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    for x in f {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    for c in cands {
+        b.extend_from_slice(&c.a.to_le_bytes());
+        b.extend_from_slice(&c.b.to_le_bytes());
+        b.extend_from_slice(&c.joint.to_le_bytes());
+        b.extend_from_slice(&c.g.to_le_bytes());
+    }
+    std::fs::write(path, b).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Reads [`write_candidates`]' file, checking it belongs to `store` and `singleton`.
+fn read_candidates(
+    path: &Path,
+    store: &LabelStore,
+    singleton: f64,
+) -> Result<(Vec<f64>, Vec<diskann_filter_lab::select::PairCand>)> {
+    let b = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
+    ensure!(
+        b.len() >= 40 && u64_at(0) == CANDS_MAGIC,
+        "not a candidates file"
+    );
+    ensure!(
+        u64_at(8) == store.n_points() as u64
+            && u64_at(16) == store.n_labels() as u64
+            && f64::from_bits(u64_at(24)) == singleton,
+        "the candidates belong to another label store or singleton probability"
+    );
+    let (nl, nc) = (store.n_labels(), u64_at(32) as usize);
+    ensure!(
+        b.len() == 40 + 8 * nl + 20 * nc,
+        "truncated candidates file"
+    );
+    let f: Vec<f64> = (0..nl)
+        .map(|i| f64::from_bits(u64_at(40 + 8 * i)))
+        .collect();
+    let base = 40 + 8 * nl;
+    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().expect("4 bytes"));
+    let cands = (0..nc)
+        .map(|i| {
+            let o = base + 20 * i;
+            diskann_filter_lab::select::PairCand {
+                a: u32_at(o),
+                b: u32_at(o + 4),
+                joint: u32_at(o + 8),
+                g: f64::from_bits(u64_at(o + 12)),
+            }
+        })
+        .collect();
+    Ok((f, cands))
+}
+
 fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> Result<()> {
     use diskann_filter_lab::select;
     let t0 = Instant::now();
@@ -1870,20 +1953,31 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         a.kappa
     );
     let t = Instant::now();
-    let (counts, f) = select::label_weights(&store, a.singleton, a.threads);
-    let f_max = f.iter().copied().fold(0.0, f64::max);
-    let keep: Vec<bool> = (0..store.n_labels() as u32)
-        .map(|l| select::pair_value_bound(&store, &costs, &model, &f, f_max, l) >= floor)
-        .collect();
-    let n_keep = keep.iter().filter(|&&k| k).count();
-    let cands = select::pair_candidates(
-        &store,
-        &counts,
-        a.singleton,
-        |l| keep[l as usize],
-        a.threads,
-    );
-    drop(counts);
+    let (f, cands, n_keep) = match &a.load_candidates {
+        Some(path) => {
+            let (f, cands) = read_candidates(path, &store, a.singleton)?;
+            (f, cands, usize::MAX)
+        }
+        None => {
+            let (counts, f) = select::label_weights(&store, a.singleton, a.threads);
+            let f_max = f.iter().copied().fold(0.0, f64::max);
+            let keep: Vec<bool> = (0..store.n_labels() as u32)
+                .map(|l| select::pair_value_bound(&store, &costs, &model, &f, f_max, l) >= floor)
+                .collect();
+            let n_keep = keep.iter().filter(|&&k| k).count();
+            let cands = select::pair_candidates(
+                &store,
+                &counts,
+                a.singleton,
+                |l| keep[l as usize],
+                a.threads,
+            );
+            (f, cands, n_keep)
+        }
+    };
+    if let Some(path) = &a.save_candidates {
+        write_candidates(path, &store, a.singleton, &f, &cands)?;
+    }
     let values = select::pair_values(&store, &costs, a.k, &model, &f, &cands);
     let pairs_s = secs(t);
     println!(
