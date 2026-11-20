@@ -9,20 +9,26 @@
 //! one memory budget, with the unit costs of the cost model. Categories are read as the label
 //! store's groups only; no query log is read.
 //!
-//! **Workload.** The base-derived queries of the islands' `queries` selection
-//! ([`QueryModel`]): a data point drawn uniformly, each of its categories kept with probability
-//! ½, a kept category's clause one of the point's labels in it (probability `singleton`) or a
-//! random subset of them (optionally, with probability `fresh`, drawn from another data point).
-//! An island serves a query through a single-label clause; a pair `(a, b)` through two
-//! single-label clauses `{a} ∧ {b}` in different categories (the `pair` plan's exact cover).
+//! **Workload.** A mixture of two components ([`QueryModel`]): with weight `1 − μ`, the
+//! base-derived queries of the islands' `queries` selection — a data point drawn uniformly, each
+//! of its categories kept with probability ½, a kept category's clause one of the point's labels
+//! in it (probability `singleton`) or a random subset of them (optionally, with probability
+//! `fresh`, drawn from another data point): queries that look like the data; with weight `μ`,
+//! *pair contexts* — a pair of labels of different categories drawn uniformly among the `N`
+//! pairs that co-occur, as the query `{a} ∧ {b}`: every combination equally likely. (`μ = ½`
+//! hedges between the two; `μ = 0` is the base-derived workload alone.) An island serves a
+//! query through a single-label clause; a pair `(a, b)` through two single-label clauses
+//! `{a} ∧ {b}` in different categories (the `pair` plan's exact cover).
 //!
-//! **Islands** are valued on a sample of these queries ([`QuerySample`]: per query the cost of
-//! its best route without auxiliary structures and of the island of each single-label clause).
+//! **Islands** are valued on a sample of this workload ([`QuerySample::build_mixed`]:
+//! `n_queries` base-derived queries and `n_queries · μ / (1 − μ)` pair contexts, equally
+//! weighted; per query the cost of its best route without auxiliary structures and of the island
+//! of each single-label clause).
 //!
-//! **Pairs** are too many, and each drawn too rarely, for a sample (a pair whose joint posting
-//! holds `j` points is drawn with probability ∝ `j/n`), so their value is the expectation over
-//! the same workload in closed form: the probability that a query's clauses in the categories
-//! of `a` and `b` are `{a}` and `{b}`,
+//! **Pairs** are too many, and each drawn too rarely, for a sample (among base-derived queries a
+//! pair whose joint posting holds `j` points is drawn with probability ∝ `j/n`), so their value
+//! is the expectation over the same workload in closed form: the probability that a query's
+//! clauses in the categories of `a` and `b` are `{a}` and `{b}`, `(1 − μ)·P_ab + μ/N` with
 //!
 //! ```text
 //! P_ab = ¼·[(1 − fresh)²·g_ab + (1 − (1 − fresh)²)·f_a·f_b]
@@ -46,17 +52,21 @@
 //! a pair is valued against the routes without auxiliary structures, an island against those and
 //! the islands taken before it.
 //!
-//! **Selection.** One greedy over both kinds by expected saving per query per byte while the
-//! budget lasts; an item is taken only if its value is at least the floor
-//! `λ = κ · (mean cost per query) / (index bytes)`: with `κ = 1`, an item must speed the workload
-//! up by at least the fraction by which it grows the index (labels of a smaller bound on their
-//! pairs' value are not counted at all). Pairs need the co-occurrence matrix of their big labels
+//! **Selection.** One greedy over both kinds by expected saving per query per byte. It stops
+//! ([`Stop::Elasticity`]) at the first item whose relative saving of the mean query time is
+//! below its relative increase of the index bytes, `Δt / t < ΔB / B` (`t`: the workload's mean
+//! cost per query, `B`: the index bytes — base vectors, label store, graph — both with the items
+//! taken so far; equivalently, an item is taken while it lowers `t · B` to first order); the
+//! budget is a ceiling. ([`Stop::Budget`]: the greedy fills the budget, items below a fixed
+//! floor `λ` excluded — the previous rule, kept for comparisons.) Pairs need the co-occurrence
+//! matrix of their big labels
 //! (the `N_T` labels of at least `T` points in a candidate pair with a positive saving:
 //! `N_T·⌈N_T/64⌉·8` bytes, plus the directory; a lookup of two big labels that never co-occur
 //! answers `Empty`): the greedy is run without pairs and for every power of two `T ≥ 64` (pairs
 //! of labels of at least `T` points, their matrix charged to the budget first), and the run with
-//! the largest expected saving is kept, provided the pairs pay for their matrix too (their saving
-//! at least `λ` times their bytes and the matrix's). (B3a's rule, every label of at least `T`
+//! the smallest `t · B` is kept ([`Stop::Budget`]: the largest expected saving, provided the
+//! pairs pay for their matrix too — their saving at least `λ` times their bytes and the
+//! matrix's). (B3a's rule, every label of at least `T`
 //! points big, answers `Empty` for more pairs, but its larger matrix makes the greedy settle on
 //! a larger `T`, i.e. fewer pairs of mid-sized labels; measured worse on the severe cells.)
 
@@ -68,6 +78,44 @@ use crate::{
     labels::LabelStore,
     pairs,
 };
+
+/// A per-label kind valued on the query sample, as the greedy sees it: candidates by expected
+/// saving per query per byte (islands, [`IslandGreedy`]; track G's router trees,
+/// [`crate::select_g::TreeGreedy`]).
+pub trait LabelKind {
+    /// The best remaining candidate (its saving per query per byte and its index).
+    fn peek(&mut self) -> Option<(f64, usize)>;
+    /// Takes the peeked candidate; returns its marginal saving per query (ns).
+    fn take(&mut self, x: usize) -> f64;
+    /// Drops the peeked candidate.
+    fn skip(&mut self, x: usize);
+    /// Bytes of candidate `x`.
+    fn bytes(&self, x: usize) -> u64;
+    /// Label of candidate `x`.
+    fn label(&self, x: usize) -> u32;
+}
+
+impl LabelKind for IslandGreedy<'_> {
+    fn peek(&mut self) -> Option<(f64, usize)> {
+        IslandGreedy::peek(self)
+    }
+
+    fn take(&mut self, x: usize) -> f64 {
+        IslandGreedy::take(self, x)
+    }
+
+    fn skip(&mut self, x: usize) {
+        IslandGreedy::skip(self, x);
+    }
+
+    fn bytes(&self, x: usize) -> u64 {
+        self.terms[x].bytes
+    }
+
+    fn label(&self, x: usize) -> u32 {
+        self.terms[x].label
+    }
+}
 
 /// A candidate pair: labels `a < b` in different categories, their joint posting size `j` and
 /// `g_ab` (see the module documentation).
@@ -153,12 +201,54 @@ pub fn pair_candidates(
     threads: usize,
 ) -> Vec<PairCand> {
     let n = labels.n_points();
+    count_pairs(
+        labels,
+        counts,
+        singleton,
+        |l| {
+            let s = labels.posting_len(l);
+            s as u64 >= pairs::T_MIN && s < n && keep(l)
+        },
+        threads,
+    )
+}
+
+/// Every co-occurring pair of labels in different categories (the pair contexts of the
+/// workload, [`QueryModel::uniform`]), in the same pass and order as [`pair_candidates`]; the
+/// candidates are the contexts both of whose labels pass [`is_candidate_label`].
+pub fn pair_contexts(
+    labels: &LabelStore,
+    counts: &[u16],
+    singleton: f64,
+    threads: usize,
+) -> Vec<PairCand> {
+    count_pairs(
+        labels,
+        counts,
+        singleton,
+        |l| labels.posting_len(l) > 0,
+        threads,
+    )
+}
+
+/// Whether label `l` can be in a stored pair: at least [`pairs::T_MIN`] and fewer than `n`
+/// points.
+pub fn is_candidate_label(labels: &LabelStore, l: u32) -> bool {
+    let s = labels.posting_len(l);
+    s as u64 >= pairs::T_MIN && s < labels.n_points()
+}
+
+/// The co-occurring pairs of labels in different categories among those accepted by `ok`.
+fn count_pairs(
+    labels: &LabelStore,
+    counts: &[u16],
+    singleton: f64,
+    ok: impl Fn(u32) -> bool + Sync,
+    threads: usize,
+) -> Vec<PairCand> {
+    let n = labels.n_points();
     let nc = labels.n_categories().max(1);
     let nl = labels.n_labels();
-    let ok = |l: u32| {
-        let s = labels.posting_len(l);
-        s as u64 >= pairs::T_MIN && s < n && keep(l)
-    };
     let rows: Vec<u32> = (0..nl as u32)
         .filter(|&a| ok(a) && (labels.category(a) as usize) + 1 < nc)
         .collect();
@@ -204,19 +294,38 @@ pub fn pair_candidates(
     parts.into_iter().flatten().collect()
 }
 
+/// When the greedy stops (see the module documentation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Stop {
+    /// At the budget (and [`Params::floor`]).
+    #[default]
+    Budget,
+    /// At the first item whose relative saving of mean query time is below its relative
+    /// increase of index bytes (`Δt / t < ΔB / B`, `t` and `B` with the items taken so far);
+    /// the budget is a ceiling.
+    Elasticity,
+}
+
 /// Selection parameters (see the module documentation).
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize)]
 pub struct Params {
     /// Answers `K` of the cost terms.
     pub k: usize,
     /// Degree bound `R` of the islands.
     pub r: usize,
-    /// Memory budget (bytes) for both kinds.
+    /// Memory budget (bytes) for both kinds (a ceiling with [`Stop::Elasticity`]).
     pub budget_bytes: u64,
-    /// Value floor `λ` (ns of expected saving per query per byte).
+    /// Value floor `λ` (ns of expected saving per query per byte; [`Stop::Budget`] only).
     pub floor: f64,
-    /// The workload (its `singleton` and `fresh` enter the pairs' closed form).
+    /// The workload (its `singleton`, `fresh`, `uniform` and `contexts` enter the pairs' closed
+    /// form).
     pub model: QueryModel,
+    pub stop: Stop,
+    /// Mean cost per query of the workload without auxiliary structures (`t₀`, ns).
+    pub mean_ns: f64,
+    /// Bytes of the index without auxiliary structures (`B₀`).
+    pub index_bytes: u64,
 }
 
 /// Value terms of a pair candidate.
@@ -232,6 +341,20 @@ pub struct PairValue {
     pub value: f64,
 }
 
+/// Probability per query of the context `{a} ∧ {b}` of a candidate pair (`P_ab` of the module
+/// documentation): `(1 − μ)` times its probability among base-derived queries plus `μ / N`
+/// from the pair contexts (`μ = model.uniform`, `N = model.contexts`).
+pub fn context_prob(model: &QueryModel, f: &[f64], p: &PairCand) -> f64 {
+    let fr = model.fresh;
+    let (own, other) = ((1.0 - fr) * (1.0 - fr), 1.0 - (1.0 - fr) * (1.0 - fr));
+    let derived = 0.25 * (own * p.g + other * f[p.a as usize] * f[p.b as usize]);
+    if model.uniform > 0.0 && model.contexts > 0 {
+        (1.0 - model.uniform) * derived + model.uniform / model.contexts as f64
+    } else {
+        derived
+    }
+}
+
 /// The value terms of the candidates with a positive saving, by decreasing value.
 pub fn pair_values(
     labels: &LabelStore,
@@ -243,8 +366,6 @@ pub fn pair_values(
 ) -> Vec<PairValue> {
     let n = labels.n_points();
     let nf = n as f64;
-    let fr = model.fresh;
-    let (own, other) = ((1.0 - fr) * (1.0 - fr), 1.0 - (1.0 - fr) * (1.0 - fr));
     let mut out: Vec<PairValue> = cands
         .iter()
         .filter_map(|&p| {
@@ -257,7 +378,7 @@ pub fn pair_values(
             if !saving_ns.is_finite() || saving_ns <= 0.0 {
                 return None;
             }
-            let prob = 0.25 * (own * p.g + other * f[p.a as usize] * f[p.b as usize]);
+            let prob = context_prob(model, f, &p);
             let bytes = pair_bytes(p.joint);
             Some(PairValue {
                 cand: p,
@@ -314,6 +435,10 @@ pub struct Run {
     pub cut: f64,
     /// The pairs pay for their matrix (or there are none).
     pub pairs_pay: bool,
+    /// Mean cost per query (ns) and index bytes with the run's items ([`Stop::Elasticity`]:
+    /// the run with the smallest product is kept).
+    pub t_ns: f64,
+    pub index_bytes: u64,
 }
 
 impl Run {
@@ -349,9 +474,9 @@ pub struct Selection {
 /// The greedy over islands (from `sample`) and pairs (`values`, by decreasing value) of labels of
 /// at least `t` points (none if `t` is `None`) within `params.budget_bytes`, the matrix of the
 /// `big` candidate labels of at least `t` points charged first.
-fn run(
+fn run<G: LabelKind>(
     labels: &LabelStore,
-    sample: &QuerySample,
+    kind: impl Fn() -> G,
     values: &[PairValue],
     cand_labels: &[u32],
     params: &Params,
@@ -375,6 +500,9 @@ fn run(
         ..Default::default()
     };
     if fixed > params.budget_bytes {
+        out.pairs_pay = params.stop == Stop::Elasticity;
+        out.t_ns = params.mean_ns;
+        out.index_bytes = params.index_bytes;
         return out;
     }
     let eligible = |v: &PairValue| match t {
@@ -384,9 +512,17 @@ fn run(
         None => false,
     };
     let mut left = params.budget_bytes - fixed;
-    let mut gr = IslandGreedy::new(sample, labels, params.r, |_| true);
+    let mut gr = kind();
     let mut pi = 0usize;
     let mut cut = f64::INFINITY;
+    // Mean cost per query and index bytes with the items taken (the matrix charged first).
+    let (mut t_cur, mut b_cur) = (params.mean_ns, (params.index_bytes + fixed) as f64);
+    // The smallest value an item may have: `Δt / ΔB ≥ t / B` (elasticity at least 1), or the
+    // floor.
+    let threshold = |t: f64, b: f64| match params.stop {
+        Stop::Budget => params.floor,
+        Stop::Elasticity => t / b,
+    };
     loop {
         while pi < values.len() && !eligible(&values[pi]) {
             pi += 1;
@@ -401,31 +537,42 @@ fn run(
         };
         if take_island {
             let (key, x) = isl.expect("an island");
-            if key < params.floor {
+            if key < threshold(t_cur, b_cur) {
                 break;
             }
-            let bytes = gr.terms[x].bytes;
+            let bytes = gr.bytes(x);
             if bytes > left {
                 gr.skip(x);
                 continue;
             }
             left -= bytes;
-            out.island_saving_ns += gr.take(x);
+            let g = gr.take(x);
+            out.island_saving_ns += g;
             out.island_bytes += bytes;
-            out.islands.push(gr.terms[x].label);
+            out.islands.push(gr.label(x));
+            t_cur -= g;
+            b_cur += bytes as f64;
             cut = key;
         } else {
             let v = &values[pi];
-            if v.value < params.floor {
-                // The pairs are by decreasing value: none of the rest passes the floor.
+            if v.value < threshold(t_cur, b_cur) {
+                // The pairs are by decreasing value: none of the rest passes (with the
+                // elasticity rule, the threshold changes only when an item is taken, and the
+                // islands left are worth less than this pair).
+                if params.stop == Stop::Elasticity {
+                    break;
+                }
                 pi = values.len();
                 continue;
             }
             if v.bytes <= left {
                 left -= v.bytes;
-                out.pair_saving_ns += v.prob * v.saving_ns;
+                let g = v.prob * v.saving_ns;
+                out.pair_saving_ns += g;
                 out.pair_bytes += v.bytes;
                 out.pairs.push(pi);
+                t_cur -= g;
+                b_cur += v.bytes as f64;
                 cut = v.value;
             }
             pi += 1;
@@ -434,8 +581,16 @@ fn run(
     out.islands.sort_unstable();
     out.n_pairs = out.pairs.len();
     out.cut = if cut.is_finite() { cut } else { 0.0 };
-    out.pairs_pay = out.pairs.is_empty()
-        || out.pair_saving_ns >= params.floor * (out.pair_bytes + fixed) as f64;
+    out.pairs_pay = match params.stop {
+        Stop::Budget => {
+            out.pairs.is_empty()
+                || out.pair_saving_ns >= params.floor * (out.pair_bytes + fixed) as f64
+        }
+        // Runs are compared by `t · B`, which charges the matrix.
+        Stop::Elasticity => true,
+    };
+    out.t_ns = params.mean_ns - out.saving_ns();
+    out.index_bytes = params.index_bytes + out.bytes();
     out
 }
 
@@ -445,6 +600,23 @@ fn run(
 pub fn select(
     labels: &LabelStore,
     sample: &QuerySample,
+    values: &[PairValue],
+    params: &Params,
+) -> Selection {
+    select_with(
+        labels,
+        || IslandGreedy::new(sample, labels, params.r, |_| true),
+        values,
+        params,
+    )
+}
+
+/// [`select`] with another per-label kind than the islands (e.g. track G's router trees,
+/// [`crate::select_g`]); `values` are the pair kind's terms (combination postings, or pair
+/// trees), by decreasing value.
+pub fn select_with<G: LabelKind>(
+    labels: &LabelStore,
+    kind: impl Fn() -> G,
     values: &[PairValue],
     params: &Params,
 ) -> Selection {
@@ -471,18 +643,30 @@ pub fn select(
     }
     let runs: Vec<Run> = ts
         .iter()
-        .map(|&t| run(labels, sample, values, &cand_labels, params, t))
+        .map(|&t| run(labels, &kind, values, &cand_labels, params, t))
         .collect();
-    let best = runs
-        .iter()
-        .filter(|r| r.pairs_pay)
-        .max_by(|x, y| {
-            x.saving_ns()
-                .total_cmp(&y.saving_ns())
-                .then(y.bytes().cmp(&x.bytes()))
-        })
-        .cloned()
-        .unwrap_or_default();
+    let best = match params.stop {
+        Stop::Budget => runs
+            .iter()
+            .filter(|r| r.pairs_pay)
+            .max_by(|x, y| {
+                x.saving_ns()
+                    .total_cmp(&y.saving_ns())
+                    .then(y.bytes().cmp(&x.bytes()))
+            })
+            .cloned()
+            .unwrap_or_default(),
+        // The run whose items lower `t · B` (mean query time × index bytes) the most.
+        Stop::Elasticity => runs
+            .iter()
+            .min_by(|x, y| {
+                (x.t_ns * x.index_bytes as f64)
+                    .total_cmp(&(y.t_ns * y.index_bytes as f64))
+                    .then(x.bytes().cmp(&y.bytes()))
+            })
+            .cloned()
+            .unwrap_or_default(),
+    };
     let mut pairs: Vec<(u32, u32)> = best
         .pairs
         .iter()
@@ -563,6 +747,7 @@ mod tests {
                 cap: 4096,
                 singleton: 0.5,
                 fresh,
+                ..Default::default()
             };
             // Frequency of the singleton contexts {a} ∧ {b} among the drawn queries.
             let mut freq = std::collections::HashMap::<(u32, u32), u64>::new();
@@ -617,6 +802,7 @@ mod tests {
             cap: 512,
             singleton: 0.5,
             fresh: 0.5,
+            ..Default::default()
         };
         let sample = QuerySample::build(&s, &c, 10, model, 2);
         let (counts, f) = label_weights(&s, 0.5, 2);
@@ -629,6 +815,7 @@ mod tests {
             budget_bytes: u64::MAX / 4,
             floor: 0.0,
             model,
+            ..Default::default()
         };
         let all = select(&s, &sample, &values, &params);
         assert!(!all.pairs.is_empty(), "every positive pair fits");
@@ -684,5 +871,144 @@ mod tests {
             pairs::PairIndex::read_from(std::io::Cursor::new(buf)).unwrap(),
             ix
         );
+    }
+
+    #[test]
+    fn pair_contexts_hold_every_cooccurring_pair_and_the_candidates() {
+        let s = store();
+        let (counts, _) = label_weights(&s, 0.5, 2);
+        let contexts = pair_contexts(&s, &counts, 0.5, 3);
+        assert_eq!(contexts, pair_contexts(&s, &counts, 0.5, 1));
+        // Brute force: every pair of labels of different categories that co-occur.
+        let mut want = Vec::new();
+        for a in 0..s.n_labels() as u32 {
+            for b in a + 1..s.n_labels() as u32 {
+                let pb = s.postings(b);
+                let j = s
+                    .postings(a)
+                    .iter()
+                    .filter(|p| pb.binary_search(p).is_ok())
+                    .count();
+                if s.category(a) != s.category(b) && j > 0 {
+                    want.push((a, b, j as u32));
+                }
+            }
+        }
+        let got: Vec<(u32, u32, u32)> = contexts.iter().map(|c| (c.a, c.b, c.joint)).collect();
+        assert_eq!(got, want);
+        // The candidates are the contexts of candidate labels, with the same terms.
+        let cands = pair_candidates(&s, &counts, 0.5, |_| true, 2);
+        let filtered: Vec<PairCand> = contexts
+            .iter()
+            .filter(|c| is_candidate_label(&s, c.a) && is_candidate_label(&s, c.b))
+            .copied()
+            .collect();
+        assert_eq!(cands, filtered);
+    }
+
+    #[test]
+    fn the_mixed_workload_adds_equally_weighted_pair_contexts() {
+        let s = store();
+        let c = UnitCosts::default();
+        let (counts, f) = label_weights(&s, 0.5, 2);
+        let contexts = pair_contexts(&s, &counts, 0.5, 2);
+        let derived = QueryModel {
+            n_queries: 3_000,
+            seed: 9,
+            cap: 512,
+            ..Default::default()
+        };
+        let mixed = QueryModel {
+            uniform: 0.5,
+            contexts: contexts.len() as u64,
+            ..derived
+        };
+        assert_eq!(mixed.n_pair_queries(), 3_000);
+        let one = QuerySample::build(&s, &c, 10, derived, 2);
+        let two = QuerySample::build_mixed(&s, &c, 10, mixed, &contexts, 3);
+        assert_eq!(two.base_ns.len(), 6_000);
+        // The base-derived half is the base-derived sample; the pair contexts are `{a} ∧ {b}`
+        // with `M = j`, priced like the pairs' closed form.
+        assert_eq!(&two.base_ns[..3_000], &one.base_ns[..]);
+        let nf = s.n_points() as f64;
+        for qi in 3_000..3_050 {
+            let p = &contexts[islands::pair_context_draw(&mixed, qi)];
+            let sz = s.posting_len(p.a).min(s.posting_len(p.b)) as f64;
+            let m = f64::from(p.joint);
+            let exact = sz * c.pred(sz / nf) + m * c.dist(m / nf);
+            let base = islands::postfilter_nominal(&c, 10, 10, m / nf, s.n_points(), 1).1;
+            assert!((two.base_ns[qi] - exact.min(base)).abs() < 1e-9 * exact.min(base));
+        }
+        // Context probabilities: (1 − μ) of the base-derived one plus μ / N.
+        for p in contexts.iter().take(20) {
+            let want = 0.5 * context_prob(&derived, &f, p) + 0.5 / contexts.len() as f64;
+            assert!((context_prob(&mixed, &f, p) - want).abs() < 1e-15);
+        }
+        // A thread count does not change the sample.
+        let three = QuerySample::build_mixed(&s, &c, 10, mixed, &contexts, 1);
+        assert_eq!(two.base_ns, three.base_ns);
+    }
+
+    #[test]
+    fn the_elasticity_rule_takes_items_while_they_lower_time_times_bytes() {
+        let s = store();
+        let c = UnitCosts::default();
+        let (counts, f) = label_weights(&s, 0.5, 2);
+        let contexts = pair_contexts(&s, &counts, 0.5, 2);
+        let model = QueryModel {
+            n_queries: 4_000,
+            seed: 11,
+            cap: 512,
+            uniform: 0.5,
+            contexts: contexts.len() as u64,
+            ..Default::default()
+        };
+        let sample = QuerySample::build_mixed(&s, &c, 10, model, &contexts, 2);
+        let cands: Vec<PairCand> = contexts
+            .iter()
+            .filter(|p| is_candidate_label(&s, p.a) && is_candidate_label(&s, p.b))
+            .copied()
+            .collect();
+        let values = pair_values(&s, &c, 10, &model, &f, &cands);
+        let mean = sample.mean_base_ns();
+        let params = |index_bytes: u64, stop: Stop| Params {
+            k: 10,
+            r: 8,
+            budget_bytes: u64::MAX / 4,
+            model,
+            stop,
+            mean_ns: mean,
+            index_bytes,
+            ..Default::default()
+        };
+        let all = select(&s, &sample, &values, &params(1 << 20, Stop::Budget));
+        let mut last = usize::MAX;
+        for b0 in [1u64 << 10, 1 << 16, 1 << 20, 1 << 26, 1 << 40] {
+            let p = params(b0, Stop::Elasticity);
+            let sel = select(&s, &sample, &values, &p);
+            let best = &sel.best;
+            // Every item taken lowers `t · B`: the run without pairs (no matrix to recover) and
+            // the kept run, the smallest product, end at most at `t₀ · B₀`.
+            let tb = |r: &Run| r.t_ns * r.index_bytes as f64;
+            let no_pairs = sel.runs.iter().find(|r| r.t_big.is_none()).expect("a run");
+            assert!(tb(no_pairs) <= mean * b0 as f64 * (1.0 + 1e-12));
+            assert!(sel.runs.iter().all(|r| tb(best) <= tb(r)));
+            assert_eq!(best.t_ns, mean - best.saving_ns());
+            assert_eq!(best.index_bytes, b0 + best.bytes());
+            // A larger index makes bytes relatively cheaper: never fewer bytes taken (with
+            // the same order of items, a lower threshold).
+            let n_items = best.islands.len() + best.pairs.len();
+            if last != usize::MAX {
+                assert!(n_items >= last, "{b0}: {n_items} < {last}");
+            }
+            last = n_items;
+            assert!(best.bytes() <= all.best.bytes() + best.fixed_bytes);
+        }
+        // An index of 1 KiB: no item lowers `t · B`; of 1 TiB: the elasticity rule takes what
+        // the budget rule takes.
+        let none = select(&s, &sample, &values, &params(1 << 10, Stop::Elasticity));
+        assert!(none.best.islands.is_empty() && none.pairs.is_empty());
+        let big = select(&s, &sample, &values, &params(1 << 40, Stop::Elasticity));
+        assert_eq!(big.best.islands, all.best.islands);
     }
 }

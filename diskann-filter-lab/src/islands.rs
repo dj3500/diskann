@@ -229,6 +229,14 @@ pub struct QueryModel {
     /// independent of the query's point) instead of the query's point: 0 keeps the categories
     /// of a query as correlated as in the data, 1 makes them independent.
     pub fresh: f64,
+    /// Share `μ` of the workload's second component, *pair contexts*: a pair of labels of
+    /// different categories drawn uniformly among the `contexts` pairs that co-occur, as the
+    /// query `{a} ∧ {b}` (0: base-derived queries only). A sample of `n_queries` base-derived
+    /// queries then holds `n_queries · μ / (1 − μ)` pair contexts besides.
+    pub uniform: f64,
+    /// Number of co-occurring label pairs of different categories (the pair contexts' support;
+    /// set from the counting pass when `uniform > 0`).
+    pub contexts: u64,
 }
 
 impl Default for QueryModel {
@@ -239,8 +247,31 @@ impl Default for QueryModel {
             cap: 4096,
             singleton: 0.5,
             fresh: 0.0,
+            uniform: 0.0,
+            contexts: 0,
         }
     }
+}
+
+impl QueryModel {
+    /// Pair contexts in a sample of `n_queries` base-derived queries (see [`Self::uniform`]).
+    pub fn n_pair_queries(&self) -> usize {
+        if self.uniform > 0.0 && self.contexts > 0 {
+            assert!(
+                self.uniform < 1.0,
+                "the pair contexts' share must be below 1"
+            );
+            (self.n_queries as f64 * self.uniform / (1.0 - self.uniform)).round() as usize
+        } else {
+            0
+        }
+    }
+}
+
+/// The pair context of sample query `qi` (a pair-context query of the sample, see
+/// [`QueryModel::uniform`]): an index into the `contexts` co-occurring pairs, drawn uniformly.
+pub fn pair_context_draw(model: &QueryModel, qi: usize) -> usize {
+    (mix(model.seed ^ 0x5041_4952 ^ mix(qi as u64)) % model.contexts.max(1)) as usize
 }
 
 #[inline]
@@ -388,9 +419,60 @@ pub(crate) fn draw_query(
     true
 }
 
+/// The smallest clause of a drawn query (its index and its upper bound `s_min`, the summed
+/// postings of its labels) and the query's estimated match count `M`: every `stride`-th member
+/// of the smallest clause (each member once: counted at the first of the clause's labels in its
+/// row) checked against the other clauses, scaled to `s_min` (at least 1).
+pub(crate) fn query_matches(
+    labels: &LabelStore,
+    model: &QueryModel,
+    kl: &[u32],
+    clauses: &[(usize, usize)],
+) -> (usize, u64, f64) {
+    let size = |&(a, b): &(usize, usize)| -> u64 {
+        kl[a..b].iter().map(|&l| labels.posting_len(l) as u64).sum()
+    };
+    let (jmin, s_min) = clauses
+        .iter()
+        .enumerate()
+        .map(|(j, r)| (j, size(r)))
+        .min_by_key(|&(_, s)| s)
+        .expect("a clause");
+    let m = if clauses.len() == 1 {
+        s_min as f64
+    } else {
+        let (a0, b0) = clauses[jmin];
+        let cl0 = &kl[a0..b0];
+        let stride = (s_min as usize).div_ceil(model.cap).max(1);
+        let (mut seen, mut hit, mut pos) = (0u64, 0u64, 0usize);
+        for (x, &l) in cl0.iter().enumerate() {
+            let post = labels.postings(l);
+            let first = (stride - pos % stride) % stride;
+            for &v in post.iter().skip(first).step_by(stride) {
+                let vr = labels.row(v);
+                if cl0[..x].iter().any(|&e| vr.binary_search(&e).is_ok()) {
+                    continue;
+                }
+                seen += 1;
+                if clauses
+                    .iter()
+                    .enumerate()
+                    .all(|(j, &(a, b))| j == jmin || meets(vr, &kl[a..b]))
+                {
+                    hit += 1;
+                }
+            }
+            pos += post.len();
+        }
+        (hit as f64 * s_min as f64 / seen.max(1) as f64).max(1.0)
+    };
+    (jmin, s_min, m)
+}
+
 impl QuerySample {
-    /// Draws the queries and computes their cost terms (with up to `threads` threads; the
-    /// result does not depend on the thread count).
+    /// Draws the base-derived queries and computes their cost terms (with up to `threads`
+    /// threads; the result does not depend on the thread count). Without pair contexts (see
+    /// [`Self::build_mixed`]).
     pub fn build(
         labels: &LabelStore,
         c: &UnitCosts,
@@ -398,10 +480,34 @@ impl QuerySample {
         model: QueryModel,
         threads: usize,
     ) -> Self {
+        let model = QueryModel {
+            uniform: 0.0,
+            ..model
+        };
+        Self::build_mixed(labels, c, k, model, &[], threads)
+    }
+
+    /// [`Self::build`] with the workload's pair contexts ([`QueryModel::uniform`]): after the
+    /// `n_queries` base-derived queries, [`QueryModel::n_pair_queries`] queries `{a} ∧ {b}` of
+    /// pairs drawn uniformly from `contexts` (every co-occurring pair of labels of different
+    /// categories, with its joint size: the match count `M`), all with the same weight.
+    pub fn build_mixed(
+        labels: &LabelStore,
+        c: &UnitCosts,
+        k: usize,
+        model: QueryModel,
+        contexts: &[crate::select::PairCand],
+        threads: usize,
+    ) -> Self {
+        assert!(
+            model.uniform == 0.0 || model.contexts == contexts.len() as u64,
+            "the model's pair contexts must be the given ones"
+        );
         let n = labels.n_points();
         let nf = n as f64;
         let chunk = 1024usize;
-        let n_chunks = model.n_queries.div_ceil(chunk);
+        let n_total = model.n_queries + model.n_pair_queries();
+        let n_chunks = n_total.div_ceil(chunk);
         let init = || {
             (
                 Vec::<u32>::new(),
@@ -413,52 +519,24 @@ impl QuerySample {
             let (kl, clauses, cats) = scratch;
             let mut base = Vec::new();
             let mut recs = Vec::new();
-            for qi in ci * chunk..((ci + 1) * chunk).min(model.n_queries) {
-                if !draw_query(labels, &model, qi, kl, clauses, cats) {
-                    base.push(0.0);
-                    continue;
-                }
-                let (kl, clauses): (&Vec<u32>, &Vec<(usize, usize)>) = (kl, clauses);
-                let size = |&(a, b): &(usize, usize)| -> u64 {
-                    kl[a..b].iter().map(|&l| labels.posting_len(l) as u64).sum()
-                };
-                let (jmin, s_min) = clauses
-                    .iter()
-                    .enumerate()
-                    .map(|(j, r)| (j, size(r)))
-                    .min_by_key(|&(_, s)| s)
-                    .expect("a clause");
-                // Match count: every `stride`-th member of the smallest clause (each member
-                // once: counted at the first of the clause's labels in its row) checked
-                // against the other clauses.
-                let m = if clauses.len() == 1 {
-                    s_min as f64
-                } else {
-                    let (a0, b0) = clauses[jmin];
-                    let cl0 = &kl[a0..b0];
-                    let stride = (s_min as usize).div_ceil(model.cap).max(1);
-                    let (mut seen, mut hit, mut pos) = (0u64, 0u64, 0usize);
-                    for (x, &l) in cl0.iter().enumerate() {
-                        let post = labels.postings(l);
-                        let first = (stride - pos % stride) % stride;
-                        for &v in post.iter().skip(first).step_by(stride) {
-                            let vr = labels.row(v);
-                            if cl0[..x].iter().any(|&e| vr.binary_search(&e).is_ok()) {
-                                continue;
-                            }
-                            seen += 1;
-                            if clauses
-                                .iter()
-                                .enumerate()
-                                .all(|(j, &(a, b))| j == jmin || meets(vr, &kl[a..b]))
-                            {
-                                hit += 1;
-                            }
-                        }
-                        pos += post.len();
+            for qi in ci * chunk..((ci + 1) * chunk).min(n_total) {
+                let (s_min, m) = if qi < model.n_queries {
+                    if !draw_query(labels, &model, qi, kl, clauses, cats) {
+                        base.push(0.0);
+                        continue;
                     }
-                    (hit as f64 * s_min as f64 / seen.max(1) as f64).max(1.0)
+                    let (_, s_min, m) = query_matches(labels, &model, kl, clauses);
+                    (s_min, m)
+                } else {
+                    let p = &contexts[pair_context_draw(&model, qi)];
+                    kl.clear();
+                    kl.extend([p.a, p.b]);
+                    clauses.clear();
+                    clauses.extend([(0, 1), (1, 2)]);
+                    let s_min = labels.posting_len(p.a).min(labels.posting_len(p.b)) as u64;
+                    (s_min, f64::from(p.joint).max(1.0))
                 };
+                let (kl, clauses): (&Vec<u32>, &Vec<(usize, usize)>) = (kl, clauses);
                 let rho_min = s_min as f64 / nf;
                 let checks = if clauses.len() > 1 {
                     s_min as f64 * c.pred(rho_min)
@@ -485,7 +563,7 @@ impl QuerySample {
             }
             (base, recs)
         });
-        let mut base_ns = Vec::with_capacity(model.n_queries);
+        let mut base_ns = Vec::with_capacity(n_total);
         let mut recs = Vec::new();
         for (b, r) in parts {
             base_ns.extend(b);
@@ -1210,6 +1288,7 @@ mod tests {
             cap: 512,
             singleton: 0.5,
             fresh: 0.0,
+            ..Default::default()
         };
         let one = QuerySample::build(&s, &c, 10, model, 1);
         let three = QuerySample::build(&s, &c, 10, model, 3);
