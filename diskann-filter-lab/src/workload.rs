@@ -25,7 +25,7 @@
 //! (seeded). [`Walk::draw`] draws `U` i.i.d. as concrete queries (for measurements).
 
 use crate::{
-    islands::{draw_query, mix, query_matches, QueryModel},
+    islands::{draw_query, mix, QueryModel},
     labels::LabelStore,
     select::PairCand,
 };
@@ -34,8 +34,11 @@ use crate::{
 const POINT_SALT: u64 = 0x5eed_0f0b_ec70_45a1;
 /// Salt of the walks.
 const WALK_SALT: u64 = 0x3c6e_f372_fe94_f82b;
-/// Proposals tried before the third label's candidates are enumerated.
+/// Proposals tried before the third label's candidates are enumerated (rejection sampling).
 const PROPOSALS: usize = 64;
+/// Labels in the categories left for the third label up to which its candidates are enumerated
+/// from the points carrying the first two (a cost switch only: both ways draw it uniformly).
+const ENUMERATE_MAX: usize = 4096;
 
 /// The data point whose vector is query `q`'s in a sample of `n_data` base-derived queries
 /// followed by the independent ones: a base-derived query's own point (the one it was drawn
@@ -88,6 +91,24 @@ pub fn draw_data(labels: &LabelStore, model: &QueryModel, i: usize) -> Option<Dr
             .collect(),
         point: query_point(model, labels.n_points(), usize::MAX, i),
     })
+}
+
+/// The parts of a sorted label list outside two categories' label-id ranges (up to three
+/// slices).
+fn outside<'s>(list: &'s [u32], ex: &[std::ops::Range<u32>; 2]) -> [&'s [u32]; 3] {
+    let mut cut = ex.clone().map(|r| {
+        (
+            list.partition_point(|&v| v < r.start),
+            list.partition_point(|&v| v < r.end),
+        )
+    });
+    cut.sort_unstable();
+    let (a, b) = (cut[0], cut[1]);
+    [
+        &list[..a.0],
+        &list[a.1..b.0.max(a.1)],
+        &list[b.1.max(a.1)..],
+    ]
 }
 
 /// One independent query with its probability.
@@ -159,6 +180,9 @@ pub struct Walk<'a> {
     contexts: &'a [PairCand],
     /// The labels that occur, per category with labels.
     cats: Vec<Vec<u32>>,
+    /// Number of labels that occur, per category id, and in all.
+    cat_len: Vec<usize>,
+    n_occurring: usize,
     /// Co-occurring labels of other categories, per label (rows sorted).
     off: Vec<usize>,
     adj: Vec<u32>,
@@ -177,6 +201,8 @@ impl<'a> Walk<'a> {
                 cats[labels.category(l) as usize].push(l);
             }
         }
+        let cat_len: Vec<usize> = cats.iter().map(Vec::len).collect();
+        let n_occurring = cat_len.iter().sum();
         cats.retain(|c| !c.is_empty());
         let mut deg = vec![0usize; nl + 1];
         for p in contexts {
@@ -203,6 +229,8 @@ impl<'a> Walk<'a> {
             labels,
             contexts,
             cats,
+            cat_len,
+            n_occurring,
             off,
             adj,
             k_max,
@@ -228,52 +256,113 @@ impl<'a> Walk<'a> {
         c[(*z % c.len() as u64) as usize]
     }
 
-    /// Whether some point carries `x`, `y` and `w`.
-    fn cooccur3(&self, x: u32, y: u32, w: u32) -> bool {
+    /// Number of points that carry `x`, `y` and `w` (`any`: stop at the first).
+    fn count3(&self, x: u32, y: u32, w: u32, any: bool) -> u32 {
         let mut t = [x, y, w];
         t.sort_by_key(|&l| self.labels.posting_len(l));
-        self.labels.postings(t[0]).iter().any(|&p| {
+        let mut n = 0;
+        for &p in self.labels.postings(t[0]) {
             let r = self.labels.row(p);
-            r.binary_search(&t[1]).is_ok() && r.binary_search(&t[2]).is_ok()
-        })
+            if r.binary_search(&t[1]).is_ok() && r.binary_search(&t[2]).is_ok() {
+                n += 1;
+                if any {
+                    break;
+                }
+            }
+        }
+        n
     }
 
-    /// A third label for `x`, `y`: uniformly among the distinct labels of the other categories
-    /// on the points carrying both (proposals drawn uniformly from the smaller of the two
-    /// neighbour lists outside `x`'s and `y`'s categories and accepted if they qualify — so the
+    /// The labels that occur in the categories other than `x`'s and `y`'s.
+    fn rest_labels(&self, x: u32, y: u32) -> usize {
+        let len = |l: u32| self.cat_len[self.labels.category(l) as usize];
+        self.n_occurring - len(x) - len(y)
+    }
+
+    /// The candidates for the third label after `x`, `y` — the distinct labels of the other
+    /// categories on the points carrying both — with the number of those points carrying each
+    /// (sorted by label): one scan of the smaller of the two postings.
+    fn third_table(&self, x: u32, y: u32) -> Vec<(u32, u32)> {
+        let (s, o) = if self.labels.posting_len(x) <= self.labels.posting_len(y) {
+            (x, y)
+        } else {
+            (y, x)
+        };
+        let ex = [x, y].map(|l| self.labels.category_labels(self.labels.category(l)));
+        let mut found = Vec::new();
+        for &p in self.labels.postings(s) {
+            let r = self.labels.row(p);
+            if r.binary_search(&o).is_ok() {
+                for seg in outside(r, &ex) {
+                    found.extend_from_slice(seg);
+                }
+            }
+        }
+        found.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for l in found {
+            match out.last_mut() {
+                Some((w, c)) if *w == l => *c += 1,
+                _ => out.push((l, 1)),
+            }
+        }
+        out
+    }
+
+    /// A third label for `x`, `y` and its triple's match count: uniformly among the distinct
+    /// labels of the other categories on the points carrying both (`None` if there is none).
+    /// With few labels left ([`ENUMERATE_MAX`]) from their table ([`Self::third_table`],
+    /// `table` if given); otherwise by proposals drawn uniformly from the smaller of the two
+    /// neighbour lists outside `x`'s and `y`'s categories, accepted if they qualify (so the
     /// accepted one is uniform among those that do; after [`PROPOSALS`] rejections the
-    /// qualifying ones are enumerated). `None` if there is none.
-    fn third(&self, x: u32, y: u32, z: &mut u64) -> Option<u32> {
+    /// qualifying ones are enumerated), the count by a scan.
+    fn third(
+        &self,
+        x: u32,
+        y: u32,
+        table: Option<&[(u32, u32)]>,
+        z: &mut u64,
+    ) -> Option<(u32, u32)> {
+        self.third_with(x, y, table, z, ENUMERATE_MAX)
+    }
+
+    /// [`Self::third`] with the enumeration switch at `enumerate_max` labels.
+    fn third_with(
+        &self,
+        x: u32,
+        y: u32,
+        table: Option<&[(u32, u32)]>,
+        z: &mut u64,
+        enumerate_max: usize,
+    ) -> Option<(u32, u32)> {
+        if self.rest_labels(x, y) <= enumerate_max {
+            let owned;
+            let t = match table {
+                Some(t) => t,
+                None => {
+                    owned = self.third_table(x, y);
+                    &owned[..]
+                }
+            };
+            if t.is_empty() {
+                return None;
+            }
+            *z = mix(*z);
+            return Some(t[(*z % t.len() as u64) as usize]);
+        }
         let (nx, ny) = (self.neighbors(x), self.neighbors(y));
         let (prop, other) = if nx.len() <= ny.len() {
             (nx, ny)
         } else {
             (ny, nx)
         };
-        let mut cut: Vec<(usize, usize)> = [x, y]
-            .iter()
-            .map(|&l| {
-                let r = self.labels.category_labels(self.labels.category(l));
-                (
-                    prop.partition_point(|&v| v < r.start),
-                    prop.partition_point(|&v| v < r.end),
-                )
-            })
-            .collect();
-        cut.sort_unstable();
-        let segs: Vec<&[u32]> = [
-            &prop[..cut[0].0],
-            &prop[cut[0].1.max(cut[0].0)..cut[1].0.max(cut[0].1)],
-            &prop[cut[1].1.max(cut[0].1)..],
-        ]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
+        let ex = [x, y].map(|l| self.labels.category_labels(self.labels.category(l)));
+        let segs = outside(prop, &ex);
         let total: usize = segs.iter().map(|s| s.len()).sum();
         if total == 0 {
             return None;
         }
-        let ok = |w: u32| other.binary_search(&w).is_ok() && self.cooccur3(x, y, w);
+        let ok = |w: u32| other.binary_search(&w).is_ok() && self.count3(x, y, w, true) > 0;
         let pick = |mut i: usize| -> u32 {
             for s in &segs {
                 if i < s.len() {
@@ -283,48 +372,45 @@ impl<'a> Walk<'a> {
             }
             unreachable!("an index below the total")
         };
+        let mut w = None;
         for _ in 0..PROPOSALS {
             *z = mix(*z);
-            let w = pick((*z % total as u64) as usize);
-            if ok(w) {
-                return Some(w);
+            let c = pick((*z % total as u64) as usize);
+            if ok(c) {
+                w = Some(c);
+                break;
             }
         }
-        let all: Vec<u32> = segs
-            .iter()
-            .flat_map(|s| s.iter().copied())
-            .filter(|&w| ok(w))
-            .collect();
-        if all.is_empty() {
-            return None;
+        if w.is_none() {
+            let all: Vec<u32> = segs
+                .iter()
+                .flat_map(|s| s.iter().copied())
+                .filter(|&c| ok(c))
+                .collect();
+            if all.is_empty() {
+                return None;
+            }
+            *z = mix(*z);
+            w = Some(all[(*z % all.len() as u64) as usize]);
+        }
+        let w = w?;
+        Some((w, self.count3(x, y, w, false)))
+    }
+
+    /// The first two labels of a walk from state `z` (`None` for the second: the first
+    /// co-occurs with no label of another category).
+    fn head(&self, z: &mut u64) -> (u32, Option<u32>) {
+        let x = self.first(z);
+        let nx = self.neighbors(x);
+        if nx.is_empty() {
+            return (x, None);
         }
         *z = mix(*z);
-        Some(all[(*z % all.len() as u64) as usize])
+        (x, Some(nx[(*z % nx.len() as u64) as usize]))
     }
 
-    /// A walk of (at most) `k` labels from state `z` (sorted).
-    fn walk(&self, k: usize, z: &mut u64) -> Vec<u32> {
-        let x = self.first(z);
-        let mut out = vec![x];
-        if k >= 2 {
-            let nx = self.neighbors(x);
-            if !nx.is_empty() {
-                *z = mix(*z);
-                let y = nx[(*z % nx.len() as u64) as usize];
-                out.push(y);
-                if k >= 3 {
-                    if let Some(w) = self.third(x, y, z) {
-                        out.push(w);
-                    }
-                }
-            }
-        }
-        out.sort_unstable();
-        out
-    }
-
-    /// Match count of a conjunction of `labels` (sorted, one clause each).
-    fn joint(&self, model: &QueryModel, labels: &[u32]) -> f64 {
+    /// Match count of a conjunction of one or two `labels` (sorted, one clause each).
+    fn joint(&self, labels: &[u32]) -> f64 {
         match labels {
             [a] => self.labels.posting_len(*a) as f64,
             [a, b] => {
@@ -334,12 +420,30 @@ impl<'a> Walk<'a> {
                     .expect("co-occurring labels");
                 f64::from(self.contexts[i].joint)
             }
-            _ => {
-                let clauses: Vec<(usize, usize)> = (0..labels.len()).map(|i| (i, i + 1)).collect();
-                query_matches(self.labels, model, labels, &clauses).2
-            }
+            _ => unreachable!("one or two labels"),
         }
         .max(1.0)
+    }
+
+    /// A walk of (at most) `k` labels from state `z` (sorted) and its match count.
+    fn walk(&self, k: usize, z: &mut u64) -> (Vec<u32>, f64) {
+        let (x, y) = self.head(z);
+        let mut out = vec![x];
+        if k >= 2 {
+            if let Some(y) = y {
+                out.push(y);
+                if k >= 3 {
+                    if let Some((w, c)) = self.third(x, y, None, z) {
+                        out.push(w);
+                        out.sort_unstable();
+                        return (out, f64::from(c).max(1.0));
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        let m = self.joint(&out);
+        (out, m)
     }
 
     /// Independent query `i` drawn i.i.d. (seeded by `model.seed` and `i`): `k` uniform in
@@ -350,7 +454,7 @@ impl<'a> Walk<'a> {
         }
         let mut z = mix(mix(model.seed ^ WALK_SALT) ^ mix(i as u64));
         let k = 1 + (z % self.k_max as u64) as usize;
-        let labels = self.walk(k, &mut z);
+        let (labels, _) = self.walk(k, &mut z);
         z = mix(z);
         Some(Drawn {
             part: Part::Independent,
@@ -408,18 +512,65 @@ pub fn independent(
     let n_pair = queries.len() - n_single;
     let n_walk = if k >= 3 { model.n_queries } else { 0 };
     if n_walk > 0 {
-        let chunk = 256usize;
-        let parts = crate::parallel::par_map(
-            n_walk.div_ceil(chunk),
+        // The walks' first two labels; the third labels' tables once per pair (when few labels
+        // are left: [`Walk::third`]); then the third labels. The result does not depend on the
+        // thread count.
+        let chunk = 1024usize;
+        let n_chunks = n_walk.div_ceil(chunk);
+        let heads: Vec<(u32, Option<u32>, u64)> = crate::parallel::par_map(
+            n_chunks,
             threads,
             || (),
             |ci, _| {
                 (ci * chunk..((ci + 1) * chunk).min(n_walk))
                     .map(|i| {
                         let mut z = mix(mix(model.seed ^ WALK_SALT ^ 3) ^ mix(i as u64));
-                        let l = walk.walk(3, &mut z);
+                        let (x, y) = walk.head(&mut z);
+                        (x, y, z)
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut keys: Vec<(u32, u32)> = heads
+            .iter()
+            .filter_map(|&(x, y, _)| y.map(|y| (x.min(y), x.max(y))))
+            .filter(|&(x, y)| walk.rest_labels(x, y) <= ENUMERATE_MAX)
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let tables: Vec<Vec<(u32, u32)>> = crate::parallel::par_map(
+            keys.len(),
+            threads,
+            || (),
+            |i, _| walk.third_table(keys[i].0, keys[i].1),
+        );
+        let parts = crate::parallel::par_map(
+            n_chunks,
+            threads,
+            || (),
+            |ci, _| {
+                (ci * chunk..((ci + 1) * chunk).min(n_walk))
+                    .map(|i| {
+                        let (x, y, mut z) = heads[i];
+                        let mut l = vec![x];
+                        let mut m = None;
+                        if let Some(y) = y {
+                            l.push(y);
+                            let t = keys
+                                .binary_search(&(x.min(y), x.max(y)))
+                                .ok()
+                                .map(|j| &tables[j][..]);
+                            if let Some((w, c)) = walk.third(x, y, t, &mut z) {
+                                l.push(w);
+                                m = Some(f64::from(c).max(1.0));
+                            }
+                        }
+                        l.sort_unstable();
                         WQuery {
-                            joint: walk.joint(model, &l),
+                            joint: m.unwrap_or_else(|| walk.joint(&l)),
                             labels: l,
                             weight: 1.0 / kf / n_walk as f64,
                         }
@@ -494,20 +645,35 @@ mod tests {
                 .collect();
             want.sort_unstable();
             want.dedup();
-            let mut z = mix(u64::from(x) << 32 | u64::from(y));
-            let draws = 6_000;
-            let mut got = std::collections::BTreeMap::<u32, usize>::new();
-            for _ in 0..draws {
-                let w = walk.third(x, y, &mut z).expect("a third label");
-                *got.entry(w).or_default() += 1;
-            }
-            assert_eq!(got.keys().copied().collect::<Vec<_>>(), want, "({x}, {y})");
-            let e = draws as f64 / want.len() as f64;
-            for (&w, &n) in &got {
-                assert!(
-                    (n as f64 - e).abs() < 5.0 * e.sqrt(),
-                    "({x}, {y}) {w}: {n} vs {e}"
-                );
+            // Both ways (the table, and rejection with a scan) draw it uniformly, with the
+            // triple's match count.
+            for enumerate_max in [usize::MAX, 0] {
+                let mut z = mix(u64::from(x) << 32 | u64::from(y));
+                let draws = 6_000;
+                let mut got = std::collections::BTreeMap::<u32, usize>::new();
+                for _ in 0..draws {
+                    let (w, c) = walk
+                        .third_with(x, y, None, &mut z, enumerate_max)
+                        .expect("a third label");
+                    let brute = s
+                        .postings(w)
+                        .iter()
+                        .filter(|&&q| {
+                            let r = s.row(q);
+                            r.binary_search(&x).is_ok() && r.binary_search(&y).is_ok()
+                        })
+                        .count();
+                    assert_eq!(c as usize, brute);
+                    *got.entry(w).or_default() += 1;
+                }
+                assert_eq!(got.keys().copied().collect::<Vec<_>>(), want, "({x}, {y})");
+                let e = draws as f64 / want.len() as f64;
+                for (&w, &n) in &got {
+                    assert!(
+                        (n as f64 - e).abs() < 5.0 * e.sqrt(),
+                        "({x}, {y}) {w}: {n} vs {e}"
+                    );
+                }
             }
         }
         // `c5` and `e3` never meet: no walk holds both, and a pair with `c5` never takes `e3`.
