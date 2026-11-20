@@ -17,7 +17,7 @@ use super::{
     },
     config::{
         Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator, TreeChoice, TreeEffort,
+        StartSource, Terminator, TreeChoice, TreeEffort, TreeRoute,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -368,6 +368,12 @@ pub struct Plan {
     /// Mean out-degree of the graph's auxiliary nodes (the routers' fan-out; `tree_choice =
     /// cost`).
     tree_fanout: f64,
+    /// `tree_route = "cost"`: the tree route's plans per member check (row scan, static
+    /// bitsets skipping c\*, per-query bitmap), one chosen per query by model cost.
+    tree_checks: Vec<Plan>,
+    /// `tree_route = "cost"`: member children per router (sampled), the members a tree search
+    /// checks per router it expands.
+    tree_kappa: f64,
 }
 
 impl Plan {
@@ -544,6 +550,20 @@ impl Plan {
         } else {
             FastPath::None
         };
+        let tree_checks: Vec<Plan> = kernel
+            .tree_check_kernels()
+            .into_iter()
+            .map(|k| tree_plan(k, ix))
+            .collect::<Result<_>>()?;
+        let tree_kappa = if kernel.tree_route == TreeRoute::Cost {
+            ensure!(
+                costs.is_some() && ix.bitsets.is_some(),
+                "tree_route = cost needs the unit costs (a calibration) and the static bitsets"
+            );
+            member_children_per_router(ix.graph)
+        } else {
+            0.0
+        };
         Ok(Self {
             kernel: kernel.clone(),
             projection,
@@ -561,19 +581,10 @@ impl Plan {
             exact_eval,
             tree: kernel
                 .tree_kernel()
-                .map(|mut k| {
-                    // The `static_bits` tree route checks with the index's bitsets at their θ.
-                    if k.predicate == PredicateMode::StaticBits(0) {
-                        let b = ix.bitsets.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "tree_route = static_bits needs static per-label bitsets"
-                            )
-                        })?;
-                        k.predicate = PredicateMode::StaticBits(b.theta());
-                    }
-                    Plan::new(&k, ix).map(Box::new)
-                })
+                .map(|k| tree_plan(k, ix).map(Box::new))
                 .transpose()?,
+            tree_checks,
+            tree_kappa,
             tree_fanout: if kernel.tree_choice == TreeChoice::Cost {
                 let (n, a) = (ix.graph.n_data() as u32, ix.graph.n_aux() as u32);
                 let edges: usize = (n..n + a).map(|v| ix.graph.degree(v)).sum();
@@ -594,6 +605,7 @@ impl Plan {
             && (self.kernel.exact_plans.contains(ExactPlan::Bitmap)
                 || self.kernel.exact_plans.contains(ExactPlan::RowAnd)))
             || self.tree.as_ref().is_some_and(|t| t.needs_dense())
+            || self.tree_checks.iter().any(Plan::needs_dense)
     }
 
     /// The same plan without its hand-specialized fast path (every query runs the
@@ -858,7 +870,16 @@ impl Searcher {
                         self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
                     }
                 };
+                let choice = (!plan.tree_checks.is_empty())
+                    .then(|| self.tree_check_choice(plan, ix, l_tree));
+                let tp = choice.map_or(tp, |(i, _)| &plan.tree_checks[i]);
                 let mut ctr = self.search(tp, ix, q, l_tree, ids, dists, reference);
+                if let Some((i, cost)) = choice {
+                    // The member check taken (101 row scan, 102 static bits, 103 bitmap) and
+                    // its model cost.
+                    ctr.plan = 101 + i as u64;
+                    ctr.est_graph_ns = cost.round() as u64;
+                }
                 ctr.n_probe += pc.n_probe;
                 ctr.t_probe_ns += pc.t_probe_ns;
                 ctr.est_probe_ns = pc.est_probe_ns;
@@ -1398,6 +1419,59 @@ impl Searcher {
         tree_frontier(plan, &est, effort, k, ix.graph.n_nodes()).0
     }
 
+    /// `tree_route = "cost"`: the member check of the tree route with the lowest model cost for
+    /// the query compiled by [`Self::tree_eligible`] (its index in `Plan::tree_checks`, and
+    /// that cost): `M = min(U(c*), κ F)` members (`F` the tree route's list size, `κ` the
+    /// routers' member children), each checked with the worst-case work of its clauses
+    /// ([`MemberWork::of_mask`]: the row scan reads the row; the static check probes the
+    /// bitset words of the clauses other than c\* and reads the row only for labels without
+    /// a bitset; the bitmap probes one word) at the unit costs of density `M / n`, plus the
+    /// bitmap's construction as the exact path's `bitmap` plan prices it.
+    fn tree_check_choice<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        l_tree: usize,
+    ) -> (usize, f64) {
+        let (Some(c), Some(b)) = (plan.costs.as_ref(), ix.bitsets) else {
+            return (0, 0.0);
+        };
+        let q = &mut self.compiled;
+        q.split_static(ix.labels, b, b.theta(), false);
+        let n = ix.graph.n_data() as f64;
+        let m = (plan.tree_kappa * l_tree as f64)
+            .min(q.min_upper_bound() as f64)
+            .max(1.0);
+        let rho = m / n;
+        let nc = q.n_clauses();
+        let full = if nc >= 64 { u64::MAX } else { (1u64 << nc) - 1 };
+        let row = c.member(&MemberWork::of_mask(q, false, full), rho);
+        let stat = c.member(&MemberWork::of_mask(q, true, full & !1), rho);
+        let bit = c.member(
+            &MemberWork {
+                words: 1.0,
+                ..MemberWork::default()
+            },
+            rho,
+        );
+        let words = (n / 64.0).ceil();
+        let mut build = words * c.word_ns;
+        for j in 0..nc {
+            build += if j == 0 { 1.0 } else { 2.0 } * words * c.word_ns;
+            for &l in q.clause(j) {
+                build += match b.slot(l) {
+                    Some(_) => words * c.word_ns,
+                    None => ix.labels.posting_len(l) as f64 * c.scatter_ns,
+                };
+            }
+        }
+        let costs = [m * row, m * stat, build + m * bit];
+        let i = (0..costs.len())
+            .min_by(|&x, &y| costs[x].total_cmp(&costs[y]))
+            .unwrap_or(0);
+        (i, costs[i])
+    }
+
     /// `tree_choice = cost`: the tree route's list size when its model cost is below the cost
     /// of the route the crossover chose (`d`, with the estimates it used): per router
     /// expansion (the frontier, at most the binding clause's routers) its fan-out of member
@@ -1677,6 +1751,34 @@ impl Searcher {
             }
         }
     }
+}
+
+/// The plan of a tree-route kernel; `static_bits(0)` (the `static_bits` check) takes the
+/// index's bitsets at their θ.
+fn tree_plan<T: Element>(mut k: Kernel, ix: &Index<'_, T>) -> Result<Plan> {
+    if k.predicate == PredicateMode::StaticBits(0) {
+        let b = ix.bitsets.ok_or_else(|| {
+            anyhow::anyhow!("the static_bits member check needs static per-label bitsets")
+        })?;
+        k.predicate = PredicateMode::StaticBits(b.theta());
+    }
+    Plan::new(&k, ix)
+}
+
+/// Data-point children per auxiliary node with children, over a strided sample of at most
+/// 100,000 of them (the members a router-tree search checks per router it expands).
+fn member_children_per_router(g: &Graph) -> f64 {
+    let (n, nn) = (g.n_data() as u32, g.n_nodes() as u32);
+    let step = ((nn - n) / 100_000).max(1) as usize;
+    let (mut members, mut routers) = (0u64, 0u64);
+    for v in (n..nn).step_by(step) {
+        let nb = g.neighbors(v);
+        if !nb.is_empty() {
+            routers += 1;
+            members += nb.iter().filter(|&&u| u < n).count() as u64;
+        }
+    }
+    members as f64 / routers.max(1) as f64
 }
 
 /// Number of starts a graph search of the query will select (before deduplication).

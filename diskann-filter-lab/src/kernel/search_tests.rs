@@ -1194,6 +1194,87 @@ fn the_static_bits_tree_route_checks_only_the_other_clauses() {
     ]);
 }
 
+#[test]
+fn the_cost_tree_route_picks_the_cheapest_member_check() {
+    use super::cost::UnitCosts;
+    // As above: a router (id 5) over the members 0, 2 and 4 of `x=1` (c*), `y=1` on 0, 1, 3, 4.
+    let rows: &[&[&str]] = &[
+        &["x=1", "y=1"],
+        &["y=1"],
+        &["x=1", "y=2"],
+        &["y=1"],
+        &["x=1", "y=1"],
+    ];
+    let (base, mut g, labels) = line(rows, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    let id = |s: &str| labels.name_index()[s];
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(id("x=1"), 5), (id("y=1"), 1), (id("y=2"), 2)])
+        .unwrap();
+    let bitsets = LabelBitsets::build(&labels, 1);
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    pb.push(&[vec!["x=1"], vec!["y=1", "y=2"]]);
+    let preds = pb.finish();
+    let shaped = |base: f64, word: f64, row: f64, word_ns: f64| UnitCosts {
+        check_base_ns: vec![base; 6],
+        check_word_ns: vec![word; 6],
+        check_prefetch_ns: vec![0.0; 6],
+        check_row_ns: vec![row; 6],
+        word_ns,
+        scatter_ns: 0.0,
+        ..UnitCosts::default()
+    };
+    let run = |costs: &UnitCosts, qi: usize| {
+        let ix = Index {
+            graph: &g,
+            vectors: g.vectors(&base).unwrap(),
+            labels: &labels,
+            global: &[0],
+            label_starts: Some(&st),
+            sample: None,
+            label_view: false,
+            view_postings: None,
+            eps_min: 0.5,
+            bitsets: Some(&bitsets),
+            costs: Some(costs),
+            sketches: Some(&sketches),
+            pairs: None,
+        };
+        let k = kernel(&[
+            ("starts", "label(c*)+global"),
+            ("collector", "heap"),
+            ("crossover", "graph"),
+            ("exact", "planned"),
+            ("estimates", "sketch"),
+            ("tree_route", "cost"),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut s = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
+        let q = Query {
+            vector: &[3.2f32],
+            cnf: preds.get(qi),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 4, &mut ids, &mut d, None);
+        assert_eq!(ctr.route, Route::Tree);
+        (ctr.plan, ids)
+    };
+    let want = [4u32, 0, u32::MAX];
+    // Expensive rows, cheap words, a costly bitmap build: the static check (102).
+    assert_eq!(run(&shaped(1.0, 1.0, 100.0, 1e6), 0), (102, want.to_vec()));
+    // Cheap rows, expensive words: the row scan (101).
+    assert_eq!(run(&shaped(1.0, 100.0, 1.0, 1e6), 0), (101, want.to_vec()));
+    // A free bitmap build against two residual words per member: the bitmap (103).
+    assert_eq!(run(&shaped(1.0, 10.0, 100.0, 0.0), 1), (103, vec![4, 2, 0]));
+    // The cost route needs a planned exact path (its unit costs) and tree_choice = always.
+    let mut k = Kernel::default();
+    k.set("tree_route", "cost").unwrap();
+    assert!(k.validate().is_err());
+}
+
 /// Six points on a line (x = i, all labelled `x=1`), leaf routers 6 (over 0, 1, 2; at 1) and
 /// 7 (over 3, 4, 5; at 4) under a root 8 (at 2.5), the root as the label's only start.
 fn router_tree() -> (Matrix<f32>, Graph, LabelStore, Starts) {

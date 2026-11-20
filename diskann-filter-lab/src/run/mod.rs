@@ -375,7 +375,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                         c.kernel.materializer,
                         Materializer::DenseStatic | Materializer::DenseNav
                     ) || uses_exact_bitsets(c)
-                        || c.kernel.tree_route == TreeRoute::StaticBits
+                        || matches!(c.kernel.tree_route, TreeRoute::StaticBits | TreeRoute::Cost)
                 })
                 .then(|| ds.labels.n_points().div_ceil(64) as u64)
         });
@@ -617,7 +617,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                         Materializer::DenseStatic | Materializer::DenseNav
                     )
                     || uses_exact_bitsets(c)
-                    || c.kernel.tree_route == TreeRoute::StaticBits)
+                    || matches!(c.kernel.tree_route, TreeRoute::StaticBits | TreeRoute::Cost))
                     .then(|| bitsets_json["source"].clone()),
                 "calibration": uses_costs(c).then(|| c.calibration.clone()).flatten(),
                 "sketches": (c.kernel.estimates == EstimateSource::Sketch)

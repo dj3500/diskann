@@ -553,6 +553,9 @@ pub enum TreeRoute {
     /// satisfies; `cstar_members`) with the static bitsets, the row only for labels without
     /// a bitset.
     StaticBits,
+    /// Per query, the member check (`row_scan`, `static_bits` or `bitmap`) with the lowest
+    /// model cost from the calibrated unit costs (see `Plan::tree_checks`).
+    Cost,
 }
 
 impl TreeRoute {
@@ -562,7 +565,8 @@ impl TreeRoute {
             "row_scan" => Self::RowScan,
             "bitmap" => Self::Bitmap,
             "static_bits" => Self::StaticBits,
-            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap, static_bits)"),
+            "cost" => Self::Cost,
+            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap, static_bits, cost)"),
         })
     }
 }
@@ -574,6 +578,7 @@ impl fmt::Display for TreeRoute {
             Self::RowScan => "row_scan",
             Self::Bitmap => "bitmap",
             Self::StaticBits => "static_bits",
+            Self::Cost => "cost",
         })
     }
 }
@@ -1441,8 +1446,16 @@ impl Kernel {
         );
         ensure!(
             !(self.static_bitsets_off
-                && matches!(self.tree_route, TreeRoute::Bitmap | TreeRoute::StaticBits)),
-            "static_bitsets = \"off\" excludes tree_route = \"bitmap\" and \"static_bits\" (their member checks use the static bitsets)"
+                && matches!(
+                    self.tree_route,
+                    TreeRoute::Bitmap | TreeRoute::StaticBits | TreeRoute::Cost
+                )),
+            "static_bitsets = \"off\" excludes tree_route = \"bitmap\", \"static_bits\" and \"cost\" (their member checks use the static bitsets)"
+        );
+        ensure!(
+            self.tree_route != TreeRoute::Cost
+                || (self.tree_choice == TreeChoice::Always && self.exact.is_planned()),
+            "tree_route = \"cost\" needs tree_choice = always and a planned exact path (its unit costs)"
         );
         ensure!(
             !self.cstar_members
@@ -1566,6 +1579,24 @@ impl Kernel {
         j
     }
 
+    /// The kernels of the tree route's member checks under `tree_route = "cost"`, in the
+    /// order of `Plan::tree_checks`: row scan, static bitsets skipping c\*, per-query bitmap.
+    pub fn tree_check_kernels(&self) -> Vec<Kernel> {
+        if self.tree_route != TreeRoute::Cost {
+            return Vec::new();
+        }
+        [TreeRoute::RowScan, TreeRoute::StaticBits, TreeRoute::Bitmap]
+            .into_iter()
+            .filter_map(|r| {
+                Kernel {
+                    tree_route: r,
+                    ..self.clone()
+                }
+                .tree_kernel()
+            })
+            .collect()
+    }
+
     /// The kernel of the tree route's search (`None` when the route is off).
     pub fn tree_kernel(&self) -> Option<Kernel> {
         let (predicate, materializer) = match self.tree_route {
@@ -1574,6 +1605,8 @@ impl Kernel {
             TreeRoute::Bitmap => (PredicateMode::Bitmap, Materializer::DenseStatic),
             // θ = 0: the index's bitsets' θ (set by `Plan::new`).
             TreeRoute::StaticBits => (PredicateMode::StaticBits(0), Materializer::None),
+            // The first of `tree_kernels` (the others are chosen per query).
+            TreeRoute::Cost => (PredicateMode::RowScan, Materializer::None),
         };
         Some(Kernel {
             starts: vec![StartSource::LabelSmallest],
