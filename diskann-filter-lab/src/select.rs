@@ -51,13 +51,16 @@
 //! `λ = κ · (mean cost per query) / (index bytes)`: with `κ = 1`, an item must speed the workload
 //! up by at least the fraction by which it grows the index (labels of a smaller bound on their
 //! pairs' value are not counted at all). Pairs need the co-occurrence matrix of their big labels
-//! (every label of at least `T` points, `N_T` of them: `N_T·⌈N_T/64⌉·8` bytes, plus the directory;
-//! it also tells the `pair` plan which pairs of big labels never co-occur, which OR-clause covers
-//! need where no pair of theirs is stored — a value the model does not count):
-//! the greedy is run without pairs and for every power of two `T ≥ 64` (pairs of labels of at
-//! least `T` points, their matrix charged to the budget first), and the run with the largest
-//! expected saving is kept, provided the pairs pay for their matrix too (their saving at least
-//! `λ` times their bytes and the matrix's).
+//! (the `N_T` labels of at least `T` points in a candidate pair with a positive saving:
+//! `N_T·⌈N_T/64⌉·8` bytes, plus the directory; a lookup of two big labels that never co-occur
+//! answers `Empty`): the greedy is run without pairs and for every power of two `T ≥ 64` (pairs
+//! of labels of at least `T` points, their matrix charged to the budget first), and the run with
+//! the largest expected saving is kept, provided the pairs pay for their matrix too (their saving
+//! at least `λ` times their bytes and the matrix's). (B3a's rule, every label of at least `T`
+//! points big, answers `Empty` for more pairs, but its larger matrix makes the greedy settle on
+//! a larger `T`, i.e. fewer pairs of mid-sized labels; measured worse on the severe cells.)
+
+use std::collections::BTreeSet;
 
 use crate::{
     islands::{IslandGreedy, QueryModel, QuerySample},
@@ -445,15 +448,11 @@ pub fn select(
     values: &[PairValue],
     params: &Params,
 ) -> Selection {
-    // Big labels at `T`: every label of at least `T` (and fewer than `n`) points, as in B3a's
-    // structure — the matrix then tells the `pair` plan which of their pairs never co-occur,
-    // which OR-clause covers need even where no pair of theirs is stored.
-    let n = labels.n_points();
-    let cand_labels: Vec<u32> = (0..labels.n_labels() as u32)
-        .filter(|&l| {
-            let s = labels.posting_len(l);
-            s as u64 >= pairs::T_MIN && s < n
-        })
+    let cand_labels: Vec<u32> = values
+        .iter()
+        .flat_map(|v| [v.cand.a, v.cand.b])
+        .collect::<BTreeSet<u32>>()
+        .into_iter()
         .collect();
     let max_t = values
         .iter()
