@@ -2326,6 +2326,33 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         );
     }
     std::fs::write(a.out_dir.join("pair-values.tsv"), tsv)?;
+    if let (Some(ts), Some(pr)) = (&tree_sample, &pricing) {
+        // Track G: every label tree's value before the greedy (its saving per query on its
+        // base-derived queries, pair contexts and single label; per byte).
+        let g = diskann_filter_lab::select_g::TreeGreedy::with_classes(
+            ts,
+            &store,
+            pr,
+            &f,
+            a.tree_min_records,
+        );
+        let mut tsv =
+            String::from("label\tsize\tqueries\tcontexts\tderived_ns\tsaving_ns\tbytes\tvalue\n");
+        for t in &g.terms {
+            tsv += &format!(
+                "{}\t{}\t{}\t{}\t{:.3e}\t{:.3e}\t{}\t{:.4e}\n",
+                t.label,
+                t.size,
+                t.queries,
+                t.contexts,
+                t.derived_ns,
+                t.saving_ns,
+                t.bytes,
+                t.saving_ns / t.bytes as f64
+            );
+        }
+        std::fs::write(a.out_dir.join("tree-values.tsv"), tsv)?;
+    }
     let preds = a
         .report
         .iter()
