@@ -52,7 +52,8 @@ flab convert labels     --format jsonl -i base_labels.jsonl -o labels.flab
 # Vectors: copy a .bin file, optionally scaling rows to unit L2 norm (f32 only)
 flab convert vectors --dtype f32 --normalize -i query.bin -o queries.fbin
 
-# Ground truth: DiskANN file and/or the extended file
+# Ground truth: DiskANN file and/or the extended file (queries without clauses — the filter-less
+# problem — are computed in blocks: each base chunk read once per block of queries)
 flab gt --base base.u8bin --queries queries.u8bin --labels labels.flab \
         --predicates queries.fpred -k 100 -t 8 --out-bin gt100.bin --out-ext gt100.fgt
 
@@ -90,6 +91,22 @@ flab sketches stats --labels labels.flab -b 64,128,256
 # bytes; one pairs-nested-b<per-mille>.flab per budget, with the coverage of the --report predicate
 # sets; nested selections by default, --plain for independent ones)
 flab pairs build --labels labels.flab --budget 0.2,0.5 -t 2 --out-dir <dir> --report q10K.fpred
+
+# One selector for the auxiliary structures (see "Selected auxiliary structures" below): combination
+# postings and per-label sub-graphs (islands) for the hybrid, or pair trees (and router trees) for
+# graph-only search (--track graph); --budget is a memory ceiling in bytes per data point
+flab select --dataset <dir> --calibration costs.json --graph <graph file> --budget 40 -t 4 \
+        --out-dir <dir>
+flab select --track graph --dataset <dir> --calibration costs.json --graph <graph file> \
+        --budget 40 -t 2 --out-dir <dir>
+
+# Router trees per label (auxiliary router nodes reached only from the start table) and pair trees
+# over selected label pairs, on any graph over the same points
+flab steiner --dataset <dir> --graph <graph> --starts starts.flab --construction tree --block 64 \
+        --min-size 0 --max-size n/10 --router centroid --partition kmeans -t 2 --out-dir <trees>
+flab steiner --dataset <dir> --graph <trees> --starts <trees>/starts.flab --construction pairs \
+        --pairs pairs.flab --block 64 --min-size 0 --max-size n/1 --router centroid \
+        --partition kmeans -t 2 --out-dir <pair trees>
 
 # Experiments with the lab search kernel (pinned to one CPU; see below)
 taskset -c 7 flab run experiment.toml --commit <sha>
@@ -176,6 +193,9 @@ are navigated, never evaluated against the predicate and never returned.
 | `static_bitsets` | `on` (default: the planned exact path, the probe and the post-filter route check clauses with the static bitsets when the index has them), `off`: on the label rows (the plans keep their forms without bitsets: `bitmap` scatters postings, `rowand` gallops; the bitsets are not built for such configurations alone): an ablation of the stored dense rows; excludes `predicate = "static_bits(θ)"` and `materializer = "dense_static"` |
 | `threshold_on` | `bound` (default: the `threshold` crossover takes the exact path when `min_c U_c ≤ T` of `exact`, `U_c` = the sum of clause `c`'s posting sizes), `estimate`: the graph route when the sketch estimate `M̂` of the match count is `≥ T`, else the exact path (needs `crossover = "threshold"`, `estimates = "sketch"` and an exact path with a threshold; the estimates are made once, before routing, and `m_hat` is recorded); an ablation that separates better match-count estimates from pricing by the cost model |
 | `df_pipeline` | `off` (default), `on`: the exact plan `df` checks a candidate inside the answer bound one block of 32 candidates after its distance, with its row offsets and row prefetched meanwhile (as `scan` prefetches its checks; the cost model prices `df`'s checks with the prefetched check curves); the same checks, answers and counters as the direct loop, only memory timing |
+| `tree_route` | `off` (default), `row_scan`, `bitmap`, `static_bits`, `cost`: a query whose binding clause c\* has router-tree roots (`flab steiner`) as starts searches the trees (`aux_only`, strict admission, a heap of the `K` best matches) with that member check; `cost` chooses per query the check of the lowest model cost (calibrated unit costs) |
+| `tree_effort` | `list` (default: the configuration's list), `curve` (the calibrated tree effort curve, `flab tree-calibrate`), `capped`, `fixed(F)` (one router frontier `F` for every query and effort) |
+| `tree_pairs` | `off` (default), `on`: a query whose clause pair is exactly covered by pair trees (`flab steiner --construction pairs`; the run's `pairs_sidecar` and `pair_roots`) with fewer members than c\* searches those trees |
 
 Illegal combinations are rejected when the configuration is validated (for example `deferred`
 needs `all` / `distance` / `final_beam`; `match_aware` needs `heap`; `bitmap` needs a
@@ -345,6 +365,8 @@ graph = "/path/to/graph"         # default graph: a directory with graph.flab, a
 # calibration = "/path/to/costs.json"       # unit costs (flab calibrate) of the planned exact path
 # sketches_sidecar = "/path/to/sketches.flab" # bottom-b sketches (estimates = "sketch")
 # pairs_sidecar = "/path/to/pairs.flab"     # combination postings (the exact path's `pair` plan)
+# islands_sidecar = "/path/to/islands.flab" # per-label sub-graphs (the cost crossover's `island` route)
+# pair_roots = "/path/to/pair_roots.flab"   # roots of the pair trees over pairs_sidecar (tree_pairs)
 # view = "<view>"                # label view: labels.<view>.flab, q<set>.<view>.fpred (its
 #                                # predicates feed the presets that use a view: sfmarket, cp)
 queries = "q10K"                 # a whole query set, or:
@@ -375,7 +397,8 @@ preset = "upstream-inline"
 name = "inline-w4"
 preset = "upstream-inline"
 beam_width = 4                   # any role key of the table above
-# graph / starts_sidecar / view / calibration override the experiment's
+# graph / starts_sidecar / view / calibration override the experiment's (configurations on one
+#                                # graph with different start tables share one copy of the graph)
 # predicates = "view"            # the view's predicates replace the queries' own (default "own"),
 #                                # e.g. an all-match view: the filter-less problem, same invocation
 # efforts = [100]                # a subset of the experiment's efforts (e.g. an L-independent
@@ -415,6 +438,33 @@ of the new ids), links to the query files, `new_of_old.u32` and `permutation.jso
 share of graph edges whose ends lie within 2^6 … 2^15 ids before and after), and the permuted
 `graph.flab` and `starts.flab`. Rows keep their neighbour order, so searches expand the same
 nodes in the same order; answers tied at the K-th distance may differ (ties are broken by id).
+
+## Selected auxiliary structures (`flab select`)
+
+One selector (module `select`; track G's kinds in `select_g`) chooses the index's auxiliary
+structures by **expected saving per query per byte** on one fixed workload, priced with the
+calibrated unit costs (`flab calibrate` of the graph the index searches); no query log is read.
+
+- **Workload** (module `workload`): a ½ / ½ mixture of *data-like* queries (a data point drawn
+  uniformly, each of its categories kept with probability ½, a kept category's clause one of the
+  point's labels or a random subset of them; the point is the query vector) and *independent*
+  queries (conjunctions of 1 to `min(3, C)` single-label clauses of distinct categories, drawn by
+  a uniform walk on the label co-occurrence structure; the query vector an independent data
+  point). `--uniform` sets the independent share (0: data-like only).
+- **Stop** (`--stop elasticity`, default): an item is taken only if it lowers the workload's mean
+  query time by at least the fraction by which it grows the index (`Δt/t ≥ ΔB/B`); `--budget`
+  (bytes per data point) is then only a ceiling. `--stop budget` fills the budget instead (items
+  below the `--kappa` floor excluded).
+- **Kinds.** `--track hybrid` (default): combination postings (pairs of labels, the exact path's
+  `pair` plan) and per-label sub-graphs (islands, the cost crossover's `island` route), written as
+  `sel-b<B>.pairs.flab` / `sel-b<B>.islands.flab` (a kind with nothing selected writes no file) and
+  built. `--track graph`: a router tree per label and a pair tree per label pair, valued against
+  the graph router alone; writes the selected labels (`sel-b<B>.trees.txt`, for `flab steiner
+  --labels-file`) and pairs (`sel-b<B>.pairs.flab`, for `flab steiner --construction pairs`).
+- Each run writes a JSON report (the runs per threshold, bytes, the model's mean costs, coverage
+  of `--report` predicate sets). `--save-candidates` / `--load-candidates` keep the counting
+  pass over every co-occurring label pair (the costly part on large label stores); results do
+  not depend on `--threads`.
 
 ## Importing DiskANN indices
 
