@@ -51,12 +51,14 @@
 //! query whose binding label has a tree takes a pair tree only with fewer members than that
 //! label. The route check decides at the run's prices (the graph route's list capped by
 //! `effort_curve(cap)`); the costs and savings are priced at the reference recall (the uncapped
-//! effort curve), since the cap buys a diluted query's time with its recall. The
+//! effort curve), since the cap buys a diluted query's time with its recall. A context too rare
+//! for the sample (no sampled query holds it) keeps its closed form. The
 //! base-derived part is then valued on the sampled queries themselves, as the independent part:
 //! a pair tree serves a sampled query whose single-label clauses include both its labels, at
 //! its tree route diluted to the query's matches, against the query's current cost — each
 //! query's saving counted once, where the closed form of the context `{a} ∧ {b}` would credit
-//! every pair of a query's single-label clauses with the whole query.
+//! every pair of a query's single-label clauses with the whole query (the closed form stays for
+//! the contexts the sample does not hold).
 //!
 //! **Calibrated costs** (`flab select --route-curves`, [`RouteCurves`]): instead of the model
 //! above, both routes are priced from recall/time curves measured per label-size class on
@@ -1290,8 +1292,8 @@ pub enum PairAlternative {
 /// smaller label's fixed tree where it has one (a pair with as many points as that label is never
 /// routed to, and has no value), else the graph route; a negative saving is none (the
 /// cost-checked route does not take the pair tree there). The greedy then values the
-/// base-derived part on the sampled queries ([`LabelKind::derived_queries`]); these closed-form
-/// terms only order the candidates and report them.
+/// base-derived part on the sampled queries ([`LabelKind::derived_queries`]) where they hold
+/// the pair's context, and by these closed-form terms only where they do not.
 pub fn pair_tree_values(
     pr: &Pricing,
     labels: &LabelStore,

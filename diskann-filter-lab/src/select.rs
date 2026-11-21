@@ -209,9 +209,10 @@ pub trait LabelKind {
     fn derived_queries(&self, _a: u32, _b: u32) -> &[u32] {
         &[]
     }
-    /// Whether a pair item's saving on the base-derived queries is its context's closed form
-    /// (`prob · saving`), or the sum over [`Self::derived_queries`] (each query's saving counted
-    /// once, against its current cost).
+    /// Whether a pair item's saving on the base-derived queries is always its context's closed
+    /// form (`prob · saving`), or the sum over [`Self::derived_queries`] (each query's saving
+    /// counted once, against its current cost) where the sample holds its context, the closed
+    /// form only where it does not (a context too rare for the sample).
     fn derived_closed_form(&self) -> bool {
         true
     }
@@ -701,9 +702,13 @@ fn run<G: LabelKind>(
     // plan's cost there).
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(values.len());
     let mut served: Vec<(usize, f64, f64)> = Vec::new();
+    // Per pair: its base-derived part is the closed form of its context.
+    let mut closed: Vec<bool> = Vec::with_capacity(values.len());
     {
         let ind = gr.independent();
+        let always = gr.derived_closed_form();
         for v in values {
+            closed.push(always || gr.derived_queries(v.cand.a, v.cand.b).is_empty());
             let start = served.len();
             if let Some((u, first)) = ind {
                 for i in u.pair_queries(v.cand.a, v.cand.b) {
@@ -722,11 +727,10 @@ fn run<G: LabelKind>(
             ranges.push((start, served.len()));
         }
     }
-    let closed = gr.derived_closed_form();
     let pair_gain = |gr: &G, i: usize| -> f64 {
         let v = &values[i];
         let (a, b) = ranges[i];
-        (if closed { v.prob * v.saving_ns } else { 0.0 })
+        (if closed[i] { v.prob * v.saving_ns } else { 0.0 })
             + served[a..b]
                 .iter()
                 .map(|&(q, w, cost)| w * (gr.query_cost(q) - cost).max(0.0))
