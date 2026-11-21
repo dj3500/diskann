@@ -228,7 +228,8 @@ fn parse_label_list(text: &str, n_labels: usize, origin: &str) -> Result<Vec<u32
     Ok(out)
 }
 
-fn parse_size(s: &str, n: usize) -> Result<usize> {
+/// A label-size bound: `n/k` (= ⌈n/k⌉ of `n` points) or a number of points.
+pub fn parse_size(s: &str, n: usize) -> Result<usize> {
     let s = s.trim();
     if let Some(k) = s.strip_prefix("n/") {
         let k: usize = k.parse().with_context(|| format!("bad size {s:?}"))?;
@@ -1107,6 +1108,9 @@ mod tests {
         let id = |s: &str| labels.name_index()[s];
         // a=1: 5 members under 3 leaf routers, then 2 routers and the root; b=1: 2 + 1.
         assert_eq!(a.routers, 6 + 3);
+        // A tree over s members with R routers has s + R − 1 edges, one to each member and to
+        // each router below the root (`flab select --tree-bytes compact` counts them so).
+        assert_eq!(a.router_edges, (5 + 6 - 1) + (3 + 3 - 1));
         for (name, members) in [("a=1", vec![0, 3, 6, 9, 11]), ("b=1", vec![0, 1, 2])] {
             let s = starts_of(&a, id(name));
             assert_eq!(s.len(), 1, "{name}: the root replaces the base starts");
@@ -1162,6 +1166,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(a.pair_roots[1], u32::MAX);
+        // s + R − 1 edges per tree (3 and 2 members).
+        assert_eq!(a.router_edges, (3 + 2 + a.routers - 2) as u64);
         for (slot, members) in &joints {
             let r = a.pair_roots[*slot as usize];
             assert!(r >= 13);

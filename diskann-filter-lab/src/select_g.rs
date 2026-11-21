@@ -55,9 +55,11 @@
 //! independent query, by the member curves on base-derived queries.
 //!
 //! **Bytes**: a tree over `s` members has `⌈(s − 1)/(b̄ − 1)⌉` routers (at least one), each a
-//! graph row, a vector and a kind byte (`router_bytes`); a pair tree adds its pair's list and
-//! directory entry ([`crate::select::pair_bytes`]); the pairs' co-occurrence matrix is charged
-//! by the selector as for combination postings.
+//! graph row, a vector and a kind byte (`router_bytes`; the `rows` accounting) or, as a run's
+//! bytes are counted (`compact`, [`TreeModel::compact_vector_bytes`]), its adjacency list — 4 B
+//! per node and per edge, `s + R − 1` edges for `R` routers — and its vector; a pair tree adds
+//! its pair's list and directory entry ([`crate::select::pair_bytes`]) and (`compact`) its root
+//! entry; the pairs' co-occurrence matrix is charged by the selector as for combination postings.
 //!
 //! **Values**: a label tree serves exactly the queries whose `c*` is that label (a clause of
 //! several labels needs a tree for each of them, which this kind does not value), so label trees
@@ -93,8 +95,15 @@ pub struct TreeModel {
     pub curve: bool,
     /// Mean router fan-out `b̄` of the trees (k-means trees of fan-out bound 64: 20–28).
     pub fanout: f64,
-    /// Bytes of one router (graph row, vector, kind).
+    /// Bytes of one router (graph row, vector, kind): the `rows` accounting.
     pub router_bytes: u64,
+    /// The `compact` accounting, as a run's bytes are counted (the memory ceiling's base): the
+    /// bytes of a router's vector. A tree over `s` members with `R` routers then counts its
+    /// adjacency lists, 4 B per node and per edge (`R` nodes; `s + R − 1` edges, one to each
+    /// member and to each router below the root), and its routers' vectors; a pair tree also
+    /// its root entry. `None`: the `rows` accounting, `R · router_bytes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_vector_bytes: Option<u64>,
 }
 
 impl TreeModel {
@@ -154,7 +163,22 @@ impl TreeModel {
 
     /// Bytes of a tree over `s` members.
     pub fn tree_bytes(&self, s: usize) -> u64 {
-        self.routers(s) * self.router_bytes
+        let r = self.routers(s);
+        match self.compact_vector_bytes {
+            Some(v) => r * (4 + v) + 4 * (s.max(1) as u64 + r - 1),
+            None => r * self.router_bytes,
+        }
+    }
+
+    /// Bytes of a pair tree over a stored pair of `joint` points: the pair's list and directory
+    /// entry ([`pair_bytes`]), its tree and, in the `compact` accounting, its root entry.
+    pub fn pair_tree_bytes(&self, joint: u32) -> u64 {
+        let root = if self.compact_vector_bytes.is_some() {
+            4
+        } else {
+            0
+        };
+        pair_bytes(joint) + self.tree_bytes(joint as usize) + root
     }
 
     /// Bytes of one router of a graph with degree bound `r_max` and vectors of `vector_bytes`.
@@ -834,6 +858,28 @@ impl<'s> TreeGreedy<'s> {
         g
     }
 
+    /// Fixes the trees of the labels `fixed` holds (built by another rule, e.g. a size cap):
+    /// taken before the greedy, valued as the kernel uses them, and every other candidate
+    /// withdrawn, so that the greedy selects pair trees only, against the routes these trees
+    /// give. Returns the trees fixed, their expected saving per query (ns) and their modelled
+    /// bytes.
+    pub fn fix(&mut self, fixed: impl Fn(u32) -> bool) -> (u32, f64, u64) {
+        let (mut saving, mut bytes) = (0.0, 0);
+        for x in 0..self.terms.len() {
+            if !self.taken[x] && fixed(self.terms[x].label) {
+                let g = self.gain(x);
+                self.taken[x] = true;
+                self.terms[x].order = Some(self.n_taken);
+                self.terms[x].saving_ns = g;
+                self.n_taken += 1;
+                saving += g;
+                bytes += self.terms[x].bytes;
+            }
+        }
+        self.heap.clear();
+        (self.n_taken, saving, bytes)
+    }
+
     /// Expected saving per query (ns) of candidate `x` given the items taken.
     fn gain(&self, x: usize) -> f64 {
         let (a, b) = self.ctx[x];
@@ -937,34 +983,37 @@ impl LabelKind for TreeGreedy<'_> {
 /// member of the joint — against its best route without the pair (the router or its smaller
 /// label's tree, which the tree kind buys where the router fails; member curves), negative where
 /// that route is faster. On the independent queries the selector values each pair through
-/// [`LabelKind::pair_cost`] (the pair tree diluted to each query's matches).
+/// [`LabelKind::pair_cost`] (the pair tree diluted to each query's matches). With fixed label
+/// trees (`tree_max`: every label of 1 to `tree_max` points has one; [`TreeGreedy::fix`]) the
+/// curves' alternative is the smaller label's tree only where that label has one. The analytic
+/// pricing values a pair against the router alone.
 pub fn pair_tree_values(
     pr: &Pricing,
     labels: &LabelStore,
     model: &QueryModel,
     f: &[f64],
     cands: &[PairCand],
+    tree_max: Option<usize>,
 ) -> Vec<PairValue> {
     let mut out: Vec<PairValue> = cands
         .iter()
         .filter_map(|&p| {
             let j = f64::from(p.joint).max(1.0);
-            let saving_ns = match pr.curves {
-                Some(_) => {
-                    let s = labels.posting_len(p.a).min(labels.posting_len(p.b));
-                    let mut alt = pr.router_derived(j, true);
-                    if s < pr.n {
-                        alt = alt.min(pr.tree_derived(s as f64, j, true));
-                    }
-                    alt - pr.pair_tree_derived(j)
-                }
-                None => pr.router_pair(j) - pr.pair_tree(j),
+            let s = labels.posting_len(p.a).min(labels.posting_len(p.b));
+            let tree = s < pr.n && pr.curves.is_some() && tree_max.is_none_or(|m| s <= m);
+            let (mut alt, pair) = match pr.curves {
+                Some(_) => (pr.router_derived(j, true), pr.pair_tree_derived(j)),
+                None => (pr.router_pair(j), pr.pair_tree(j)),
             };
+            if tree {
+                alt = alt.min(pr.tree_derived(s as f64, j, true));
+            }
+            let saving_ns = alt - pair;
             if !saving_ns.is_finite() {
                 return None;
             }
             let prob = context_prob(model, f, &p);
-            let bytes = pair_bytes(p.joint) + pr.tm.tree_bytes(p.joint as usize);
+            let bytes = pr.tm.pair_tree_bytes(p.joint);
             Some(PairValue {
                 cand: p,
                 prob,
@@ -1028,6 +1077,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         let n = 1_000_000;
         // A selective label: the tree searches it whole, below the router's post-filter route
@@ -1062,6 +1112,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         let model = QueryModel {
             n_queries: 20_000,
@@ -1095,7 +1146,7 @@ mod tests {
         // The greedy through the selector: within every budget, the rare label first.
         let (counts, f) = select::label_weights(&s, model.singleton, 2);
         let cands = select::pair_candidates(&s, &counts, model.singleton, |_| true, 2);
-        let values = pair_tree_values(&pr, &s, &model, &f, &cands);
+        let values = pair_tree_values(&pr, &s, &model, &f, &cands, None);
         assert!(values.windows(2).all(|w| w[0].value >= w[1].value));
         for budget in [0u64, rare.bytes, 10 * rare.bytes, u64::MAX / 4] {
             let params = select::Params {
@@ -1145,6 +1196,7 @@ mod tests {
             curve: true,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         assert!((tm.tree_expansions(&c, 1_000.0, 1_000.0) - 4.0).abs() < 1e-9);
         assert!((tm.tree_expansions(&c, 100_000.0, 100_000.0) - 16.0).abs() < 1e-9);
@@ -1172,6 +1224,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
@@ -1305,6 +1358,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         // The router reaches 0.96 only on labels of ≥ 2,000 points; trees reach it everywhere.
         let class = |size: f64, router: f64| CurveClass {
@@ -1417,6 +1471,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         // The router reaches 0.96 only on clauses of ≥ 1,000 points, placed anywhere; trees
         // everywhere at 50 ns, except a label's tree on a pair context (diluted): 500 ns.
@@ -1470,7 +1525,7 @@ mod tests {
         let mean = sample.mean_base_ns();
         assert!(mean > 1e6, "unreachable queries dominate the mean");
         let cands = select::pair_candidates(&s, &counts, 0.5, |_| true, 2);
-        let values = pair_tree_values(&pr, &s, &model, &f, &cands);
+        let values = pair_tree_values(&pr, &s, &model, &f, &cands, None);
         assert!(!values.is_empty());
         // On a base-derived `{a} ∧ {b}` (a member as the query point) a pair tree saves at most
         // what the smaller label's tree costs there (50 ns), never the router's unreachable price.
@@ -1497,5 +1552,209 @@ mod tests {
         // workload's cost (up to the sampling noise of the rare labels' closed form).
         assert!(sel.best.n_pairs > 0 && !sel.best.islands.is_empty());
         assert!(sel.best.t_ns >= -0.01 * mean, "{} of {mean}", sel.best.t_ns);
+    }
+
+    #[test]
+    fn compact_bytes_count_a_trees_adjacency_lists_and_vectors() {
+        let rows = TreeModel {
+            k: 10,
+            recall: 0.9,
+            frontier: 512.0,
+            curve: false,
+            fanout: 26.0,
+            router_bytes: TreeModel::router_bytes_of(83, 64),
+            compact_vector_bytes: None,
+        };
+        let compact = TreeModel {
+            compact_vector_bytes: Some(64),
+            ..rows
+        };
+        for s in [1usize, 2, 26, 27, 1_000, 100_000] {
+            let r = rows.routers(s);
+            assert_eq!(rows.tree_bytes(s), r * 401);
+            // R nodes and s + R − 1 edges of 4 B, R vectors of 64 B.
+            assert_eq!(
+                compact.tree_bytes(s),
+                4 * r + 4 * (s as u64 + r - 1) + 64 * r
+            );
+            assert!(compact.tree_bytes(s) < rows.tree_bytes(s));
+        }
+        // A pair tree: its list and directory entry, its tree and (compact) its root entry.
+        assert_eq!(
+            rows.pair_tree_bytes(60),
+            pair_bytes(60) + rows.tree_bytes(60)
+        );
+        assert_eq!(
+            compact.pair_tree_bytes(60),
+            pair_bytes(60) + compact.tree_bytes(60) + 4
+        );
+        // The rows accounting reports as before (no compact key).
+        let j = serde_json::to_value(rows).unwrap();
+        assert!(j.get("compact_vector_bytes").is_none());
+        assert_eq!(
+            serde_json::to_value(compact).unwrap()["compact_vector_bytes"],
+            64
+        );
+    }
+
+    #[test]
+    fn fixed_trees_are_taken_first_and_only_pair_trees_are_selected() {
+        let s = store();
+        let c = costs();
+        let tm = TreeModel {
+            k: 10,
+            recall: 0.96,
+            frontier: 4096.0,
+            curve: false,
+            fanout: 26.0,
+            router_bytes: 400,
+            compact_vector_bytes: None,
+        };
+        // The router reaches 0.96 only on clauses of ≥ 1,000 points; trees at 50 ns, a label's
+        // tree on a pair context (diluted) at 500 ns.
+        let class = |size: f64, router: f64, tree: f64| CurveClass {
+            size,
+            router: [
+                ("10".to_string(), vec![[router, 100.0]]),
+                ("100".to_string(), vec![[router, 100.0]]),
+            ]
+            .into_iter()
+            .collect(),
+            tree: [
+                ("10".to_string(), vec![[1.0, tree]]),
+                ("100".to_string(), vec![[1.0, tree]]),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let classes = |tree: f64| {
+            vec![
+                class(999.0, 0.5, tree),
+                class(1_000.0, 1.0, tree),
+                class(1e6, 1.0, tree),
+            ]
+        };
+        let cv = RouteCurves {
+            u: classes(50.0),
+            d: classes(50.0),
+            p: classes(500.0),
+            q: Vec::new(),
+            t: Vec::new(),
+        };
+        let pr = Pricing {
+            tm,
+            c: &c,
+            curves: Some(&cv),
+            n: s.n_points(),
+            at_max: false,
+        };
+        let (counts, f) = select::label_weights(&s, 0.5, 2);
+        let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
+        let model = QueryModel {
+            n_queries: 4_000,
+            seed: 11,
+            uniform: 0.5,
+            contexts: contexts.len() as u64,
+            ..QueryModel::default()
+        };
+        let u = Arc::new(crate::workload::independent(&s, &contexts, &model, 2));
+        let sample = TreeSample::build_mixed(&s, &pr, model, Some(u.clone()), 2);
+        let mean = sample.mean_base_ns();
+        // The size cap: tr (200 points) and u0…u9 (2,000 each) get a tree; tx and c0…c3 do not.
+        let cap = 2_000;
+        let fixed = |l: u32| (1..=cap).contains(&s.posting_len(l));
+        let mut g = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30);
+        let free = g.clone();
+        let (nt, saving, bytes) = g.fix(fixed);
+        assert_eq!(nt, 11);
+        // No two trees share a query: their saving is the sum of their values at the start.
+        let mine = free.terms.iter().filter(|t| fixed(t.label));
+        let want: f64 = mine.clone().map(|t| t.saving_ns).sum();
+        assert!(
+            (saving - want).abs() <= 1e-9 * want.abs(),
+            "{saving} {want}"
+        );
+        assert_eq!(bytes, mine.map(|t| t.bytes).sum::<u64>());
+        assert!(g.terms.iter().all(|t| t.order.is_some() == fixed(t.label)));
+        // No other label tree is offered.
+        assert_eq!(g.peek(), None);
+        // An independent query costs its binding label's tree if that label's tree is fixed, the
+        // router otherwise.
+        let nd = sample.n_data;
+        let mut checked = [0; 2];
+        for (i, w) in u.queries.iter().enumerate() {
+            let q = nd + i;
+            let l = *w
+                .labels
+                .iter()
+                .min_by_key(|&&l| (s.posting_len(l), l))
+                .unwrap();
+            if fixed(l) {
+                let t = pr.tree_conj(w.labels.len(), s.posting_len(l) as f64, w.joint.max(1.0));
+                assert_eq!(g.query_cost(q), f64::from(t as f32));
+                checked[0] += 1;
+            } else {
+                assert_eq!(g.query_cost(q), sample.base_ns[q]);
+                checked[1] += 1;
+            }
+        }
+        assert!(checked[0] > 0 && checked[1] > 0, "{checked:?}");
+        // A base-derived pair context whose smaller label has no tree is valued against the
+        // router alone: never less than against the router or a tree.
+        let cands = select::pair_candidates(&s, &counts, 0.5, |_| true, 2);
+        let values = pair_tree_values(&pr, &s, &model, &f, &cands, Some(cap));
+        let values_free = pair_tree_values(&pr, &s, &model, &f, &cands, None);
+        let mut above = 0;
+        for v in &values {
+            let w = values_free.iter().find(|w| w.cand == v.cand).unwrap();
+            let small = s.posting_len(v.cand.a).min(s.posting_len(v.cand.b));
+            if small > cap {
+                assert!(v.saving_ns >= w.saving_ns);
+                above += 1;
+            } else {
+                assert_eq!(v.saving_ns, w.saving_ns);
+            }
+        }
+        assert!(above > 0);
+        // The analytic pricing values a pair against the router alone, with or without fixed trees.
+        let pr_a = Pricing { curves: None, ..pr };
+        let fixed_a = pair_tree_values(&pr_a, &s, &model, &f, &cands, Some(cap));
+        for v in pair_tree_values(&pr_a, &s, &model, &f, &cands, None) {
+            assert_eq!(
+                v.saving_ns,
+                pr_a.router_pair(f64::from(v.cand.joint).max(1.0))
+                    - pr_a.pair_tree(f64::from(v.cand.joint).max(1.0))
+            );
+            let w = fixed_a.iter().find(|w| w.cand == v.cand).unwrap();
+            assert_eq!(w.saving_ns, v.saving_ns);
+        }
+        // The greedy takes pair trees only, starting from the mean cost with the fixed trees.
+        let params = select::Params {
+            k: 10,
+            r: 32,
+            budget_bytes: u64::MAX / 4,
+            model,
+            stop: select::Stop::Elasticity,
+            mean_ns: mean - saving,
+            index_bytes: 50_000_000,
+            ..select::Params::default()
+        };
+        let sel = select::select_with(
+            &s,
+            || {
+                let mut g = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30);
+                g.fix(fixed);
+                g
+            },
+            &values,
+            &params,
+        );
+        assert!(sel.best.islands.is_empty() && sel.best.n_pairs > 0);
+        let t = mean - saving - sel.best.pair_saving_ns;
+        assert!(
+            (sel.best.t_ns - t).abs() <= 1e-9 * mean,
+            "{} {t}",
+            sel.best.t_ns
+        );
     }
 }
