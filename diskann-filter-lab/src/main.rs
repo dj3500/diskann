@@ -485,8 +485,8 @@ struct SelectArgs {
     /// Unit costs of the cost model (`flab calibrate` output).
     #[arg(long)]
     calibration: PathBuf,
-    /// The graph file the index searches: with the base vectors and the label store, its
-    /// bytes are the index bytes of the value floor.
+    /// The graph the index searches (a directory with `graph.flab`, a `graph.flab`, or a DiskANN
+    /// index file): its compact bytes count in the index bytes (`--index-bytes`).
     #[arg(long)]
     graph: PathBuf,
     /// Memory budgets in bytes per data point (one selection each; with `--stop elasticity` a
@@ -499,6 +499,14 @@ struct SelectArgs {
     /// excluded).
     #[arg(long, value_enum, default_value = "elasticity")]
     stop: StopArg,
+    /// The index's compact bytes without the selected structures, `B` of the elasticity rule
+    /// and of the `--kappa` floor: the bytes of the configuration the selection serves (base
+    /// vectors `n·d·elem`, graph `4·(nodes + edges)` and router vectors, label store, static
+    /// bitsets, sketches, start tables; e.g. measured by a probe run, the base of a `--budget`
+    /// ceiling given as a fraction of the index). Default: the same accounting of what the
+    /// selector reads — without the sketches and start tables (`select::IndexBytes`).
+    #[arg(long)]
+    index_bytes: Option<u64>,
     /// `--stop budget`: value floor, an item must speed the workload up by at least `kappa`
     /// times the fraction by which it grows the index, both measured without auxiliary
     /// structures (expected saving per query per byte at least `kappa · mean cost / index
@@ -1942,12 +1950,6 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
     Ok(())
 }
 
-fn file_bytes(p: &Path) -> Result<u64> {
-    Ok(std::fs::metadata(p)
-        .with_context(|| format!("size of {}", p.display()))?
-        .len())
-}
-
 const CANDS_MAGIC: u64 = 0x5345_4c43_414e_4431; // "SELCAND1": the candidates only
 const CONTEXTS_MAGIC: u64 = 0x5345_4c43_414e_4432; // "SELCAND2": every co-occurring pair
 
@@ -2124,9 +2126,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let costs = run::read_costs(&a.calibration)?;
     std::fs::create_dir_all(&a.out_dir)?;
     let base_file = run::data::base_file(&a.dataset)?;
-    let index_bytes = file_bytes(&base_file)?
-        + file_bytes(&a.dataset.join("labels.flab"))?
-        + file_bytes(&a.graph)?;
+    let parts = select::IndexBytes::of(&a.dataset, &a.graph, &store, T::DTYPE.size())?;
+    let index_bytes = a.index_bytes.unwrap_or(parts.total());
     let n = store.n_points();
     ensure!(
         (0.0..1.0).contains(&a.uniform),
@@ -2444,6 +2445,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "graph": a.graph,
         "n_points": n,
         "index_bytes": index_bytes,
+        "index_bytes_given": a.index_bytes.is_some(),
+        "index_bytes_parts": {
+            "vectors": parts.vectors, "graph": parts.graph, "router_vectors": parts.router_vectors,
+            "labels": parts.labels, "bitsets": parts.bitsets, "total": parts.total(),
+        },
         "kappa": a.kappa,
         "stop": stop,
         "floor_ns_per_query_byte": floor,

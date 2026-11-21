@@ -455,6 +455,13 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
   query time by at least the fraction by which it grows the index (`Δt/t ≥ ΔB/B`); `--budget`
   (bytes per data point) is then only a ceiling. `--stop budget` fills the budget instead (items
   below the `--kappa` floor excluded).
+- **Index bytes** `B` (of both stops): the index's compact bytes without the selected
+  structures, counted as the reports count a configuration's bytes — base vectors `n·d·elem`,
+  the graph as adjacency lists `4·(nodes + edges)` (whatever its file format) and its router
+  vectors, the label store, the static bitsets (`θ = ⌈n/64⌉`), the sketches and the start
+  tables. `--index-bytes` takes this value (e.g. measured by a probe `flab run` of the
+  configuration, whose ceiling `--budget` is then a fraction of the same number); without it the
+  selector counts what it reads (all but the sketches and start tables: `select::IndexBytes`).
 - **Kinds.** `--track hybrid` (default): combination postings (pairs of labels, the exact path's
   `pair` plan) and per-label sub-graphs (islands, the cost crossover's `island` route), written as
   `sel-b<B>.pairs.flab` / `sel-b<B>.islands.flab` (a kind with nothing selected writes no file) and

@@ -65,9 +65,9 @@
 //! **Selection.** One greedy over both kinds by expected saving per query per byte. It stops
 //! ([`Stop::Elasticity`]) at the first item whose relative saving of the mean query time is
 //! below its relative increase of the index bytes, `Δt / t < ΔB / B` (`t`: the workload's mean
-//! cost per query, `B`: the index bytes — base vectors, label store, graph — both with the items
-//! taken so far; equivalently, an item is taken while it lowers `t · B` to first order); the
-//! budget is a ceiling. ([`Stop::Budget`]: the greedy fills the budget, items below a fixed
+//! cost per query, `B`: the index's compact bytes, [`IndexBytes`], both with the items taken so
+//! far; equivalently, an item is taken while it lowers `t · B` to first order); the budget is a
+//! ceiling. ([`Stop::Budget`]: the greedy fills the budget, items below a fixed
 //! floor `λ` excluded — the previous rule, kept for comparisons.) Pairs need the co-occurrence
 //! matrix of their big labels
 //! (the `N_T` labels of at least `T` points in a candidate pair with a positive saving:
@@ -80,14 +80,89 @@
 //! points big, answers `Empty` for more pairs, but its larger matrix makes the greedy settle on
 //! a larger `T`, i.e. fewer pairs of mid-sized labels; measured worse on the severe cells.)
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
+
+use anyhow::{Context, Result};
 
 use crate::{
+    bitsets, container, diskann_io,
+    graph::{self, AuxKind},
     islands::{IslandGreedy, QueryModel, QuerySample},
     kernel::cost::UnitCosts,
     labels::LabelStore,
-    pairs,
+    pairs, run,
 };
+
+/// The compact bytes of an index without the selector's own structures — `B` of the elasticity
+/// rule and of the budget stop's floor — counted as a configuration's bytes are counted from its
+/// `run.json` (the base of a memory ceiling given as a fraction of the index): base vectors
+/// `n·d·elem`, the graph as adjacency lists, `4·(nodes + edges)` (in either file format), and its
+/// router vectors, the label store file (dictionary, rows, postings) and the static bitsets of
+/// the planned exact path (`θ = ⌈n/64⌉`). The sketches and start tables, which the selector does
+/// not read, are not counted: `flab select --index-bytes` takes the complete value (e.g. measured
+/// by a probe run of the configuration).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexBytes {
+    pub vectors: u64,
+    pub graph: u64,
+    pub router_vectors: u64,
+    pub labels: u64,
+    pub bitsets: u64,
+}
+
+impl IndexBytes {
+    /// The accounting of a dataset directory (`base.*`, `labels.flab`, whose store is `store`)
+    /// and the graph the index searches (a directory with `graph.flab`, a `graph.flab`, or a
+    /// DiskANN in-memory index file); `elem`: bytes per vector component.
+    pub fn of(dataset: &Path, graph_path: &Path, store: &LabelStore, elem: usize) -> Result<Self> {
+        let base = run::data::base_file(dataset)?;
+        let mut f =
+            std::fs::File::open(&base).with_context(|| format!("opening {}", base.display()))?;
+        let (rows, dim) = diskann_io::read_bin_header(&mut f)?;
+        let labels_path = dataset.join("labels.flab");
+        let labels = std::fs::metadata(&labels_path)
+            .with_context(|| format!("reading {}", labels_path.display()))?
+            .len();
+        let g = if graph_path.is_dir() {
+            graph_path.join("graph.flab")
+        } else {
+            graph_path.to_owned()
+        };
+        let (graph, router_vectors) =
+            if container::peek_magic(&g).ok().as_ref() == Some(graph::MAGIC) {
+                let mut r = container::Reader::open(&g, graph::MAGIC)?;
+                let p = *r.params();
+                let (n_data, n_nodes, n_edges) = (p[0], p[1], p[7]);
+                let aux = n_nodes.saturating_sub(n_data) as usize;
+                let routers = if aux == 0 {
+                    0
+                } else {
+                    r.section::<u8>(3, aux)?
+                        .iter()
+                        .filter(|&&k| k == AuxKind::Router.code())
+                        .count() as u64
+                };
+                (4 * (n_nodes + n_edges), routers * dim as u64 * elem as u64)
+            } else {
+                // A DiskANN in-memory index: the header, then per node its degree and neighbours.
+                let mut f =
+                    std::fs::File::open(&g).with_context(|| format!("opening {}", g.display()))?;
+                let h = diskann_io::Header::read(&mut f)?;
+                (h.file_size.saturating_sub(diskann_io::HEADER_BYTES), 0)
+            };
+        Ok(Self {
+            vectors: rows as u64 * dim as u64 * elem as u64,
+            graph,
+            router_vectors,
+            labels,
+            bitsets: bitsets::footprint(store, store.n_points().div_ceil(64) as u64).1,
+        })
+    }
+
+    pub fn total(&self) -> u64 {
+        self.vectors + self.graph + self.router_vectors + self.labels + self.bitsets
+    }
+}
 
 /// A per-label kind valued on the query sample, as the greedy sees it: candidates by expected
 /// saving per query per byte (islands, [`IslandGreedy`]; track G's router trees,
