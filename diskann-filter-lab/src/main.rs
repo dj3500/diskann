@@ -617,6 +617,36 @@ struct SelectArgs {
     /// accounting, kept to reproduce earlier selections).
     #[arg(long, value_enum)]
     tree_bytes: Option<SelectTreeBytes>,
+    /// `--track graph` with `--fixed-trees-max-size`: the route a pair tree's base-derived
+    /// queries are valued against besides the router — `trees` (default: the pair's smaller
+    /// label's fixed tree where it has one, which has already taken the router's cost of those
+    /// queries, so that no saving counts twice) or `router` (the analytic pricing's router alone,
+    /// counting the fixed trees' saving again: the selection before, kept to reproduce it).
+    #[arg(long, value_enum)]
+    pair_alternative: Option<SelectPairAlternative>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SelectPairAlternative {
+    Trees,
+    Router,
+}
+
+/// What a pair tree is valued against: the fixed trees unless `--pair-alternative` says
+/// otherwise; only track G's pair trees have an alternative, so the option is an error for the
+/// hybrid track.
+fn select_pair_alternative(
+    track: SelectTrack,
+    given: Option<SelectPairAlternative>,
+) -> Result<diskann_filter_lab::select_g::PairAlternative> {
+    ensure!(
+        track == SelectTrack::Graph || given.is_none(),
+        "--pair-alternative values track G's pair trees (--track graph)"
+    );
+    Ok(match given.unwrap_or(SelectPairAlternative::Trees) {
+        SelectPairAlternative::Trees => diskann_filter_lab::select_g::PairAlternative::Trees,
+        SelectPairAlternative::Router => diskann_filter_lab::select_g::PairAlternative::Router,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -2163,6 +2193,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let n = store.n_points();
     let graph_track = a.track == SelectTrack::Graph;
     let tree_bytes = select_tree_bytes(a.track, a.tree_bytes)?;
+    let pair_alternative = select_pair_alternative(a.track, a.pair_alternative)?;
     let fixed_max = match &a.fixed_trees_max_size {
         Some(s) => {
             ensure!(
@@ -2384,7 +2415,13 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let values = match &pricing {
         Some(_) if !a.pair_trees => Vec::new(),
         Some(pr) => diskann_filter_lab::select_g::pair_tree_values(
-            pr, &store, &model, &f, &cands, fixed_max,
+            pr,
+            &store,
+            &model,
+            &f,
+            &cands,
+            fixed_max,
+            pair_alternative,
         ),
         None => select::pair_values(&store, &costs, a.k, &model, &f, &cands),
     };
@@ -2557,6 +2594,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             "max_size": fixed_max, "labels": nt, "expected_saving_ns": s, "model_bytes": b,
         })),
         "mean_cost_start_ns": mean_start,
+        "pair_alternative": graph_track.then_some(pair_alternative),
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
@@ -3250,6 +3288,25 @@ fn print_vectors<T: Element>(m: &Matrix<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_alternative_defaults_to_the_fixed_trees_and_belongs_to_track_g() {
+        use diskann_filter_lab::select_g::PairAlternative;
+        assert!(select_pair_alternative(SelectTrack::Hybrid, None).is_ok());
+        assert!(
+            select_pair_alternative(SelectTrack::Hybrid, Some(SelectPairAlternative::Router))
+                .is_err()
+        );
+        assert_eq!(
+            select_pair_alternative(SelectTrack::Graph, None).unwrap(),
+            PairAlternative::Trees
+        );
+        assert_eq!(
+            select_pair_alternative(SelectTrack::Graph, Some(SelectPairAlternative::Router))
+                .unwrap(),
+            PairAlternative::Router
+        );
+    }
 
     #[test]
     fn tree_bytes_default_to_compact_and_belong_to_track_g() {

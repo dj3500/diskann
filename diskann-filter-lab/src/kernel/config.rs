@@ -507,10 +507,10 @@ pub struct Kernel {
     /// router-tree search from c\*'s starts: `starts = "label(c*)"`, forced starts, only
     /// routers expanded), so checks cover the other clauses only (off by default).
     pub cstar_members: bool,
-    /// `tree_pairs = "on"`: a query whose clause pair is exactly covered by pair trees
+    /// The pair-tree route for queries whose clause pair is exactly covered by pair trees
     /// (`flab steiner --construction pairs`; the run's `pairs_sidecar` and `pair_roots`) with
-    /// fewer members than c\* searches those trees (off by default).
-    pub tree_pairs: bool,
+    /// fewer members than c\* (off by default).
+    pub tree_pairs: TreePairs,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -640,6 +640,33 @@ impl fmt::Display for TreeEffort {
     }
 }
 
+/// The pair-tree route (`tree_pairs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreePairs {
+    /// No pair route (`off`).
+    Off,
+    /// A covered query searches the pair trees when their model cost is below the route it
+    /// takes otherwise — its label tree when it is tree-eligible, else the crossover's route —
+    /// each tree priced at the query's dilution (`on`): the frontier scaled to the members per
+    /// estimated match, at most the whole tree, its router expansions' member checks and
+    /// distances; the pair route then searches that frontier.
+    Cost,
+    /// Every covered query searches the pair trees at the tree route's list size (`always`:
+    /// the route before the cost check, kept to reproduce it).
+    Always,
+}
+
+impl TreePairs {
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim() {
+            "off" => Self::Off,
+            "on" => Self::Cost,
+            "always" => Self::Always,
+            v => bail!("unknown tree_pairs {v:?} (on, always, off)"),
+        })
+    }
+}
+
 /// When a tree-eligible query takes the tree route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TreeChoice {
@@ -712,7 +739,7 @@ impl Default for Kernel {
             tree_effort: TreeEffort::List,
             tree_choice: TreeChoice::Always,
             cstar_members: false,
-            tree_pairs: false,
+            tree_pairs: TreePairs::Off,
         }
     }
 }
@@ -1278,13 +1305,7 @@ impl Kernel {
                     v => bail!("unknown cstar_members {v:?} (on, off)"),
                 }
             }
-            "tree_pairs" => {
-                self.tree_pairs = match value.trim() {
-                    "on" => true,
-                    "off" => false,
-                    v => bail!("unknown tree_pairs {v:?} (on, off)"),
-                }
-            }
+            "tree_pairs" => self.tree_pairs = TreePairs::parse(value)?,
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1469,9 +1490,14 @@ impl Kernel {
             "static_bitsets = \"off\" excludes tree_route = \"bitmap\", \"static_bits\" and \"cost\" (their member checks use the static bitsets)"
         );
         ensure!(
-            !self.tree_pairs
+            self.tree_pairs == TreePairs::Off
                 || (self.tree_route != TreeRoute::Off && self.tree_choice == TreeChoice::Always),
-            "tree_pairs = \"on\" needs the tree route with tree_choice = always"
+            "tree_pairs needs the tree route with tree_choice = always"
+        );
+        ensure!(
+            self.tree_pairs != TreePairs::Cost
+                || (self.exact.is_planned() && self.crossover != Crossover::Threshold),
+            "tree_pairs = \"on\" prices its route after the crossover: a planned exact path (its unit costs) and crossover cost or graph"
         );
         ensure!(
             self.tree_route != TreeRoute::Cost
@@ -1597,8 +1623,10 @@ impl Kernel {
         if self.cstar_members {
             j["cstar_members"] = json!("on");
         }
-        if self.tree_pairs {
-            j["tree_pairs"] = json!("on");
+        match self.tree_pairs {
+            TreePairs::Off => {}
+            TreePairs::Cost => j["tree_pairs"] = json!("on"),
+            TreePairs::Always => j["tree_pairs"] = json!("always"),
         }
         j
     }
@@ -1626,7 +1654,7 @@ impl Kernel {
     /// extra starts (the covering pairs' roots); their checks cover the clauses outside the
     /// covered pair (set per query), not via `cstar_members`.
     pub fn pair_kernels(&self) -> Vec<Kernel> {
-        if !self.tree_pairs {
+        if self.tree_pairs == TreePairs::Off {
             return Vec::new();
         }
         let ks = if self.tree_route == TreeRoute::Cost {

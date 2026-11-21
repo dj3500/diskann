@@ -1348,7 +1348,7 @@ fn the_pair_tree_route_searches_the_conjunctions_tree() {
     let mut pb = PredicateSetBuilder::new(&labels);
     pb.push(&[vec!["x=1"], vec!["y=1"]]);
     let preds = pb.finish();
-    let run = |route: &str, pairs: bool, roots: &[u32]| {
+    let run = |route: &str, pairs: &str, roots: &[u32]| {
         let ix = Index {
             graph: &g,
             vectors: g.vectors(&base).unwrap(),
@@ -1374,10 +1374,28 @@ fn the_pair_tree_route_searches_the_conjunctions_tree() {
             ("estimates", "sketch"),
             ("tree_route", route),
         ];
-        if pairs {
-            edits.push(("tree_pairs", "on"));
+        if pairs != "off" {
+            edits.push(("tree_pairs", pairs));
         }
         let plan = Plan::new(&kernel(&edits), &ix).unwrap();
+        if pairs == "on" {
+            // The model's prices at the query's dilution: a tree's frontier scaled to its
+            // members per estimated match, at most the whole tree, its list at least the
+            // configured one; a diluted tree costs more than an undiluted one of its size.
+            let est = super::cost::Estimates {
+                n: 200.0,
+                m: 20.0,
+                ..Default::default()
+            };
+            let (l_pair, c_pair) = super::search::tree_route_option(&plan, &est, 8, 3, 20.0, 202);
+            let (l_label, c_label) =
+                super::search::tree_route_option(&plan, &est, 8, 3, 100.0, 202);
+            assert_eq!((l_pair, l_label), (8, 8));
+            assert!(c_pair < c_label, "{c_pair} {c_label}");
+            let thin = super::cost::Estimates { m: 2.0, ..est };
+            let (l_thin, c_thin) = super::search::tree_route_option(&plan, &thin, 8, 3, 1e6, 202);
+            assert!(l_thin > 8 && c_thin > c_label, "{l_thin} {c_thin}");
+        }
         let mut s = Searcher::for_index(&ix, &[&plan]);
         let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
         let q = Query {
@@ -1390,19 +1408,44 @@ fn the_pair_tree_route_searches_the_conjunctions_tree() {
         assert_eq!(ctr.route, Route::Tree);
         (ctr.plan, ctr.n_pred, ctr.n_aux_expand)
     };
-    // The label tree checks x=1's 100 members; the pair tree only the conjunction's 20.
-    let (plan, label_checks, _) = run("row_scan", false, &roots);
+    // The label tree checks x=1's 100 members; the pair tree only the conjunction's 20 — taken
+    // at any cost (`always`), and by the cost check (`on`) since it is cheaper than the label
+    // tree, the query's other route.
+    let (plan, label_checks, _) = run("row_scan", "off", &roots);
     assert_eq!((plan, label_checks), (0, 100));
-    let (plan, pair_checks, expanded) = run("row_scan", true, &roots);
+    let (plan, pair_checks, expanded) = run("row_scan", "always", &roots);
     assert_eq!((plan, pair_checks, expanded), (110, 20, 1));
+    let (plan, _, expanded) = run("row_scan", "on", &roots);
+    assert_eq!((plan, expanded), (110, 1));
     // Without a tree for the pair, the label tree route.
-    assert_eq!(run("row_scan", true, &no_roots).0, 0);
+    assert_eq!(run("row_scan", "always", &no_roots).0, 0);
+    assert_eq!(run("row_scan", "on", &no_roots).0, 0);
     // Under the cost route the pair route picks its check too (111–113).
-    assert!((111..=113).contains(&run("cost", true, &roots).0));
-    // tree_pairs needs the tree route.
+    assert!((111..=113).contains(&run("cost", "always", &roots).0));
+    assert!((111..=113).contains(&run("cost", "on", &roots).0));
+    // tree_pairs needs the tree route; `on` also the unit costs and a crossover that prices its
+    // routes (not the threshold router).
     let mut k = Kernel::default();
     k.set("tree_pairs", "on").unwrap();
     assert!(k.validate().is_err());
+    let mut k = Kernel::default();
+    for (key, value) in [
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("crossover", "threshold"),
+        ("exact", "planned"),
+        ("estimates", "sketch"),
+        ("tree_route", "row_scan"),
+        ("tree_pairs", "on"),
+    ] {
+        k.set(key, value).unwrap();
+    }
+    let e = k.validate().unwrap_err().to_string();
+    assert!(e.contains("tree_pairs"), "{e}");
+    k.set("tree_pairs", "always").unwrap();
+    assert!(k.validate().is_ok());
+    let mut k = Kernel::default();
+    assert!(k.set("tree_pairs", "sometimes").is_err());
 }
 
 /// Six points on a line (x = i, all labelled `x=1`), leaf routers 6 (over 0, 1, 2; at 1) and

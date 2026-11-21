@@ -17,7 +17,7 @@ use super::{
     },
     config::{
         Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator, TreeChoice, TreeEffort, TreeRoute,
+        StartSource, Terminator, TreeChoice, TreeEffort, TreePairs, TreeRoute,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -580,7 +580,7 @@ impl Plan {
                 })
             })
             .collect::<Result<_>>()?;
-        if kernel.tree_pairs {
+        if kernel.tree_pairs != TreePairs::Off {
             ensure!(
                 ix.pairs.is_some() && ix.pair_roots.is_some(),
                 "tree_pairs needs combination postings (pairs_sidecar) and their tree roots (pair_roots)"
@@ -618,7 +618,9 @@ impl Plan {
             tree_kappa,
             tree_pair,
             pair_members: false,
-            tree_fanout: if kernel.tree_choice == TreeChoice::Cost {
+            tree_fanout: if kernel.tree_choice == TreeChoice::Cost
+                || kernel.tree_pairs == TreePairs::Cost
+            {
                 let (n, a) = (ix.graph.n_data() as u32, ix.graph.n_aux() as u32);
                 let edges: usize = (n..n + a).map(|v| ix.graph.degree(v)).sum();
                 edges as f64 / f64::from(a.max(1))
@@ -894,48 +896,27 @@ impl Searcher {
     ) -> Counters {
         assert_eq!(ids.len(), dists.len());
         let mut tree_candidate = false;
+        // `tree_pairs = "on"`: the query is covered by pair trees; its route is chosen after the
+        // crossover's estimates (`Some(eligible)`: whether its label tree is the alternative).
+        let mut pair_deferred = None;
         if let Some(tp) = plan.tree.as_deref() {
             let eligible = self.tree_eligible(tp, ix, q);
             if !plan.tree_pair.is_empty() {
-                if let Some(ctr) = self.pair_route(plan, ix, q, l, eligible, ids, dists, reference)
-                {
-                    return ctr;
+                if plan.kernel.tree_pairs == TreePairs::Always {
+                    if let Some(ctr) =
+                        self.pair_route(plan, ix, q, l, eligible, ids, dists, reference)
+                    {
+                        return ctr;
+                    }
+                } else if self.pair_covered(ix, eligible) {
+                    pair_deferred = Some(eligible);
                 }
             }
-            if !eligible {
+            if pair_deferred.is_some() || !eligible {
             } else if plan.kernel.tree_choice == TreeChoice::Cost {
                 tree_candidate = true;
             } else {
-                let mut pc = Counters {
-                    timing: plan.kernel.phase_times,
-                    ..Counters::default()
-                };
-                let l_tree = match plan.kernel.tree_effort {
-                    TreeEffort::List => l,
-                    TreeEffort::Fixed(f) => f as usize,
-                    TreeEffort::Curve | TreeEffort::Capped => {
-                        self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
-                    }
-                };
-                let choice = (!plan.tree_checks.is_empty()).then(|| {
-                    let u = self.compiled.min_upper_bound();
-                    self.tree_check_choice(plan, ix, l_tree, 1, u)
-                });
-                let tp = choice.map_or(tp, |(i, _)| &plan.tree_checks[i]);
-                let mut ctr = self.search(tp, ix, q, l_tree, ids, dists, reference);
-                if let Some((i, cost)) = choice {
-                    // The member check taken (101 row scan, 102 static bits, 103 bitmap) and
-                    // its model cost.
-                    ctr.plan = 101 + i as u64;
-                    ctr.est_graph_ns = cost.round() as u64;
-                }
-                ctr.n_probe += pc.n_probe;
-                ctr.t_probe_ns += pc.t_probe_ns;
-                ctr.est_probe_ns = pc.est_probe_ns;
-                ctr.a_hat = pc.a_hat;
-                ctr.m_hat = pc.m_hat;
-                ctr.route = Route::Tree;
-                return ctr;
+                return self.label_tree_route(plan, tp, ix, q, l, ids, dists, reference);
             }
         }
         let k = ids.len();
@@ -1103,6 +1084,42 @@ impl Searcher {
             let t = tic(&ctr);
             let d = self.decide(plan, ix, l, k, exact_stat, &mut ctr);
             toc(t, &mut ctr.t_decide_ns);
+            if let (Some(eligible), Some(tp)) = (pair_deferred, plan.tree.as_deref()) {
+                // The pair trees when cheaper than the route the query takes otherwise (its
+                // label tree when eligible, else the crossover's), each tree priced at the
+                // query's dilution.
+                let n_nodes = ix.graph.n_nodes();
+                let est = self.last_estimates.clone();
+                let members = self.tree_cover.members as f64;
+                let (l_pair, c_pair) = tree_route_option(plan, &est, l, k, members, n_nodes);
+                let c_alt = if eligible {
+                    tree_route_option(plan, &est, l, k, est.a, n_nodes).1
+                } else if d.exact {
+                    d.est_exact
+                } else {
+                    d.est_graph
+                };
+                if c_pair < c_alt || eligible {
+                    // The tree plan's compiled query for the tree routes' member checks.
+                    self.tree_eligible(tp, ix, q);
+                    let mut tc = if c_pair < c_alt {
+                        let mut pc =
+                            self.run_pair_route(plan, ix, q, l_pair, ids, dists, reference);
+                        pc.est_graph_ns = c_pair.round() as u64;
+                        pc
+                    } else {
+                        self.label_tree_route(plan, tp, ix, q, l, ids, dists, reference)
+                    };
+                    tc.n_probe += ctr.n_probe;
+                    tc.t_probe_ns += ctr.t_probe_ns;
+                    tc.t_decide_ns += ctr.t_decide_ns;
+                    tc.est_probe_ns += ctr.est_probe_ns;
+                    tc.est_exact_ns = ctr.est_exact_ns;
+                    (tc.m_hat, tc.m_hi) = (ctr.m_hat, ctr.m_hi);
+                    tc.n_pair_lookups += ctr.n_pair_lookups;
+                    return tc;
+                }
+            }
             let tree_l = if tree_candidate {
                 self.tree_option(plan, ix, l, k, &d)
             } else {
@@ -1568,10 +1585,81 @@ impl Searcher {
         (i, costs[i])
     }
 
-    /// `tree_pairs`: answers `q` (compiled by [`Self::tree_eligible`]) on the pair trees when
-    /// a clause pair of it is exactly covered by them ([`PairIndex::tree_cover`]) with fewer
-    /// members than c\* (or c\* is not tree-eligible): starts the covering pairs' roots, checks
-    /// the clauses outside the pair (`pair_skip`), the tree route's list size; `None` otherwise.
+    /// The tree route on the label tree of `q`'s binding clause (compiled by
+    /// [`Self::tree_eligible`]): the configured list size (`tree_effort`) and, under
+    /// `tree_route = "cost"`, the member check of the lowest model cost.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs of `search`"
+    )]
+    fn label_tree_route<T: Element>(
+        &mut self,
+        plan: &Plan,
+        tp: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l: usize,
+        ids: &mut [u32],
+        dists: &mut [f32],
+        reference: Option<u64>,
+    ) -> Counters {
+        let mut pc = Counters {
+            timing: plan.kernel.phase_times,
+            ..Counters::default()
+        };
+        let l_tree = match plan.kernel.tree_effort {
+            TreeEffort::List => l,
+            TreeEffort::Fixed(f) => f as usize,
+            TreeEffort::Curve | TreeEffort::Capped => {
+                self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
+            }
+        };
+        let choice = (!plan.tree_checks.is_empty()).then(|| {
+            let u = self.compiled.min_upper_bound();
+            self.tree_check_choice(plan, ix, l_tree, 1, u)
+        });
+        let tp = choice.map_or(tp, |(i, _)| &plan.tree_checks[i]);
+        let mut ctr = self.search(tp, ix, q, l_tree, ids, dists, reference);
+        if let Some((i, cost)) = choice {
+            // The member check taken (101 row scan, 102 static bits, 103 bitmap) and its model
+            // cost.
+            ctr.plan = 101 + i as u64;
+            ctr.est_graph_ns = cost.round() as u64;
+        }
+        ctr.n_probe += pc.n_probe;
+        ctr.t_probe_ns += pc.t_probe_ns;
+        ctr.est_probe_ns = pc.est_probe_ns;
+        ctr.a_hat = pc.a_hat;
+        ctr.m_hat = pc.m_hat;
+        ctr.route = Route::Tree;
+        ctr
+    }
+
+    /// `tree_pairs`: whether a clause pair of `q` (compiled by [`Self::tree_eligible`]) is
+    /// exactly covered by pair trees ([`PairIndex::tree_cover`], into `self.tree_cover`) with
+    /// fewer members than c\* (or c\* is not tree-eligible).
+    fn pair_covered<T: Element>(&mut self, ix: &Index<'_, T>, eligible: bool) -> bool {
+        let (Some(px), Some(roots)) = (ix.pairs, ix.pair_roots) else {
+            return false;
+        };
+        let cq = &self.compiled;
+        if cq.is_empty() || cq.n_clauses() < 2 {
+            return false;
+        }
+        let found = px.tree_cover(
+            cq.n_clauses(),
+            |j| cq.clause(j),
+            |l| ix.labels.posting_len(l),
+            |s| roots[s] != u32::MAX,
+            &mut self.tree_cover,
+        );
+        let tc = &self.tree_cover;
+        found && tc.j < 64 && !(eligible && tc.members >= cq.min_upper_bound())
+    }
+
+    /// `tree_pairs = "always"`: answers `q` (compiled by [`Self::tree_eligible`]) on the pair
+    /// trees when it is covered ([`Self::pair_covered`]) at the tree route's list size; `None`
+    /// otherwise.
     #[expect(
         clippy::too_many_arguments,
         reason = "the per-query inputs and outputs of `search`"
@@ -1587,27 +1675,9 @@ impl Searcher {
         dists: &mut [f32],
         reference: Option<u64>,
     ) -> Option<Counters> {
-        let (Some(px), Some(roots)) = (ix.pairs, ix.pair_roots) else {
-            return None;
-        };
-        let cq = &self.compiled;
-        if cq.is_empty() || cq.n_clauses() < 2 {
+        if !self.pair_covered(ix, eligible) {
             return None;
         }
-        let found = px.tree_cover(
-            cq.n_clauses(),
-            |j| cq.clause(j),
-            |l| ix.labels.posting_len(l),
-            |s| roots[s] != u32::MAX,
-            &mut self.tree_cover,
-        );
-        let tc = &self.tree_cover;
-        if !found || tc.j >= 64 || (eligible && tc.members >= cq.min_upper_bound()) {
-            return None;
-        }
-        let (skip, members, lookups) = ((1u64 << tc.i) | (1u64 << tc.j), tc.members, tc.lookups);
-        self.extra_starts.clear();
-        self.extra_starts.extend(tc.slots.iter().map(|&s| roots[s]));
         let mut pc = Counters {
             timing: plan.kernel.phase_times,
             ..Counters::default()
@@ -1619,6 +1689,35 @@ impl Searcher {
                 self.tree_list_size(plan, ix, l, ids.len(), &mut pc)
             }
         };
+        let mut ctr = self.run_pair_route(plan, ix, q, l_tree, ids, dists, reference);
+        ctr.n_probe += pc.n_probe;
+        ctr.t_probe_ns += pc.t_probe_ns;
+        Some(ctr)
+    }
+
+    /// The pair-tree route over the cover found by [`Self::pair_covered`] at list size
+    /// `l_tree`: starts the covering pairs' roots and checks the clauses outside the pair
+    /// (`pair_skip`), with the member check of the lowest model cost under `tree_route =
+    /// "cost"`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the per-query inputs and outputs of `search`"
+    )]
+    fn run_pair_route<T: Element>(
+        &mut self,
+        plan: &Plan,
+        ix: &Index<'_, T>,
+        q: &Query<'_, T>,
+        l_tree: usize,
+        ids: &mut [u32],
+        dists: &mut [f32],
+        reference: Option<u64>,
+    ) -> Counters {
+        let roots = ix.pair_roots.expect("a cover needs the pair roots");
+        let tc = &self.tree_cover;
+        let (skip, members, lookups) = ((1u64 << tc.i) | (1u64 << tc.j), tc.members, tc.lookups);
+        self.extra_starts.clear();
+        self.extra_starts.extend(tc.slots.iter().map(|&s| roots[s]));
         let (i, cost) = if plan.tree_pair.len() > 1 {
             self.tree_check_choice(plan, ix, l_tree, skip, members)
         } else {
@@ -1628,8 +1727,6 @@ impl Searcher {
         let mut ctr = self.search(&plan.tree_pair[i], ix, q, l_tree, ids, dists, reference);
         self.pair_skip = 0;
         self.extra_starts.clear();
-        ctr.n_probe += pc.n_probe;
-        ctr.t_probe_ns += pc.t_probe_ns;
         ctr.route = Route::Tree;
         // The pair-tree route (110; 111 row scan, 112 static bits, 113 bitmap under
         // `tree_route = "cost"`), its directory lookups and members.
@@ -1642,7 +1739,7 @@ impl Searcher {
         ctr.est_graph_ns = cost.round() as u64;
         ctr.n_pair_lookups = lookups;
         ctr.a_hat = members;
-        Some(ctr)
+        ctr
     }
 
     /// `tree_choice = cost`: the tree route's list size when its model cost is below the cost
@@ -2014,6 +2111,48 @@ fn tree_frontier(
         }
     }
     (l.ceil().clamp(1.0, n_nodes as f64) as usize, a, rho)
+}
+
+/// `tree_pairs = "on"`: a tree route's list size and model cost at the query's dilution, for a
+/// tree over `a` members of which the estimated `M̂` match (`ρ = M̂ / a`). Its frontier at this
+/// effort reaches the level's recall on an undiluted tree, so the route expands `F / ρ` routers
+/// (the calibrated curve, `tree_effort = "curve"`, is at `K / ρ` members already), at most the
+/// whole tree (`a / (b̄ − 1) + 1` routers), each with its fan-out's member checks (at most the
+/// tree's `a` members in all), a distance per member expected to match and one for the router
+/// (as `Searcher::tree_option`). The list size is that frontier, at least the configured one.
+pub(super) fn tree_route_option(
+    plan: &Plan,
+    est: &Estimates,
+    effort: usize,
+    k: usize,
+    a: f64,
+    n_nodes: usize,
+) -> (usize, f64) {
+    let costs = plan
+        .costs
+        .as_ref()
+        .expect("validated: tree_pairs = on has the unit costs");
+    let a = a.max(1.0);
+    let rho = (est.m / a).clamp(1.0 / a, 1.0);
+    let b = plan.tree_fanout.max(2.0);
+    let whole = a / (b - 1.0) + 1.0;
+    let (frontier, configured) = match plan.kernel.tree_effort {
+        TreeEffort::List => (effort as f64 / rho, effort as f64),
+        TreeEffort::Fixed(f) => (f as f64 / rho, f as f64),
+        TreeEffort::Curve | TreeEffort::Capped => {
+            let e = Estimates { a, ..est.clone() };
+            let f = tree_frontier(plan, &e, effort, k, n_nodes).0 as f64;
+            (f, f)
+        }
+    };
+    let expansions = frontier.min(whole).max(1.0);
+    let checks = (expansions * b).min(a);
+    let cost = checks * costs.graph_pred_ns + (checks * rho + expansions) * costs.graph_dist_ns;
+    let l = expansions
+        .max(configured)
+        .ceil()
+        .clamp(1.0, n_nodes.max(1) as f64);
+    (l as usize, cost)
 }
 
 /// `effort_curve(cap)`: the calibrated unfiltered list size for the target recall `effort / 1000`

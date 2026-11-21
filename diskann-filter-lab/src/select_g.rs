@@ -977,6 +977,20 @@ impl LabelKind for TreeGreedy<'_> {
     }
 }
 
+/// The route a pair tree's base-derived queries are valued against, besides the router, when the
+/// label trees are fixed ([`pair_tree_values`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PairAlternative {
+    /// The pair's smaller label's fixed tree where it has one, in both pricings: a fixed tree
+    /// has already taken the router's cost of its queries out of the mean the greedy starts
+    /// from, so a pair saves only the rest (each query's saving counted once).
+    Trees,
+    /// The analytic pricing's router alone (the selection before the fixed trees were priced),
+    /// which counts the fixed trees' saving a second time; kept to reproduce those selections.
+    Router,
+}
+
 /// The pair-tree terms of the candidate pairs, by decreasing value (the selector's pair kind;
 /// see the module documentation): `prob` the base-derived probability of the context `{a} ∧ {b}`
 /// ([`context_prob`]) and `saving_ns` the pair tree's saving on such a query, whose point is a
@@ -985,8 +999,10 @@ impl LabelKind for TreeGreedy<'_> {
 /// that route is faster. On the independent queries the selector values each pair through
 /// [`LabelKind::pair_cost`] (the pair tree diluted to each query's matches). With fixed label
 /// trees (`tree_max`: every label of 1 to `tree_max` points has one; [`TreeGreedy::fix`]) the
-/// curves' alternative is the smaller label's tree only where that label has one. The analytic
-/// pricing values a pair against the router alone.
+/// alternative is the smaller label's tree where that label has one (`alternative`: in both
+/// pricings, [`PairAlternative::Trees`]; with the curves only, [`PairAlternative::Router`]).
+/// Without fixed trees the curves' alternative is any label's tree and the analytic pricing's the
+/// router alone.
 pub fn pair_tree_values(
     pr: &Pricing,
     labels: &LabelStore,
@@ -994,13 +1010,17 @@ pub fn pair_tree_values(
     f: &[f64],
     cands: &[PairCand],
     tree_max: Option<usize>,
+    alternative: PairAlternative,
 ) -> Vec<PairValue> {
     let mut out: Vec<PairValue> = cands
         .iter()
         .filter_map(|&p| {
             let j = f64::from(p.joint).max(1.0);
             let s = labels.posting_len(p.a).min(labels.posting_len(p.b));
-            let tree = s < pr.n && pr.curves.is_some() && tree_max.is_none_or(|m| s <= m);
+            let tree = s < pr.n
+                && tree_max.is_none_or(|m| s <= m)
+                && (pr.curves.is_some()
+                    || (tree_max.is_some() && alternative == PairAlternative::Trees));
             let (mut alt, pair) = match pr.curves {
                 Some(_) => (pr.router_derived(j, true), pr.pair_tree_derived(j)),
                 None => (pr.router_pair(j), pr.pair_tree(j)),
@@ -1146,7 +1166,7 @@ mod tests {
         // The greedy through the selector: within every budget, the rare label first.
         let (counts, f) = select::label_weights(&s, model.singleton, 2);
         let cands = select::pair_candidates(&s, &counts, model.singleton, |_| true, 2);
-        let values = pair_tree_values(&pr, &s, &model, &f, &cands, None);
+        let values = pair_tree_values(&pr, &s, &model, &f, &cands, None, PairAlternative::Trees);
         assert!(values.windows(2).all(|w| w[0].value >= w[1].value));
         for budget in [0u64, rare.bytes, 10 * rare.bytes, u64::MAX / 4] {
             let params = select::Params {
@@ -1525,7 +1545,7 @@ mod tests {
         let mean = sample.mean_base_ns();
         assert!(mean > 1e6, "unreachable queries dominate the mean");
         let cands = select::pair_candidates(&s, &counts, 0.5, |_| true, 2);
-        let values = pair_tree_values(&pr, &s, &model, &f, &cands, None);
+        let values = pair_tree_values(&pr, &s, &model, &f, &cands, None, PairAlternative::Trees);
         assert!(!values.is_empty());
         // On a base-derived `{a} ∧ {b}` (a member as the query point) a pair tree saves at most
         // what the smaller label's tree costs there (50 ns), never the router's unreachable price.
@@ -1702,8 +1722,30 @@ mod tests {
         // A base-derived pair context whose smaller label has no tree is valued against the
         // router alone: never less than against the router or a tree.
         let cands = select::pair_candidates(&s, &counts, 0.5, |_| true, 2);
-        let values = pair_tree_values(&pr, &s, &model, &f, &cands, Some(cap));
-        let values_free = pair_tree_values(&pr, &s, &model, &f, &cands, None);
+        let values = pair_tree_values(
+            &pr,
+            &s,
+            &model,
+            &f,
+            &cands,
+            Some(cap),
+            PairAlternative::Trees,
+        );
+        let values_free =
+            pair_tree_values(&pr, &s, &model, &f, &cands, None, PairAlternative::Trees);
+        // With the curves the alternative is the same either way.
+        assert_eq!(
+            values,
+            pair_tree_values(
+                &pr,
+                &s,
+                &model,
+                &f,
+                &cands,
+                Some(cap),
+                PairAlternative::Router
+            )
+        );
         let mut above = 0;
         for v in &values {
             let w = values_free.iter().find(|w| w.cand == v.cand).unwrap();
@@ -1716,18 +1758,50 @@ mod tests {
             }
         }
         assert!(above > 0);
-        // The analytic pricing values a pair against the router alone, with or without fixed trees.
+        // The analytic pricing: without fixed trees against the router alone; with them against
+        // the smaller label's fixed tree where it has one (`Trees`, the default), or against the
+        // router again (`Router`, counting the fixed trees' saving twice).
         let pr_a = Pricing { curves: None, ..pr };
-        let fixed_a = pair_tree_values(&pr_a, &s, &model, &f, &cands, Some(cap));
-        for v in pair_tree_values(&pr_a, &s, &model, &f, &cands, None) {
+        let fixed_a = pair_tree_values(
+            &pr_a,
+            &s,
+            &model,
+            &f,
+            &cands,
+            Some(cap),
+            PairAlternative::Trees,
+        );
+        let fixed_r = pair_tree_values(
+            &pr_a,
+            &s,
+            &model,
+            &f,
+            &cands,
+            Some(cap),
+            PairAlternative::Router,
+        );
+        let mut below = 0;
+        for v in pair_tree_values(&pr_a, &s, &model, &f, &cands, None, PairAlternative::Trees) {
+            let j = f64::from(v.cand.joint).max(1.0);
+            assert_eq!(v.saving_ns, pr_a.router_pair(j) - pr_a.pair_tree(j));
             assert_eq!(
-                v.saving_ns,
-                pr_a.router_pair(f64::from(v.cand.joint).max(1.0))
-                    - pr_a.pair_tree(f64::from(v.cand.joint).max(1.0))
+                fixed_r.iter().find(|w| w.cand == v.cand).unwrap().saving_ns,
+                v.saving_ns
             );
             let w = fixed_a.iter().find(|w| w.cand == v.cand).unwrap();
-            assert_eq!(w.saving_ns, v.saving_ns);
+            let small = s.posting_len(v.cand.a).min(s.posting_len(v.cand.b));
+            if small > cap {
+                assert_eq!(w.saving_ns, v.saving_ns);
+            } else {
+                let tree = pr_a.tree_derived(small as f64, j, true);
+                assert_eq!(
+                    w.saving_ns,
+                    pr_a.router_pair(j).min(tree) - pr_a.pair_tree(j)
+                );
+                below += usize::from(w.saving_ns < v.saving_ns);
+            }
         }
+        assert!(below > 0);
         // The greedy takes pair trees only, starting from the mean cost with the fixed trees.
         let params = select::Params {
             k: 10,
@@ -1750,6 +1824,31 @@ mod tests {
             &params,
         );
         assert!(sel.best.islands.is_empty() && sel.best.n_pairs > 0);
+        // Priced against the fixed trees (the default), the analytic selection saves at most what
+        // the workload costs after the fixed trees (each query's saving counted once).
+        let sample_a = TreeSample::build_mixed(&s, &pr_a, model, Some(u.clone()), 2);
+        let mean_a = sample_a.mean_base_ns();
+        let (_, saving_a, _) = TreeGreedy::with_classes(&sample_a, &s, &pr_a, &f, 30).fix(fixed);
+        let params_a = select::Params {
+            mean_ns: mean_a - saving_a,
+            ..params
+        };
+        let sel_a = select::select_with(
+            &s,
+            || {
+                let mut g = TreeGreedy::with_classes(&sample_a, &s, &pr_a, &f, 30);
+                g.fix(fixed);
+                g
+            },
+            &fixed_a,
+            &params_a,
+        );
+        assert!(sel_a.best.islands.is_empty());
+        assert!(
+            sel_a.best.t_ns >= -0.01 * mean_a,
+            "{} of {mean_a}",
+            sel_a.best.t_ns
+        );
         let t = mean - saving - sel.best.pair_saving_ns;
         assert!(
             (sel.best.t_ns - t).abs() <= 1e-9 * mean,
