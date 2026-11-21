@@ -606,6 +606,18 @@ struct SelectArgs {
     /// `--fixed-trees-max-size` the fixed trees' modelled bytes).
     #[arg(long)]
     index_bytes: Option<u64>,
+    /// `--track graph`: how a router tree's bytes are counted — `rows` (each router a graph row
+    /// at the degree bound, its vector and a kind byte) or `compact` (as a run's bytes are
+    /// counted, the memory ceiling's base: adjacency lists of 4 B per node and per edge, and the
+    /// routers' vectors; a pair tree also its root entry).
+    #[arg(long, value_enum, default_value = "rows")]
+    tree_bytes: SelectTreeBytes,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SelectTreeBytes {
+    Rows,
+    Compact,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2140,6 +2152,10 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         + file_bytes(&a.graph)?;
     let n = store.n_points();
     let graph_track = a.track == SelectTrack::Graph;
+    ensure!(
+        graph_track || a.tree_bytes == SelectTreeBytes::Rows,
+        "--tree-bytes counts track G's router trees (--track graph)"
+    );
     let fixed_max = match &a.fixed_trees_max_size {
         Some(s) => {
             ensure!(
@@ -2181,6 +2197,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
                 r_max,
                 dim * T::DTYPE.size(),
             ),
+            compact_vector_bytes: (a.tree_bytes == SelectTreeBytes::Compact)
+                .then_some((dim * T::DTYPE.size()) as u64),
         })
     } else {
         None

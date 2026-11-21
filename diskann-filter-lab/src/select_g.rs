@@ -55,9 +55,11 @@
 //! independent query, by the member curves on base-derived queries.
 //!
 //! **Bytes**: a tree over `s` members has `⌈(s − 1)/(b̄ − 1)⌉` routers (at least one), each a
-//! graph row, a vector and a kind byte (`router_bytes`); a pair tree adds its pair's list and
-//! directory entry ([`crate::select::pair_bytes`]); the pairs' co-occurrence matrix is charged
-//! by the selector as for combination postings.
+//! graph row, a vector and a kind byte (`router_bytes`; the `rows` accounting) or, as a run's
+//! bytes are counted (`compact`, [`TreeModel::compact_vector_bytes`]), its adjacency list — 4 B
+//! per node and per edge, `s + R − 1` edges for `R` routers — and its vector; a pair tree adds
+//! its pair's list and directory entry ([`crate::select::pair_bytes`]) and (`compact`) its root
+//! entry; the pairs' co-occurrence matrix is charged by the selector as for combination postings.
 //!
 //! **Values**: a label tree serves exactly the queries whose `c*` is that label (a clause of
 //! several labels needs a tree for each of them, which this kind does not value), so label trees
@@ -93,8 +95,15 @@ pub struct TreeModel {
     pub curve: bool,
     /// Mean router fan-out `b̄` of the trees (k-means trees of fan-out bound 64: 20–28).
     pub fanout: f64,
-    /// Bytes of one router (graph row, vector, kind).
+    /// Bytes of one router (graph row, vector, kind): the `rows` accounting.
     pub router_bytes: u64,
+    /// The `compact` accounting, as a run's bytes are counted (the memory ceiling's base): the
+    /// bytes of a router's vector. A tree over `s` members with `R` routers then counts its
+    /// adjacency lists, 4 B per node and per edge (`R` nodes; `s + R − 1` edges, one to each
+    /// member and to each router below the root), and its routers' vectors; a pair tree also
+    /// its root entry. `None`: the `rows` accounting, `R · router_bytes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_vector_bytes: Option<u64>,
 }
 
 impl TreeModel {
@@ -154,7 +163,22 @@ impl TreeModel {
 
     /// Bytes of a tree over `s` members.
     pub fn tree_bytes(&self, s: usize) -> u64 {
-        self.routers(s) * self.router_bytes
+        let r = self.routers(s);
+        match self.compact_vector_bytes {
+            Some(v) => r * (4 + v) + 4 * (s.max(1) as u64 + r - 1),
+            None => r * self.router_bytes,
+        }
+    }
+
+    /// Bytes of a pair tree over a stored pair of `joint` points: the pair's list and directory
+    /// entry ([`pair_bytes`]), its tree and, in the `compact` accounting, its root entry.
+    pub fn pair_tree_bytes(&self, joint: u32) -> u64 {
+        let root = if self.compact_vector_bytes.is_some() {
+            4
+        } else {
+            0
+        };
+        pair_bytes(joint) + self.tree_bytes(joint as usize) + root
     }
 
     /// Bytes of one router of a graph with degree bound `r_max` and vectors of `vector_bytes`.
@@ -989,7 +1013,7 @@ pub fn pair_tree_values(
                 return None;
             }
             let prob = context_prob(model, f, &p);
-            let bytes = pair_bytes(p.joint) + pr.tm.tree_bytes(p.joint as usize);
+            let bytes = pr.tm.pair_tree_bytes(p.joint);
             Some(PairValue {
                 cand: p,
                 prob,
@@ -1053,6 +1077,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         let n = 1_000_000;
         // A selective label: the tree searches it whole, below the router's post-filter route
@@ -1087,6 +1112,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         let model = QueryModel {
             n_queries: 20_000,
@@ -1170,6 +1196,7 @@ mod tests {
             curve: true,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         assert!((tm.tree_expansions(&c, 1_000.0, 1_000.0) - 4.0).abs() < 1e-9);
         assert!((tm.tree_expansions(&c, 100_000.0, 100_000.0) - 16.0).abs() < 1e-9);
@@ -1197,6 +1224,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
@@ -1330,6 +1358,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         // The router reaches 0.96 only on labels of ≥ 2,000 points; trees reach it everywhere.
         let class = |size: f64, router: f64| CurveClass {
@@ -1442,6 +1471,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         // The router reaches 0.96 only on clauses of ≥ 1,000 points, placed anywhere; trees
         // everywhere at 50 ns, except a label's tree on a pair context (diluted): 500 ns.
@@ -1525,6 +1555,49 @@ mod tests {
     }
 
     #[test]
+    fn compact_bytes_count_a_trees_adjacency_lists_and_vectors() {
+        let rows = TreeModel {
+            k: 10,
+            recall: 0.9,
+            frontier: 512.0,
+            curve: false,
+            fanout: 26.0,
+            router_bytes: TreeModel::router_bytes_of(83, 64),
+            compact_vector_bytes: None,
+        };
+        let compact = TreeModel {
+            compact_vector_bytes: Some(64),
+            ..rows
+        };
+        for s in [1usize, 2, 26, 27, 1_000, 100_000] {
+            let r = rows.routers(s);
+            assert_eq!(rows.tree_bytes(s), r * 401);
+            // R nodes and s + R − 1 edges of 4 B, R vectors of 64 B.
+            assert_eq!(
+                compact.tree_bytes(s),
+                4 * r + 4 * (s as u64 + r - 1) + 64 * r
+            );
+            assert!(compact.tree_bytes(s) < rows.tree_bytes(s));
+        }
+        // A pair tree: its list and directory entry, its tree and (compact) its root entry.
+        assert_eq!(
+            rows.pair_tree_bytes(60),
+            pair_bytes(60) + rows.tree_bytes(60)
+        );
+        assert_eq!(
+            compact.pair_tree_bytes(60),
+            pair_bytes(60) + compact.tree_bytes(60) + 4
+        );
+        // The rows accounting reports as before (no compact key).
+        let j = serde_json::to_value(rows).unwrap();
+        assert!(j.get("compact_vector_bytes").is_none());
+        assert_eq!(
+            serde_json::to_value(compact).unwrap()["compact_vector_bytes"],
+            64
+        );
+    }
+
+    #[test]
     fn fixed_trees_are_taken_first_and_only_pair_trees_are_selected() {
         let s = store();
         let c = costs();
@@ -1535,6 +1608,7 @@ mod tests {
             curve: false,
             fanout: 26.0,
             router_bytes: 400,
+            compact_vector_bytes: None,
         };
         // The router reaches 0.96 only on clauses of ≥ 1,000 points; trees at 50 ns, a label's
         // tree on a pair context (diluted) at 500 ns.
