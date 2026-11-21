@@ -595,6 +595,17 @@ struct SelectArgs {
     /// workload's closed form; see `select_g::TreeGreedy::with_classes`).
     #[arg(long, default_value_t = 30)]
     tree_min_records: u32,
+    /// `--track graph`: the label trees are fixed by a size cap — every label of 1 to SIZE
+    /// points (`n/10` = ⌈n/10⌉), as `flab steiner --construction tree --min-size 0 --max-size
+    /// SIZE` builds them — taken before the greedy and part of the index, and only pair trees
+    /// are selected, valued against the routes these trees give.
+    #[arg(long)]
+    fixed_trees_max_size: Option<String>,
+    /// The index's bytes without the selected structures (the `B` of the elasticity rule and of
+    /// the floor). Default: the base vectors, the label store and the graph file (and with
+    /// `--fixed-trees-max-size` the fixed trees' modelled bytes).
+    #[arg(long)]
+    index_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2124,10 +2135,22 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let costs = run::read_costs(&a.calibration)?;
     std::fs::create_dir_all(&a.out_dir)?;
     let base_file = run::data::base_file(&a.dataset)?;
-    let index_bytes = file_bytes(&base_file)?
+    let file_index_bytes = file_bytes(&base_file)?
         + file_bytes(&a.dataset.join("labels.flab"))?
         + file_bytes(&a.graph)?;
     let n = store.n_points();
+    let graph_track = a.track == SelectTrack::Graph;
+    let fixed_max = match &a.fixed_trees_max_size {
+        Some(s) => {
+            ensure!(
+                graph_track,
+                "--fixed-trees-max-size fixes track G's label trees (--track graph)"
+            );
+            Some(diskann_filter_lab::build::steiner::parse_size(s, n)?)
+        }
+        None => None,
+    };
+    let is_fixed = |l: u32| fixed_max.is_some_and(|m| (1..=m).contains(&store.posting_len(l)));
     ensure!(
         (0.0..1.0).contains(&a.uniform),
         "--uniform must be in [0, 1)"
@@ -2140,7 +2163,6 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         uniform: a.uniform,
         ..Default::default()
     };
-    let graph_track = a.track == SelectTrack::Graph;
     let tree_model = if graph_track {
         ensure!(
             a.tree_effort == SelectTreeEffort::Frontier || !costs.tree_r.is_empty(),
@@ -2257,12 +2279,38 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let (n_single, n_pair, n_walk) = independent
         .as_deref()
         .map_or((0, 0, 0), |u| (u.n_single, u.n_pair, u.n_walk));
+    // `--fixed-trees-max-size`: the fixed trees (their number, expected saving per query and
+    // modelled bytes; the same in every greedy run), the mean cost the greedy starts from.
+    let fixed = match (fixed_max, &tree_sample, &pricing) {
+        (Some(_), Some(ts), Some(pr)) => Some(
+            diskann_filter_lab::select_g::TreeGreedy::with_classes(
+                ts,
+                &store,
+                pr,
+                &f,
+                a.tree_min_records,
+            )
+            .fix(is_fixed),
+        ),
+        _ => None,
+    };
+    let index_bytes = a
+        .index_bytes
+        .unwrap_or(file_index_bytes + fixed.map_or(0, |(_, _, b)| b));
+    let mean_start = mean - fixed.map_or(0.0, |(_, s, _)| s);
+    if let Some((nt, s, b)) = fixed {
+        println!(
+            "fixed label trees (1 to {} points): {nt}, {:.1} MiB modelled, expected saving {s:.0} of {mean:.0} ns per query; the greedy starts at {mean_start:.0} ns",
+            fixed_max.unwrap_or(0),
+            b as f64 / (1u64 << 20) as f64
+        );
+    }
     let stop = match a.stop {
         StopArg::Elasticity => select::Stop::Elasticity,
         StopArg::Budget => select::Stop::Budget,
     };
     let floor = match stop {
-        select::Stop::Budget => a.kappa * mean / index_bytes as f64,
+        select::Stop::Budget => a.kappa * mean_start / index_bytes as f64,
         select::Stop::Elasticity => 0.0,
     };
     println!(
@@ -2310,7 +2358,9 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         .collect();
     let values = match &pricing {
         Some(_) if !a.pair_trees => Vec::new(),
-        Some(pr) => diskann_filter_lab::select_g::pair_tree_values(pr, &store, &model, &f, &cands),
+        Some(pr) => diskann_filter_lab::select_g::pair_tree_values(
+            pr, &store, &model, &f, &cands, fixed_max,
+        ),
         None => select::pair_values(&store, &costs, a.k, &model, &f, &cands),
     };
     let pairs_s = count_s + secs(t);
@@ -2388,7 +2438,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             floor,
             model,
             stop,
-            mean_ns: mean,
+            mean_ns: mean_start,
             index_bytes,
         };
         let t = Instant::now();
@@ -2397,13 +2447,17 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             (_, Some(ts), Some(pr)) => select::select_with(
                 &store,
                 || {
-                    diskann_filter_lab::select_g::TreeGreedy::with_classes(
+                    let mut g = diskann_filter_lab::select_g::TreeGreedy::with_classes(
                         ts,
                         &store,
                         pr,
                         &f,
                         a.tree_min_records,
-                    )
+                    );
+                    if fixed_max.is_some() {
+                        g.fix(is_fixed);
+                    }
+                    g
                 },
                 &values,
                 &params,
@@ -2413,7 +2467,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         let select_s = secs(t);
         let best = &sel.best;
         println!(
-            "budget {b} B/point: {} {} ({:.1} MiB, {:.0} ns per query), {} {} (T {:?}, {} big labels, {:.1} MiB incl. matrix, {:.0} ns per query); expected saving {:.0} of {mean:.0} ns, {:.1} MiB; cut {:.3e}; {select_s:.1} s",
+            "budget {b} B/point: {} {} ({:.1} MiB, {:.0} ns per query), {} {} (T {:?}, {} big labels, {:.1} MiB incl. matrix, {:.0} ns per query); expected saving {:.0} of {mean_start:.0} ns, {:.1} MiB; cut {:.3e}; {select_s:.1} s",
             best.islands.len(),
             if graph_track { "trees" } else { "islands" },
             best.island_bytes as f64 / (1u64 << 20) as f64,
@@ -2431,9 +2485,9 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         println!(
             "  {:.2} B/point spent; mean cost {:.0} → {:.0} ns (−{:.1} %), index +{:.2} %",
             best.bytes() as f64 / n as f64,
-            mean,
-            mean - best.saving_ns(),
-            100.0 * best.saving_ns() / mean,
+            mean_start,
+            mean_start - best.saving_ns(),
+            100.0 * best.saving_ns() / mean_start,
             100.0 * best.bytes() as f64 / index_bytes as f64
         );
         sels.push((b, params, sel, select_s));
@@ -2469,6 +2523,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "route_curves": a.route_curves,
         "unreachable": if a.unreachable == SelectUnreachable::AtMax { "at-max" } else { "must" },
         "pair_trees": a.pair_trees,
+        "fixed_trees": fixed.map(|(nt, s, b)| json!({
+            "max_size": fixed_max, "labels": nt, "expected_saving_ns": s, "model_bytes": b,
+        })),
+        "mean_cost_start_ns": mean_start,
+        "index_bytes_given": a.index_bytes.is_some(),
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
@@ -2549,10 +2608,18 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     for (b, params, sel, select_s) in &sels {
         let mut build = json!({});
         if graph_track {
+            // The trees' labels: those taken, or (`--fixed-trees-max-size`) the fixed ones.
+            let trees: Vec<u32> = match fixed_max {
+                Some(_) => (0..store.n_labels() as u32)
+                    .filter(|&l| is_fixed(l))
+                    .collect(),
+                None => sel.best.islands.clone(),
+            };
             let out = a.out_dir.join(format!("sel-b{}.trees.txt", tag(*b)));
-            let text: String = sel.best.islands.iter().map(|l| format!("{l}\n")).collect();
+            let text: String = trees.iter().map(|l| format!("{l}\n")).collect();
             std::fs::write(&out, text)?;
-            build["trees"] = json!({ "output": out, "labels": sel.best.islands.len() });
+            build["trees"] =
+                json!({ "output": out, "labels": trees.len(), "fixed": fixed_max.is_some() });
         }
         if let Some((union, per_island, wall)) = &built_islands {
             if !sel.best.islands.is_empty() {

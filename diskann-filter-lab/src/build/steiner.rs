@@ -228,7 +228,8 @@ fn parse_label_list(text: &str, n_labels: usize, origin: &str) -> Result<Vec<u32
     Ok(out)
 }
 
-fn parse_size(s: &str, n: usize) -> Result<usize> {
+/// A label-size bound: `n/k` (= ⌈n/k⌉ of `n` points) or a number of points.
+pub fn parse_size(s: &str, n: usize) -> Result<usize> {
     let s = s.trim();
     if let Some(k) = s.strip_prefix("n/") {
         let k: usize = k.parse().with_context(|| format!("bad size {s:?}"))?;
