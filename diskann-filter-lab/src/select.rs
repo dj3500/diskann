@@ -203,6 +203,18 @@ pub trait LabelKind {
     }
     /// An item of another kind serves sample query `q` at `cost`.
     fn serve(&mut self, _q: usize, _cost: f64) {}
+    /// The sample's base-derived queries a pair item of labels `a`, `b` serves when they are
+    /// valued one by one (as the independent queries, [`Self::pair_cost`]) rather than by the
+    /// closed form of their context ([`Self::derived_closed_form`]).
+    fn derived_queries(&self, _a: u32, _b: u32) -> &[u32] {
+        &[]
+    }
+    /// Whether a pair item's saving on the base-derived queries is its context's closed form
+    /// (`prob · saving`), or the sum over [`Self::derived_queries`] (each query's saving counted
+    /// once, against its current cost).
+    fn derived_closed_form(&self) -> bool {
+        true
+    }
 }
 
 impl LabelKind for IslandGreedy<'_> {
@@ -701,13 +713,20 @@ fn run<G: LabelKind>(
                     }
                 }
             }
+            for &q in gr.derived_queries(v.cand.a, v.cand.b) {
+                let q = q as usize;
+                if let Some(cost) = gr.pair_cost(q, v.cand.a, v.cand.b, v.cand.joint) {
+                    served.push((q, gr.query_weight(q), cost));
+                }
+            }
             ranges.push((start, served.len()));
         }
     }
+    let closed = gr.derived_closed_form();
     let pair_gain = |gr: &G, i: usize| -> f64 {
         let v = &values[i];
         let (a, b) = ranges[i];
-        v.prob * v.saving_ns
+        (if closed { v.prob * v.saving_ns } else { 0.0 })
             + served[a..b]
                 .iter()
                 .map(|&(q, w, cost)| w * (gr.query_cost(q) - cost).max(0.0))

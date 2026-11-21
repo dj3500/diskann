@@ -48,7 +48,12 @@
 //! tree serves by the graph-only crossover's estimate — so that selection and routing share one
 //! cost model: a pair tree saves only where the kernel would route a query to it (cheaper than
 //! the query's label tree, or than its graph route when it has none), and a query whose
-//! binding label has a tree takes a pair tree only with fewer members than that label.
+//! binding label has a tree takes a pair tree only with fewer members than that label. The
+//! base-derived part is then valued on the sampled queries themselves, as the independent part:
+//! a pair tree serves a sampled query whose single-label clauses include both its labels, at
+//! its tree route diluted to the query's matches, against the query's current cost — each
+//! query's saving counted once, where the closed form of the context `{a} ∧ {b}` would credit
+//! every pair of a query's single-label clauses with the whole query.
 //!
 //! **Calibrated costs** (`flab select --route-curves`, [`RouteCurves`]): instead of the model
 //! above, both routes are priced from recall/time curves measured per label-size class on
@@ -608,6 +613,15 @@ pub struct TreeSample {
     /// Base-derived queries (the first `n_data` of `base_ns`).
     pub n_data: usize,
     independent: Option<Arc<Independent>>,
+    /// Under the kernel's prices ([`KernelRoutes`]): the base-derived queries themselves, for
+    /// valuing pair trees on them (each query's saving counted once). Per query, its match count
+    /// and its binding label (the binding clause's single label, `u32::MAX` for none) with that
+    /// label's tree cost; the pairs of its single-label clauses, `(a, b)` with `a < b`, sorted,
+    /// and the queries holding each (`derived_pairs` / `derived_queries`, parallel).
+    derived_m: Vec<f32>,
+    derived_binding: Vec<(u32, f32)>,
+    derived_pairs: Vec<(u32, u32)>,
+    derived_queries: Vec<u32>,
 }
 
 impl TreeSample {
@@ -645,6 +659,7 @@ impl TreeSample {
                 Vec::<(usize, usize, bool)>::new(),
             )
         };
+        let kernel = pr.kernel.is_some();
         let parts = crate::parallel::par_map(
             n_total.div_ceil(chunk),
             threads,
@@ -652,6 +667,9 @@ impl TreeSample {
             |ci, (kl, clauses, cats)| {
                 let mut base = Vec::new();
                 let mut recs = Vec::new();
+                // Under the kernel's prices, per base-derived query: (match count, binding label
+                // and its tree cost, single-label clauses).
+                let mut derived: Vec<(f32, (u32, f32), Vec<u32>)> = Vec::new();
                 for qi in ci * chunk..((ci + 1) * chunk).min(n_total) {
                     if qi >= model.n_queries {
                         let w = &u[qi - model.n_queries];
@@ -674,37 +692,76 @@ impl TreeSample {
                     }
                     if !draw_query(labels, &model, qi, kl, clauses, cats) {
                         base.push(0.0);
+                        if kernel {
+                            derived.push((0.0, (u32::MAX, 0.0), Vec::new()));
+                        }
                         continue;
                     }
                     let (jmin, _, m) = query_matches(labels, &model, kl, clauses);
                     base.push(pr.router_derived(m, clauses.len() > 1));
                     let (a, b) = clauses[jmin];
                     let mut nonempty = kl[a..b].iter().filter(|&&l| labels.posting_len(l) > 0);
+                    let mut binding = (u32::MAX, 0.0);
                     if let (Some(&l), None) = (nonempty.next(), nonempty.next()) {
                         let s = labels.posting_len(l);
                         if s < n {
                             let t = pr.tree_derived(s as f64, m, clauses.len() > 1);
                             recs.push((l, qi as u32, t as f32));
+                            binding = (l, t as f32);
                         }
                     }
+                    if kernel {
+                        let mut singles: Vec<u32> = clauses
+                            .iter()
+                            .filter(|&&(a, b)| b == a + 1 && labels.posting_len(kl[a]) > 0)
+                            .map(|&(a, _)| kl[a])
+                            .collect();
+                        singles.sort_unstable();
+                        derived.push((m as f32, binding, singles));
+                    }
                 }
-                (base, recs)
+                (base, recs, derived)
             },
         );
         let mut base_ns = Vec::with_capacity(n_total);
         let mut recs = Vec::new();
-        for (b, r) in parts {
+        let (mut derived_m, mut derived_binding) = (Vec::new(), Vec::new());
+        let mut pairs: Vec<((u32, u32), u32)> = Vec::new();
+        for (b, r, d) in parts {
             base_ns.extend(b);
             recs.extend(r);
+            for (m, binding, singles) in d {
+                let q = derived_m.len() as u32;
+                for (i, &x) in singles.iter().enumerate() {
+                    pairs.extend(singles[i + 1..].iter().map(|&y| ((x, y), q)));
+                }
+                derived_m.push(m);
+                derived_binding.push(binding);
+            }
         }
         recs.sort_unstable_by_key(|&(l, q, _)| (l, q));
+        pairs.sort_unstable();
+        let (derived_pairs, derived_queries) = pairs.into_iter().unzip();
         Self {
             model,
             base_ns,
             recs,
             n_data: model.n_queries,
             independent,
+            derived_m,
+            derived_binding,
+            derived_pairs,
+            derived_queries,
         }
+    }
+
+    /// Under the kernel's prices: the base-derived queries whose single-label clauses include
+    /// both `a` and `b` (none otherwise).
+    fn derived_pair_queries(&self, a: u32, b: u32) -> &[u32] {
+        let key = (a.min(b), a.max(b));
+        let lo = self.derived_pairs.partition_point(|&p| p < key);
+        let hi = lo + self.derived_pairs[lo..].partition_point(|&p| p == key);
+        &self.derived_queries[lo..hi]
     }
 
     /// Share `μ` of the independent queries (0 without them).
@@ -819,6 +876,10 @@ pub struct TreeGreedy<'s> {
     /// Per independent query: the cost of the cheapest stored pair tree that serves it (`∞`:
     /// none).
     served: Vec<f64>,
+    /// Under the kernel's prices: the candidate of each label (`u32::MAX`: none), and per
+    /// base-derived query the cost of the cheapest stored pair tree the route check takes for it.
+    x_of_label: Vec<u32>,
+    derived_served: Vec<f64>,
     taken: Vec<bool>,
     heap: std::collections::BinaryHeap<(Key, std::cmp::Reverse<usize>)>,
     n_taken: u32,
@@ -930,6 +991,8 @@ impl<'s> TreeGreedy<'s> {
             ctx_recs: Vec::new(),
             ctx_cand: vec![(u32::MAX, 0.0); n_ctx],
             served: vec![f64::INFINITY; n_ctx],
+            x_of_label: Vec::new(),
+            derived_served: vec![f64::INFINITY; sample.derived_m.len()],
             taken: Vec::new(),
             heap: std::collections::BinaryHeap::new(),
             n_taken: 0,
@@ -955,6 +1018,12 @@ impl<'s> TreeGreedy<'s> {
                 order: None,
             });
             g.taken.push(false);
+        }
+        if pr.kernel.is_some() {
+            g.x_of_label = vec![u32::MAX; nl];
+            for (x, t) in g.terms.iter().enumerate() {
+                g.x_of_label[t.label as usize] = x as u32;
+            }
         }
         for x in 0..g.terms.len() {
             let gain = g.gain(x);
@@ -987,6 +1056,15 @@ impl<'s> TreeGreedy<'s> {
         }
         self.heap.clear();
         (self.n_taken, saving, bytes)
+    }
+
+    /// Under the kernel's prices: the size and cost of base-derived query `q`'s binding-label
+    /// tree when that tree is taken (`None`: the query takes the graph route).
+    fn derived_tree(&self, q: usize) -> Option<(usize, f64)> {
+        let (l, t) = *self.sample.derived_binding.get(q)?;
+        let x = *self.x_of_label.get(l as usize)?;
+        (x != u32::MAX && self.taken[x as usize])
+            .then(|| (self.terms[x as usize].size, f64::from(t)))
     }
 
     /// Expected saving per query (ns) of candidate `x` given the items taken.
@@ -1051,6 +1129,18 @@ impl LabelKind for TreeGreedy<'_> {
     }
 
     fn pair_cost(&self, q: usize, _a: u32, _b: u32, joint: u32) -> Option<f64> {
+        let j = f64::from(joint).max(1.0);
+        if q < self.sample.n_data {
+            // Under the kernel's prices, a base-derived query holding the pair's labels as
+            // single-label clauses, as an independent one below.
+            let m = f64::from(*self.sample.derived_m.get(q)?);
+            if let Some(s) = self.derived_tree(q).map(|(s, _)| s) {
+                if joint as usize >= s {
+                    return None;
+                }
+            }
+            return Some(self.pr.pair_tree_on(j, m.clamp(1.0, j)));
+        }
         let w = self.sample.independent_query(q)?;
         if self.pr.kernel.is_some() {
             // The kernel considers a pair tree for a query whose binding label has a tree only
@@ -1066,13 +1156,18 @@ impl LabelKind for TreeGreedy<'_> {
                 _ => {}
             }
         }
-        let j = f64::from(joint).max(1.0);
         Some(self.pr.pair_tree_on(j, w.joint.clamp(1.0, j)))
     }
 
     fn query_cost(&self, q: usize) -> f64 {
         let nd = self.sample.n_data;
         if q < nd {
+            if let Some(&c) = self.derived_served.get(q).filter(|c| c.is_finite()) {
+                return c;
+            }
+            if let Some((_, t)) = self.derived_tree(q) {
+                return t;
+            }
             return self.sample.base_ns[q];
         }
         let i = q - nd;
@@ -1089,9 +1184,21 @@ impl LabelKind for TreeGreedy<'_> {
         self.sample.weight(q)
     }
 
+    fn derived_queries(&self, a: u32, b: u32) -> &[u32] {
+        self.sample.derived_pair_queries(a, b)
+    }
+
+    fn derived_closed_form(&self) -> bool {
+        self.pr.kernel.is_none()
+    }
+
     fn serve(&mut self, q: usize, cost: f64) {
         let nd = self.sample.n_data;
-        if q >= nd {
+        if q < nd && q < self.derived_served.len() {
+            if cost < self.query_cost(q) {
+                self.derived_served[q] = cost;
+            }
+        } else if q >= nd {
             // The kernel takes a stored pair's route first, whatever the label tree costs; of
             // several stored pairs, the one with the fewest points (here: the cheapest). Under
             // the kernel's prices the route is cost-checked: the pair tree only where it is
@@ -1133,7 +1240,9 @@ pub enum PairAlternative {
 /// router alone. Under the kernel's prices ([`KernelRoutes`]) the alternative is the kernel's: the
 /// smaller label's fixed tree where it has one (a pair with as many points as that label is never
 /// routed to, and has no value), else the graph route; a negative saving is none (the
-/// cost-checked route does not take the pair tree there).
+/// cost-checked route does not take the pair tree there). The greedy then values the
+/// base-derived part on the sampled queries ([`LabelKind::derived_queries`]); these closed-form
+/// terms only order the candidates and report them.
 pub fn pair_tree_values(
     pr: &Pricing,
     labels: &LabelStore,
@@ -2154,8 +2263,37 @@ mod tests {
             refused > 0 && cheaper > 0 && dearer > 0,
             "{refused} {cheaper} {dearer}"
         );
+        // The base-derived queries are valued one by one, not by their contexts' closed form:
+        // a pair serves those holding both its labels as single-label clauses, at its tree
+        // diluted to the query's matches, unless the query's binding label has a tree no larger
+        // than the pair.
+        assert!(!g.derived_closed_form());
+        let mut derived = [0; 2];
+        for p in &cands {
+            let j = f64::from(p.joint).max(1.0);
+            for q in g.derived_queries(p.a, p.b).to_vec() {
+                let q = q as usize;
+                assert!(q < nd);
+                match g.pair_cost(q, p.a, p.b, p.joint) {
+                    Some(cost) => {
+                        let m = f64::from(sample.derived_m[q]);
+                        assert_eq!(cost, pr.pair_tree_on(j, m.clamp(1.0, j)));
+                        let before = g.query_cost(q);
+                        g.serve(q, cost);
+                        assert_eq!(g.query_cost(q), before.min(cost));
+                        derived[0] += 1;
+                    }
+                    None => {
+                        let (l, _) = sample.derived_binding[q];
+                        assert!(fixed(l) && p.joint as usize >= s.posting_len(l));
+                        derived[1] += 1;
+                    }
+                }
+            }
+        }
+        assert!(derived.iter().all(|&x| x > 0), "{derived:?}");
         // The greedy takes only pair trees with a positive saving; the mean cost it reaches is
-        // the start minus their savings.
+        // the start minus their savings, never below zero (each query's saving counted once).
         let sample = TreeSample::build_mixed(&s, &pr, model, Some(u), 2);
         let (_, saving, _) = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30).fix(fixed);
         let mean = sample.mean_base_ns() - saving;
@@ -2179,9 +2317,10 @@ mod tests {
             &values,
             &params,
         );
-        assert!(sel.best.islands.is_empty());
+        assert!(sel.best.islands.is_empty() && sel.best.n_pairs > 0);
         assert!(sel.best.pair_gains.iter().all(|&x| x > 0.0));
         assert_eq!(sel.best.pair_gains.len(), sel.best.n_pairs);
+        assert!(sel.best.t_ns >= 0.0, "{} of {mean}", sel.best.t_ns);
         let t = mean - sel.best.pair_saving_ns;
         assert!(
             (sel.best.t_ns - t).abs() <= 1e-9 * mean,
