@@ -624,6 +624,62 @@ struct SelectArgs {
     /// counting the fixed trees' saving again: the selection before, kept to reproduce it).
     #[arg(long, value_enum)]
     pair_alternative: Option<SelectPairAlternative>,
+    /// `--track graph`: how routes are priced — `kernel` (the default with
+    /// `--fixed-trees-max-size`: as the kernel's cost-checked pair route, `tree_pairs = "on"`,
+    /// prices them at the reference recall — a tree route by its frontier `--tree-frontier` at
+    /// the query's dilution, a query no tree serves by the graph-only crossover's estimate under
+    /// track G's run keys — so that a pair tree is worth only what it saves where the kernel
+    /// would route to it) or `model` (the selector's analytic model, or `--route-curves`: the
+    /// selections before, kept to reproduce them; the default without fixed trees, whose label
+    /// trees the kernel takes whatever they cost).
+    #[arg(long, value_enum)]
+    pricing: Option<SelectPricing>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SelectPricing {
+    Kernel,
+    Model,
+}
+
+/// How track G's routes are priced: the kernel's prices with fixed label trees, the model
+/// otherwise, unless `--pricing` says otherwise; the kernel's prices need fixed trees, the
+/// reference frontier (`--tree-effort frontier`), no route curves and the router's effort curve,
+/// and a pair valued against the fixed trees.
+fn select_pricing(
+    a: &SelectArgs,
+    costs: &diskann_filter_lab::kernel::cost::UnitCosts,
+) -> Result<SelectPricing> {
+    let graph_track = a.track == SelectTrack::Graph;
+    ensure!(
+        graph_track || a.pricing.is_none(),
+        "--pricing prices track G's routes (--track graph)"
+    );
+    let fixed = a.fixed_trees_max_size.is_some();
+    let kernel_ok = graph_track
+        && fixed
+        && a.route_curves.is_none()
+        && a.tree_effort == SelectTreeEffort::Frontier;
+    let pricing = a.pricing.unwrap_or(if kernel_ok {
+        SelectPricing::Kernel
+    } else {
+        SelectPricing::Model
+    });
+    if pricing == SelectPricing::Kernel {
+        ensure!(
+            kernel_ok,
+            "--pricing kernel prices pair trees against fixed label trees (--fixed-trees-max-size) at the reference frontier (--tree-effort frontier), without --route-curves"
+        );
+        ensure!(
+            a.pair_alternative != Some(SelectPairAlternative::Router),
+            "--pricing kernel values pair trees against the kernel's routes (--pair-alternative trees)"
+        );
+        ensure!(
+            costs.effort_list(a.tree_recall, a.k as f64).is_some(),
+            "--pricing kernel needs a calibration with the router's effort curve"
+        );
+    }
+    Ok(pricing)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -2194,6 +2250,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let graph_track = a.track == SelectTrack::Graph;
     let tree_bytes = select_tree_bytes(a.track, a.tree_bytes)?;
     let pair_alternative = select_pair_alternative(a.track, a.pair_alternative)?;
+    let pricing_kind = select_pricing(&a, &costs)?;
     let fixed_max = match &a.fixed_trees_max_size {
         Some(s) => {
             ensure!(
@@ -2264,6 +2321,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             curves: curves.as_ref(),
             n,
             at_max: a.unreachable == SelectUnreachable::AtMax,
+            kernel: (pricing_kind == SelectPricing::Kernel)
+                .then(|| diskann_filter_lab::select_g::KernelRoutes::recipe(a.tree_recall)),
         });
     // Every co-occurring pair of labels of different categories: the pair contexts of the
     // workload, and (labels of 64 to n − 1 points) the candidates.
@@ -2595,6 +2654,11 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         })),
         "mean_cost_start_ns": mean_start,
         "pair_alternative": graph_track.then_some(pair_alternative),
+        "pricing": graph_track.then_some(match pricing_kind {
+            SelectPricing::Kernel => "kernel",
+            SelectPricing::Model => "model",
+        }),
+        "kernel_routes": pricing.as_ref().and_then(|p| p.kernel),
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
@@ -2685,6 +2749,25 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             let out = a.out_dir.join(format!("sel-b{}.trees.txt", tag(*b)));
             let text: String = trees.iter().map(|l| format!("{l}\n")).collect();
             std::fs::write(&out, text)?;
+            // The pair trees taken, in the greedy's order: their base-derived saving per query
+            // (`prob · saving`) and their marginal saving with the workload's independent
+            // queries when taken (diagnostics).
+            let mut tsv = String::from("a\tb\tsize_a\tsize_b\tjoint\tderived_ns\tgain_ns\tbytes\n");
+            for (&i, &g) in sel.best.pairs.iter().zip(&sel.best.pair_gains) {
+                let v = &values[i];
+                tsv += &format!(
+                    "{}\t{}\t{}\t{}\t{}\t{:.4e}\t{:.4e}\t{}\n",
+                    v.cand.a,
+                    v.cand.b,
+                    store.posting_len(v.cand.a),
+                    store.posting_len(v.cand.b),
+                    v.cand.joint,
+                    v.prob * v.saving_ns,
+                    g,
+                    v.bytes
+                );
+            }
+            std::fs::write(a.out_dir.join(format!("sel-b{}.pairs.tsv", tag(*b))), tsv)?;
             build["trees"] =
                 json!({ "output": out, "labels": trees.len(), "fixed": fixed_max.is_some() });
         }

@@ -16,8 +16,8 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{
-        Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator, TreeChoice, TreeEffort, TreePairs, TreeRoute,
+        Crossover, EstimateSource, ExactChecks, PostfilterRoute, PostfilterStarts, RowReads,
+        StartAdmission, StartSource, Terminator, TreeChoice, TreeEffort, TreePairs, TreeRoute,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -2133,9 +2133,8 @@ pub(super) fn tree_route_option(
         .as_ref()
         .expect("validated: tree_pairs = on has the unit costs");
     let a = a.max(1.0);
-    let rho = (est.m / a).clamp(1.0 / a, 1.0);
+    let rho = tree_dilution(est.m, a);
     let b = plan.tree_fanout.max(2.0);
-    let whole = a / (b - 1.0) + 1.0;
     let (frontier, configured) = match plan.kernel.tree_effort {
         TreeEffort::List => (effort as f64 / rho, effort as f64),
         TreeEffort::Fixed(f) => (f as f64 / rho, f as f64),
@@ -2145,14 +2144,87 @@ pub(super) fn tree_route_option(
             (f, f)
         }
     };
-    let expansions = frontier.min(whole).max(1.0);
-    let checks = (expansions * b).min(a);
-    let cost = checks * costs.graph_pred_ns + (checks * rho + expansions) * costs.graph_dist_ns;
+    let (expansions, cost) = tree_route_cost(costs, b, a, rho, frontier);
     let l = expansions
         .max(configured)
         .ceil()
         .clamp(1.0, n_nodes.max(1) as f64);
     (l as usize, cost)
+}
+
+/// The share `ρ = M̂ / a` of a tree's `a ≥ 1` members that match (at least one member, at most
+/// all), as [`tree_route_option`] prices it.
+fn tree_dilution(m: f64, a: f64) -> f64 {
+    (m / a).clamp(1.0 / a, 1.0)
+}
+
+/// [`tree_route_option`]'s expansions and model cost for a tree over `a ≥ 1` members of which a
+/// share `rho` match, routers of mean fan-out `b ≥ 2`, at router frontier `frontier`: at most
+/// the whole tree, each expansion with its fan-out's member checks (at most the tree's `a`
+/// members in all), a distance per member expected to match and one for the router.
+fn tree_route_cost(costs: &UnitCosts, b: f64, a: f64, rho: f64, frontier: f64) -> (f64, f64) {
+    let whole = a / (b - 1.0) + 1.0;
+    let expansions = frontier.min(whole).max(1.0);
+    let checks = (expansions * b).min(a);
+    let cost = checks * costs.graph_pred_ns + (checks * rho + expansions) * costs.graph_dist_ns;
+    (expansions, cost)
+}
+
+/// The model cost [`tree_route_option`] gives a tree route under `tree_effort = "fixed(F)"`
+/// (`frontier` = F) for a tree over `a` members of which `m` match, routers of mean fan-out
+/// `fanout`: the price of the cost-checked pair route (`tree_pairs = "on"`) and of the label
+/// tree it is compared with, for the selector's pricing of track G's pair trees (`flab select
+/// --track graph --pricing kernel`, [`crate::select_g::KernelRoutes`]).
+pub(crate) fn fixed_tree_route_ns(
+    costs: &UnitCosts,
+    fanout: f64,
+    frontier: f64,
+    a: f64,
+    m: f64,
+) -> f64 {
+    let a = a.max(1.0);
+    let rho = tree_dilution(m, a);
+    tree_route_cost(costs, fanout.max(2.0), a, rho, frontier / rho).1
+}
+
+/// Graph only (`crossover = "graph"`, no islands): the crossover's cost estimate of a query's
+/// route at match rate `rate` (`decide`'s `est_graph`) — the filtered graph search at the list
+/// `terminator = "effort_curve(cap)"` plans for the target recall `effort / 1000`, or the
+/// post-filter route when it is not dearer (`postfilter = "cost"`) — with `configured` start
+/// nodes, the post-filter route with those or the `global` ones (`postfilter_starts`). What a
+/// query that no tree serves costs, and the alternative the cost-checked pair route
+/// (`tree_pairs = "on"`) compares a pair tree with when the query has no label tree: the
+/// selector prices track G's pair trees with it ([`crate::select_g::KernelRoutes`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the planner's inputs for one query"
+)]
+pub(crate) fn graph_only_route_ns(
+    costs: &UnitCosts,
+    effort: usize,
+    k: usize,
+    rate: f64,
+    n: usize,
+    cap: f64,
+    laziness: Laziness,
+    configured: usize,
+    global: usize,
+    postfilter_starts: PostfilterStarts,
+) -> f64 {
+    let starts = configured as f64 * (costs.graph_dist_ns + costs.graph_pred_ns);
+    let l_plan = effort_l(costs, effort, k, rate, n, cap);
+    let g = costs.graph_cost(l_plan as f64, k, rate, laziness) + starts;
+    let pf_starts = if postfilter_starts.configured_at(rate) {
+        configured
+    } else {
+        global
+    };
+    let (_, g_pf) = postfilter_option(costs, l_plan, k, rate, n, pf_starts);
+    if g_pf.is_finite() && g_pf <= g {
+        g_pf
+    } else {
+        g
+    }
 }
 
 /// `effort_curve(cap)`: the calibrated unfiltered list size for the target recall `effort / 1000`

@@ -586,6 +586,9 @@ pub struct Run {
     /// Indices into the pair values.
     #[serde(skip)]
     pub pairs: Vec<usize>,
+    /// The marginal saving per query (ns) of each pair taken, in the order of `pairs`.
+    #[serde(skip)]
+    pub pair_gains: Vec<f64>,
     pub n_pairs: usize,
     pub pair_bytes: u64,
     pub pair_saving_ns: f64,
@@ -788,6 +791,7 @@ fn run<G: LabelKind>(
                 out.pair_saving_ns += g;
                 out.pair_bytes += v.bytes;
                 out.pairs.push(i);
+                out.pair_gains.push(g);
                 t_cur -= g;
                 b_cur += v.bytes as f64;
                 cut = key;

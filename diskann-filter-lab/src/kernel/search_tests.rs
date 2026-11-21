@@ -1392,9 +1392,22 @@ fn the_pair_tree_route_searches_the_conjunctions_tree() {
                 super::search::tree_route_option(&plan, &est, 8, 3, 100.0, 202);
             assert_eq!((l_pair, l_label), (8, 8));
             assert!(c_pair < c_label, "{c_pair} {c_label}");
-            let thin = super::cost::Estimates { m: 2.0, ..est };
+            let thin = super::cost::Estimates {
+                m: 2.0,
+                ..est.clone()
+            };
             let (l_thin, c_thin) = super::search::tree_route_option(&plan, &thin, 8, 3, 1e6, 202);
             assert!(l_thin > 8 && c_thin > c_label, "{l_thin} {c_thin}");
+            // The selector's kernel prices (`flab select --pricing kernel`) are these, at the
+            // routers' mean fan-out (100 and 20 members) and the frontier (the list, 8).
+            for e in [&est, &thin] {
+                for a in [20.0, 100.0, 1e6] {
+                    assert_eq!(
+                        super::search::tree_route_option(&plan, e, 8, 3, a, 202).1,
+                        super::search::fixed_tree_route_ns(&costs, 60.0, 8.0, a, e.m)
+                    );
+                }
+            }
         }
         let mut s = Searcher::for_index(&ix, &[&plan]);
         let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
@@ -3023,6 +3036,77 @@ fn the_graph_crossover_never_takes_the_exact_path() {
             assert!(exact > 0, "the cost crossover never took the exact path");
         }
     }
+}
+
+#[test]
+fn the_selectors_graph_route_price_is_the_crossovers_estimate() {
+    // `flab select --pricing kernel` prices a query no tree serves with `graph_only_route_ns`:
+    // the graph-only crossover's estimate of its route, which the counters record.
+    use super::{
+        config::{Laziness, PostfilterStarts},
+        cost::UnitCosts,
+        search::graph_only_route_ns,
+    };
+    let f = fixture(300, 47, false);
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 1000, 1, 1);
+    let costs = UnitCosts {
+        graph_dist_ns: 90.0,
+        graph_pred_ns: 30.0,
+        graph_alpha: 1.5,
+        graph_beta: 4.0,
+        effort_r: vec![0.5, 0.9],
+        effort_k: vec![10.0, 100.0],
+        effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        pairs: None,
+        islands: None,
+        ..f.index()
+    };
+    let n = ix.graph.n_data();
+    let starts = ix.global.len();
+    let (mut checked, mut postfilter) = (0, 0);
+    for ps in ["configured", "by_rate_both_k"] {
+        let k = khpad(&[
+            ("starts", "global"),
+            ("exact", "planned"),
+            ("crossover", "graph"),
+            ("estimates", "sketch"),
+            ("terminator", "effort_curve(2)"),
+            ("laziness", "heap_bound"),
+            ("postfilter", "cost"),
+            ("postfilter_starts", ps),
+        ]);
+        let plan = Plan::new(&k, &ix).unwrap();
+        let mut st = Searcher::for_index(&ix, &[&plan]);
+        let pstarts = PostfilterStarts::parse(ps).unwrap();
+        for q in 0..f.preds.len() {
+            let (_, ctr) = search_ix(&f, &ix, &mut st, &plan, q, 700, 10);
+            if ctr.route == Route::Empty {
+                continue;
+            }
+            let rate = ctr.m_hat as f64 / n as f64;
+            let want = graph_only_route_ns(
+                &costs,
+                700,
+                10,
+                rate,
+                n,
+                2.0,
+                Laziness::HeapBound,
+                starts,
+                starts,
+                pstarts,
+            );
+            assert_eq!(ctr.est_graph_ns, want.round() as u64, "q={q} {ps}");
+            checked += 1;
+            postfilter += usize::from(ctr.route == Route::Postfilter);
+        }
+    }
+    assert!(checked > 0 && postfilter > 0, "{checked} {postfilter}");
 }
 
 #[test]

@@ -476,7 +476,16 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
   are selected, each valued against the route its queries have with those trees. A router tree's
   bytes are counted as a run's bytes are (`--tree-bytes compact`, default: 4 B per node and per
   edge, the routers' vectors, a pair tree's root entry); `--tree-bytes rows` (a fixed row per
-  router) reproduces selections made before that accounting.
+  router) reproduces selections made before that accounting. With fixed trees the routes are
+  priced as the kernel's cost-checked pair route prices them (`--pricing kernel`, default: at the
+  reference recall, a tree route by its frontier `--tree-frontier` at the query's dilution and a
+  query no tree serves by the graph-only crossover's estimate under track G's run keys; a pair
+  tree is worth only what it saves where `tree_pairs = "on"` would take it — cheaper than the
+  query's label tree, or than its graph route when it has none — and a query whose binding label
+  has a tree takes a pair tree only with fewer members than that label); `--pricing model` (the
+  selector's analytic model, or `--route-curves`) reproduces the selections before, and is the
+  pricing without fixed trees. Track G also writes the pair trees taken with their savings
+  (`sel-b<B>.pairs.tsv`).
 - Each run writes a JSON report (the runs per threshold, bytes, the model's mean costs, coverage
   of `--report` predicate sets). `--save-candidates` / `--load-candidates` keep the counting
   pass over every co-occurring label pair (the costly part on large label stores); results do

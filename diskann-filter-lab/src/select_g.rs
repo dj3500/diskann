@@ -41,6 +41,15 @@
 //!   saving: against the router, as the selector's pair kinds; on its pair context against the
 //!   context's current cost, shared with the label trees through [`LabelKind`]).
 //!
+//! **Kernel prices** (`flab select --pricing kernel`, the default with fixed label trees,
+//! [`KernelRoutes`]): instead, every route at the price the kernel's cost-checked pair route
+//! (`tree_pairs = "on"`) gives it at the reference level — a tree over `s` members of which `M`
+//! match by its frontier at that dilution (as the run's `tree_effort = "fixed(F)"`), a query no
+//! tree serves by the graph-only crossover's estimate — so that selection and routing share one
+//! cost model: a pair tree saves only where the kernel would route a query to it (cheaper than
+//! the query's label tree, or than its graph route when it has none), and a query whose
+//! binding label has a tree takes a pair tree only with fewer members than that label.
+//!
 //! **Calibrated costs** (`flab select --route-curves`, [`RouteCurves`]): instead of the model
 //! above, both routes are priced from recall/time curves measured per label-size class on
 //! calibration queries drawn from the base (a single label with an independent query point, with
@@ -75,7 +84,11 @@ use std::sync::Arc;
 
 use crate::{
     islands::{draw_query, postfilter_nominal, query_matches, QueryModel},
-    kernel::cost::{kth_match_rank, UnitCosts, Z},
+    kernel::{
+        config::{Laziness, PostfilterStarts},
+        cost::{kth_match_rank, UnitCosts, Z},
+        search::{fixed_tree_route_ns, graph_only_route_ns},
+    },
     labels::LabelStore,
     select::{context_prob, pair_bytes, LabelKind, PairCand, PairValue},
     workload::{Independent, WQuery},
@@ -333,8 +346,50 @@ impl RouteCurves {
     }
 }
 
+/// The kernel's route prices (`flab select --track graph --pricing kernel`, the default with
+/// fixed label trees): every route priced as the cost-checked pair route (`tree_pairs = "on"`)
+/// prices it at the reference level — a tree over `s` members of which `M` match by its
+/// frontier at that dilution (`tree_effort = "fixed(F)"`, `F` the reference frontier), a query
+/// no tree serves by the graph-only crossover's estimate (the filtered graph search at the list
+/// `effort_curve(cap)` plans for the reference recall, or the post-filter route when cheaper).
+/// One cost model for selection and routing: a pair tree is worth what it saves on the queries
+/// the kernel would route to it, and nothing on the others.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct KernelRoutes {
+    /// Target recall of the graph route's planned list, per mille (the reference recall).
+    pub effort: usize,
+    /// `terminator = "effort_curve(cap)"`.
+    pub cap: f64,
+    /// Start nodes of the graph route of a query no tree serves (`starts =
+    /// "label(c*)+global"`: its binding label's starts and the global ones).
+    pub starts: usize,
+    /// The global start nodes (a broad query's post-filter route, `postfilter_starts`).
+    pub global_starts: usize,
+    #[serde(skip)]
+    pub laziness: Laziness,
+    #[serde(skip)]
+    pub postfilter_starts: PostfilterStarts,
+}
+
+impl KernelRoutes {
+    /// Track G's run keys at the reference recall `recall`: `terminator =
+    /// "effort_curve(4)"`, `laziness = "heap_bound"`, `starts = "label(c*)+global"` (a label
+    /// without a tree has the start table's 4 k-means starts; one global start) and
+    /// `postfilter_starts = "by_rate_both_k"`.
+    pub fn recipe(recall: f64) -> Self {
+        Self {
+            effort: (1000.0 * recall).round() as usize,
+            cap: 4.0,
+            starts: 5,
+            global_starts: 1,
+            laziness: Laziness::HeapBound,
+            postfilter_starts: PostfilterStarts::ByRateBothK,
+        }
+    }
+}
+
 /// How the selector prices track G's routes: from route calibration curves (B2i) when given, else
-/// by the analytic [`TreeModel`] (B2h).
+/// by the analytic [`TreeModel`] (B2h), or as the kernel's cost-checked routes ([`KernelRoutes`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Pricing<'a> {
     pub tm: TreeModel,
@@ -345,6 +400,8 @@ pub struct Pricing<'a> {
     /// A route that never reaches the reference recall is priced at its time at the highest
     /// measured level (the effort it spends trying) instead of [`UNREACHABLE_NS`].
     pub at_max: bool,
+    /// Every route at the kernel's prices instead (the curves and the analytic model unused).
+    pub kernel: Option<KernelRoutes>,
 }
 
 impl Pricing<'_> {
@@ -353,10 +410,35 @@ impl Pricing<'_> {
             .unwrap_or(UNREACHABLE_NS)
     }
 
+    /// [`KernelRoutes`]: a tree over `s` members of which `m` match.
+    fn kernel_tree(&self, s: f64, m: f64) -> f64 {
+        fixed_tree_route_ns(self.c, self.tm.fanout, self.tm.frontier, s, m)
+    }
+
+    /// [`KernelRoutes`]: a query with `m` matches that no tree serves.
+    fn kernel_graph(&self, kr: &KernelRoutes, m: f64) -> f64 {
+        let rate = (m / self.n.max(1) as f64).clamp(0.0, 1.0);
+        graph_only_route_ns(
+            self.c,
+            kr.effort,
+            self.tm.k,
+            rate,
+            self.n,
+            kr.cap,
+            kr.laziness,
+            kr.starts,
+            kr.global_starts,
+            kr.postfilter_starts,
+        )
+    }
+
     /// A base-derived (data-like) query with `m` matches: the router — for a conjunction
     /// (`multi`: more than one clause) by the member-placed pair curves where measured, else by
     /// the single labels'.
     pub fn router_derived(&self, m: f64, multi: bool) -> f64 {
+        if let Some(kr) = &self.kernel {
+            return self.kernel_graph(kr, m);
+        }
         match self.curves {
             Some(cv) if multi && !cv.q.is_empty() => {
                 self.priced(&cv.q, Route::Router, self.tm.k, m)
@@ -369,6 +451,9 @@ impl Pricing<'_> {
     /// A base-derived query whose binding clause is a label of `s` points, `m` of them matching:
     /// the label's tree (the clause diluted to `K' = K·s/m` members; `checks`: other clauses).
     pub fn tree_derived(&self, s: f64, m: f64, checks: bool) -> f64 {
+        if self.kernel.is_some() {
+            return self.kernel_tree(s, m);
+        }
         match self.curves {
             Some(cv) => self.diluted(&cv.d, s, m),
             None => self.tm.tree_ns(self.c, s, m, checks),
@@ -377,6 +462,9 @@ impl Pricing<'_> {
 
     /// The single-label query `{ℓ}` (`s` points) placed independently of the label: the router.
     pub fn router_label(&self, s: f64) -> f64 {
+        if let Some(kr) = &self.kernel {
+            return self.kernel_graph(kr, s);
+        }
         match self.curves {
             Some(cv) => self.priced(&cv.u, Route::Router, self.tm.k, s),
             None => self.tm.router_ns(self.c, s, self.n),
@@ -385,6 +473,9 @@ impl Pricing<'_> {
 
     /// The single-label query `{ℓ}` placed independently of the label: its tree.
     pub fn tree_label(&self, s: f64) -> f64 {
+        if self.kernel.is_some() {
+            return self.kernel_tree(s, s);
+        }
         match self.curves {
             Some(cv) => self.priced(&cv.u, Route::Tree, self.tm.k, s),
             None => self.tm.tree_ns(self.c, s, s, false),
@@ -393,6 +484,9 @@ impl Pricing<'_> {
 
     /// The pair query `{a} ∧ {b}` of joint `j` placed independently: the router.
     pub fn router_pair(&self, j: f64) -> f64 {
+        if let Some(kr) = &self.kernel {
+            return self.kernel_graph(kr, j);
+        }
         match self.curves {
             Some(cv) if !cv.p.is_empty() => self.priced(&cv.p, Route::Router, self.tm.k, j),
             _ => self.tm.router_ns(self.c, j, self.n),
@@ -401,6 +495,9 @@ impl Pricing<'_> {
 
     /// The pair query of joint `j` whose smaller label has `s` points: that label's tree.
     pub fn tree_pair_label(&self, s: f64, j: f64) -> f64 {
+        if self.kernel.is_some() {
+            return self.kernel_tree(s, j);
+        }
         match self.curves {
             Some(cv) if !cv.p.is_empty() => self.priced(&cv.p, Route::Tree, self.tm.k, j),
             _ => self.tm.tree_ns(self.c, s, j, true),
@@ -411,6 +508,9 @@ impl Pricing<'_> {
     /// single labels' curves for one clause, the pairs' for two, the triples' for three or more
     /// where measured, else the pairs').
     pub fn router_conj(&self, c: usize, m: f64) -> f64 {
+        if let Some(kr) = &self.kernel {
+            return self.kernel_graph(kr, m);
+        }
         match (c, self.curves) {
             (0 | 1, _) => self.router_label(m),
             (2, _) | (_, None) => self.router_pair(m),
@@ -422,6 +522,9 @@ impl Pricing<'_> {
     /// An independent conjunction of `c` single-label clauses with `m` matches, its smallest
     /// clause a label of `s` points: that label's tree (as [`Self::router_conj`] by clause count).
     pub fn tree_conj(&self, c: usize, s: f64, m: f64) -> f64 {
+        if self.kernel.is_some() {
+            return self.kernel_tree(s, m);
+        }
         match (c, self.curves) {
             (0 | 1, _) => self.tree_label(s),
             (2, _) | (_, None) => self.tree_pair_label(s, m),
@@ -435,6 +538,9 @@ impl Pricing<'_> {
     /// `K' = K·j/m` members (between the `K` = 10 and 100 curves, beyond ∝ `K'` up to the whole
     /// tree).
     pub fn pair_tree_on(&self, j: f64, m: f64) -> f64 {
+        if self.kernel.is_some() {
+            return self.kernel_tree(j, m);
+        }
         let Some(cv) = self.curves else {
             return self.tm.tree_ns(self.c, j, m, true);
         };
@@ -465,6 +571,9 @@ impl Pricing<'_> {
 
     /// The pair query of joint `j`: its pair tree (a tree over the `j` joint members).
     pub fn pair_tree(&self, j: f64) -> f64 {
+        if self.kernel.is_some() {
+            return self.kernel_tree(j, j);
+        }
         match self.curves {
             Some(cv) => self.priced(&cv.u, Route::Tree, self.tm.k, j),
             None => self.tm.tree_ns(self.c, j, j, false),
@@ -475,8 +584,8 @@ impl Pricing<'_> {
     /// tree of joint `j` (the member curves; without curves, [`Self::pair_tree`]).
     pub fn pair_tree_derived(&self, j: f64) -> f64 {
         match self.curves {
-            Some(cv) => self.priced(&cv.d, Route::Tree, self.tm.k, j),
-            None => self.pair_tree(j),
+            Some(cv) if self.kernel.is_none() => self.priced(&cv.d, Route::Tree, self.tm.k, j),
+            _ => self.pair_tree(j),
         }
     }
 }
@@ -943,6 +1052,20 @@ impl LabelKind for TreeGreedy<'_> {
 
     fn pair_cost(&self, q: usize, _a: u32, _b: u32, joint: u32) -> Option<f64> {
         let w = self.sample.independent_query(q)?;
+        if self.pr.kernel.is_some() {
+            // The kernel considers a pair tree for a query whose binding label has a tree only
+            // when it has fewer members than that label (`pair_covered`).
+            match self.ctx_cand[q - self.sample.n_data] {
+                (x, _)
+                    if x != u32::MAX
+                        && self.taken[x as usize]
+                        && joint as usize >= self.terms[x as usize].size =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+        }
         let j = f64::from(joint).max(1.0);
         Some(self.pr.pair_tree_on(j, w.joint.clamp(1.0, j)))
     }
@@ -970,7 +1093,12 @@ impl LabelKind for TreeGreedy<'_> {
         let nd = self.sample.n_data;
         if q >= nd {
             // The kernel takes a stored pair's route first, whatever the label tree costs; of
-            // several stored pairs, the one with the fewest points (here: the cheapest).
+            // several stored pairs, the one with the fewest points (here: the cheapest). Under
+            // the kernel's prices the route is cost-checked: the pair tree only where it is
+            // cheaper than the query's route.
+            if self.pr.kernel.is_some() && cost >= self.query_cost(q) {
+                return;
+            }
             let s = &mut self.served[q - nd];
             *s = s.min(cost);
         }
@@ -1002,7 +1130,10 @@ pub enum PairAlternative {
 /// alternative is the smaller label's tree where that label has one (`alternative`: in both
 /// pricings, [`PairAlternative::Trees`]; with the curves only, [`PairAlternative::Router`]).
 /// Without fixed trees the curves' alternative is any label's tree and the analytic pricing's the
-/// router alone.
+/// router alone. Under the kernel's prices ([`KernelRoutes`]) the alternative is the kernel's: the
+/// smaller label's fixed tree where it has one (a pair with as many points as that label is never
+/// routed to, and has no value), else the graph route; a negative saving is none (the
+/// cost-checked route does not take the pair tree there).
 pub fn pair_tree_values(
     pr: &Pricing,
     labels: &LabelStore,
@@ -1017,18 +1148,34 @@ pub fn pair_tree_values(
         .filter_map(|&p| {
             let j = f64::from(p.joint).max(1.0);
             let s = labels.posting_len(p.a).min(labels.posting_len(p.b));
-            let tree = s < pr.n
-                && tree_max.is_none_or(|m| s <= m)
-                && (pr.curves.is_some()
-                    || (tree_max.is_some() && alternative == PairAlternative::Trees));
-            let (mut alt, pair) = match pr.curves {
-                Some(_) => (pr.router_derived(j, true), pr.pair_tree_derived(j)),
-                None => (pr.router_pair(j), pr.pair_tree(j)),
+            let saving_ns = if pr.kernel.is_some() {
+                // The kernel's prices: the context's route is its smaller label's tree where it
+                // has one (taken whatever it costs), else the graph route; the pair tree is
+                // taken only where cheaper (and, against a label tree, only with fewer members).
+                let tree = s < pr.n && tree_max.is_some_and(|m| s <= m);
+                if tree && p.joint as usize >= s {
+                    return None;
+                }
+                let alt = if tree {
+                    pr.tree_pair_label(s as f64, j)
+                } else {
+                    pr.router_pair(j)
+                };
+                (alt - pr.pair_tree(j)).max(0.0)
+            } else {
+                let tree = s < pr.n
+                    && tree_max.is_none_or(|m| s <= m)
+                    && (pr.curves.is_some()
+                        || (tree_max.is_some() && alternative == PairAlternative::Trees));
+                let (mut alt, pair) = match pr.curves {
+                    Some(_) => (pr.router_derived(j, true), pr.pair_tree_derived(j)),
+                    None => (pr.router_pair(j), pr.pair_tree(j)),
+                };
+                if tree {
+                    alt = alt.min(pr.tree_derived(s as f64, j, true));
+                }
+                alt - pair
             };
-            if tree {
-                alt = alt.min(pr.tree_derived(s as f64, j, true));
-            }
-            let saving_ns = alt - pair;
             if !saving_ns.is_finite() {
                 return None;
             }
@@ -1145,6 +1292,7 @@ mod tests {
             curves: None,
             n: s.n_points(),
             at_max: false,
+            kernel: None,
         };
         let sample = TreeSample::build(&s, &pr, model, 2);
         let again = TreeSample::build(&s, &pr, model, 1);
@@ -1261,6 +1409,7 @@ mod tests {
             curves: None,
             n: s.n_points(),
             at_max: false,
+            kernel: None,
         };
         let u = Arc::new(crate::workload::independent(&s, &contexts, &model, 2));
         assert_eq!(u.k_max, 3);
@@ -1415,6 +1564,7 @@ mod tests {
             curves: Some(&cv),
             n: s.n_points(),
             at_max: false,
+            kernel: None,
         };
         assert_eq!(pr.router_label(200.0), UNREACHABLE_NS);
         assert_eq!(pr.router_label(5_000.0), 1_000.0);
@@ -1530,6 +1680,7 @@ mod tests {
             curves: Some(&cv),
             n: s.n_points(),
             at_max: false,
+            kernel: None,
         };
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
@@ -1667,6 +1818,7 @@ mod tests {
             curves: Some(&cv),
             n: s.n_points(),
             at_max: false,
+            kernel: None,
         };
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
@@ -1850,6 +2002,187 @@ mod tests {
             sel_a.best.t_ns
         );
         let t = mean - saving - sel.best.pair_saving_ns;
+        assert!(
+            (sel.best.t_ns - t).abs() <= 1e-9 * mean,
+            "{} {t}",
+            sel.best.t_ns
+        );
+    }
+
+    #[test]
+    fn kernel_prices_value_a_pair_tree_only_where_the_kernel_routes_to_it() {
+        let s = store();
+        let n = s.n_points();
+        // The kernel's prices need the router's effort curve.
+        let c = UnitCosts {
+            effort_r: vec![0.5, 0.9],
+            effort_k: vec![10.0, 100.0],
+            effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+            ..costs()
+        };
+        let tm = TreeModel {
+            k: 10,
+            recall: 0.9,
+            frontier: 64.0,
+            curve: false,
+            fanout: 26.0,
+            router_bytes: 400,
+            compact_vector_bytes: Some(4),
+        };
+        let pr = Pricing {
+            tm,
+            c: &c,
+            curves: None,
+            n,
+            at_max: false,
+            kernel: Some(KernelRoutes::recipe(0.9)),
+        };
+        // Every route at the kernel's price: a tree as the cost-checked route prices it, a query
+        // no tree serves as the graph-only crossover estimates it.
+        for (a, m) in [(200.0, 200.0), (2_000.0, 50.0), (10_000.0, 9_000.0)] {
+            let tree = fixed_tree_route_ns(&c, 26.0, 64.0, a, m);
+            assert_eq!(pr.tree_conj(3, a, m), tree);
+            assert_eq!(pr.tree_derived(a, m, true), tree);
+            assert_eq!(pr.pair_tree_on(a, m), tree);
+            let graph = graph_only_route_ns(
+                &c,
+                900,
+                10,
+                m / n as f64,
+                n,
+                4.0,
+                Laziness::HeapBound,
+                5,
+                1,
+                PostfilterStarts::ByRateBothK,
+            );
+            assert_eq!(pr.router_conj(2, m), graph);
+            assert_eq!(pr.router_derived(m, true), graph);
+        }
+        let (counts, f) = select::label_weights(&s, 0.5, 2);
+        let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
+        let model = QueryModel {
+            n_queries: 4_000,
+            seed: 11,
+            uniform: 0.5,
+            contexts: contexts.len() as u64,
+            ..QueryModel::default()
+        };
+        let u = Arc::new(crate::workload::independent(&s, &contexts, &model, 2));
+        let sample = TreeSample::build_mixed(&s, &pr, model, Some(u.clone()), 2);
+        // The size cap: tr (200 points, all of them in c3) and u0…u9 (2,000 each) have trees.
+        let cap = 2_000;
+        let fixed = |l: u32| (1..=cap).contains(&s.posting_len(l));
+        let cands = select::pair_candidates(&s, &counts, 0.5, |_| true, 2);
+        let values = pair_tree_values(
+            &pr,
+            &s,
+            &model,
+            &f,
+            &cands,
+            Some(cap),
+            PairAlternative::Trees,
+        );
+        // A pair context is valued against its smaller label's fixed tree where it has one,
+        // else the graph route, and never below zero (the route check refuses a dearer pair
+        // tree); a pair as large as its smaller label (tr ∧ c3) is never routed to.
+        let id = |name: &str| s.name_index()[name];
+        let mut seen = [0; 3];
+        for p in &cands {
+            let small = s.posting_len(p.a).min(s.posting_len(p.b));
+            let v = values.iter().find(|v| v.cand == *p);
+            if small <= cap && p.joint as usize >= small {
+                assert!(v.is_none(), "{p:?}");
+                seen[0] += 1;
+                continue;
+            }
+            let j = f64::from(p.joint).max(1.0);
+            let alt = if small <= cap {
+                pr.tree_pair_label(small as f64, j)
+            } else {
+                pr.router_pair(j)
+            };
+            let want = (alt - pr.pair_tree(j)).max(0.0);
+            assert_eq!(v.expect("valued").saving_ns, want, "{p:?}");
+            seen[1 + usize::from(want > 0.0)] += 1;
+        }
+        assert!(seen.iter().all(|&x| x > 0), "{seen:?}");
+        assert!(!values
+            .iter()
+            .any(|v| (v.cand.a, v.cand.b) == (id("c3").min(id("tr")), id("c3").max(id("tr")))));
+        // The independent queries: a pair tree serves a query whose binding label has a tree
+        // only with fewer members than that label, and lowers a query's cost only where it is
+        // cheaper (the route check).
+        let mut g = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30);
+        g.fix(fixed);
+        let nd = sample.n_data;
+        let (mut refused, mut cheaper, mut dearer) = (0, 0, 0);
+        for (i, w) in u.queries.iter().enumerate() {
+            if w.labels.len() < 2 {
+                continue;
+            }
+            let q = nd + i;
+            let binding = *w
+                .labels
+                .iter()
+                .min_by_key(|&&l| (s.posting_len(l), l))
+                .unwrap();
+            let (a, b) = (w.labels[0], w.labels[1]);
+            let joint = s
+                .postings(a)
+                .iter()
+                .filter(|p| s.postings(b).binary_search(p).is_ok())
+                .count() as u32;
+            let cost = g.pair_cost(q, a, b, joint);
+            if fixed(binding) && joint as usize >= s.posting_len(binding) {
+                assert_eq!(cost, None, "{:?}", w.labels);
+                refused += 1;
+                continue;
+            }
+            let cost = cost.expect("a pair tree serves the query");
+            let before = g.query_cost(q);
+            g.serve(q, cost);
+            if cost < before {
+                assert_eq!(g.query_cost(q), cost);
+                cheaper += 1;
+            } else {
+                assert_eq!(g.query_cost(q), before);
+                dearer += 1;
+            }
+        }
+        assert!(
+            refused > 0 && cheaper > 0 && dearer > 0,
+            "{refused} {cheaper} {dearer}"
+        );
+        // The greedy takes only pair trees with a positive saving; the mean cost it reaches is
+        // the start minus their savings.
+        let sample = TreeSample::build_mixed(&s, &pr, model, Some(u), 2);
+        let (_, saving, _) = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30).fix(fixed);
+        let mean = sample.mean_base_ns() - saving;
+        let params = select::Params {
+            k: 10,
+            r: 32,
+            budget_bytes: u64::MAX / 4,
+            model,
+            stop: select::Stop::Elasticity,
+            mean_ns: mean,
+            index_bytes: 5_000_000,
+            ..select::Params::default()
+        };
+        let sel = select::select_with(
+            &s,
+            || {
+                let mut g = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30);
+                g.fix(fixed);
+                g
+            },
+            &values,
+            &params,
+        );
+        assert!(sel.best.islands.is_empty());
+        assert!(sel.best.pair_gains.iter().all(|&x| x > 0.0));
+        assert_eq!(sel.best.pair_gains.len(), sel.best.n_pairs);
+        let t = mean - sel.best.pair_saving_ns;
         assert!(
             (sel.best.t_ns - t).abs() <= 1e-9 * mean,
             "{} {t}",
