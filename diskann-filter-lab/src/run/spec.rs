@@ -53,6 +53,7 @@
 //! sketches_sidecar = "<sketches.flab>" # per-configuration sketches (e.g. another priority seed)
 //! pairs_sidecar = "<pairs.flab>"   # per-configuration combination postings (e.g. a budget)
 //! islands_sidecar = "<islands.flab>" # per-configuration per-label sub-graphs
+//! pair_roots = "<pair_roots.flab>" # roots of the pair trees over those postings (`tree_pairs`)
 //!
 //! [[config]]                       # timed mode: a per-query mixture of two earlier configurations
 //! name = "mix"                     # on one graph, each row runs the first at its effort with
@@ -162,6 +163,8 @@ pub struct ConfigSpec {
     pub pairs_sidecar: Option<PathBuf>,
     /// Per-label sub-graphs of this configuration (the experiment's unless overridden).
     pub islands_sidecar: Option<PathBuf>,
+    /// Roots of the pair trees over `pairs_sidecar` (`flab steiner --construction pairs`).
+    pub pair_roots: Option<PathBuf>,
     /// The overrides as given (for the record).
     pub overrides: BTreeMap<String, String>,
     /// A per-query mixture of two earlier configurations (`mix`; this configuration is a copy
@@ -329,6 +332,11 @@ impl Experiment {
             let islands_sidecar = text(&mut table, "islands_sidecar")?
                 .map(PathBuf::from)
                 .or_else(|| e.islands_sidecar.clone());
+            let pair_roots = text(&mut table, "pair_roots")?.map(PathBuf::from);
+            ensure!(
+                pair_roots.is_none() || pairs_sidecar.is_some(),
+                "config {name:?}: pair_roots needs pairs_sidecar"
+            );
             let efforts = match table.remove("efforts") {
                 None => None,
                 Some(toml::Value::Array(items)) => {
@@ -438,6 +446,7 @@ impl Experiment {
                 sketches_sidecar: sketches_sidecar.map(|p| resolve(dir, &p)),
                 pairs_sidecar: pairs_sidecar.map(|p| resolve(dir, &p)),
                 islands_sidecar: islands_sidecar.map(|p| resolve(dir, &p)),
+                pair_roots: pair_roots.map(|p| resolve(dir, &p)),
                 overrides,
                 mix: None,
             });

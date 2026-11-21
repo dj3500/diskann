@@ -157,6 +157,7 @@ pub(crate) fn select(
                     push(v, visited, out);
                 }
             }
+            StartSource::Extra => {}
             StartSource::LabelSmallest => match inp.predicate {
                 StartPredicate::Base => {
                     if q.n_clauses() > 0 {

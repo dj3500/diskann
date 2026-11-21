@@ -31,6 +31,7 @@ pub mod permute;
 pub mod predicate;
 pub mod run;
 pub mod select;
+pub mod select_g;
 pub mod sketches;
 pub mod starts;
 pub mod text;

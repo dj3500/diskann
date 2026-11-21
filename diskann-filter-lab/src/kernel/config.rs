@@ -39,6 +39,8 @@ pub enum StartSource {
     Sample(usize),
     /// Every auxiliary node.
     Aux,
+    /// None of its own: only the searcher's extra starts (the pair-tree route's roots).
+    Extra,
 }
 
 /// Whether starts obey the admission rule.
@@ -505,6 +507,10 @@ pub struct Kernel {
     /// router-tree search from c\*'s starts: `starts = "label(c*)"`, forced starts, only
     /// routers expanded), so checks cover the other clauses only (off by default).
     pub cstar_members: bool,
+    /// `tree_pairs = "on"`: a query whose clause pair is exactly covered by pair trees
+    /// (`flab steiner --construction pairs`; the run's `pairs_sidecar` and `pair_roots`) with
+    /// fewer members than c\* searches those trees (off by default).
+    pub tree_pairs: bool,
 }
 
 /// How the cost model counts a member check's row reads (the static evaluator reads a
@@ -553,6 +559,9 @@ pub enum TreeRoute {
     /// satisfies; `cstar_members`) with the static bitsets, the row only for labels without
     /// a bitset.
     StaticBits,
+    /// Per query, the member check (`row_scan`, `static_bits` or `bitmap`) with the lowest
+    /// model cost from the calibrated unit costs (see `Plan::tree_checks`).
+    Cost,
 }
 
 impl TreeRoute {
@@ -562,7 +571,8 @@ impl TreeRoute {
             "row_scan" => Self::RowScan,
             "bitmap" => Self::Bitmap,
             "static_bits" => Self::StaticBits,
-            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap, static_bits)"),
+            "cost" => Self::Cost,
+            v => bail!("unknown tree_route {v:?} (off, row_scan, bitmap, static_bits, cost)"),
         })
     }
 }
@@ -574,6 +584,7 @@ impl fmt::Display for TreeRoute {
             Self::RowScan => "row_scan",
             Self::Bitmap => "bitmap",
             Self::StaticBits => "static_bits",
+            Self::Cost => "cost",
         })
     }
 }
@@ -701,6 +712,7 @@ impl Default for Kernel {
             tree_effort: TreeEffort::List,
             tree_choice: TreeChoice::Always,
             cstar_members: false,
+            tree_pairs: false,
         }
     }
 }
@@ -745,7 +757,8 @@ impl StartSource {
             ("product", []) => Self::LabelAll,
             ("sample", [k]) => Self::Sample(num(k, "sample size")?),
             ("aux", []) => Self::Aux,
-            _ => bail!("unknown start source {s:?} (global, label(c*), label(all), product, sample(k), aux)"),
+            ("extra", []) => Self::Extra,
+            _ => bail!("unknown start source {s:?} (global, label(c*), label(all), product, sample(k), aux, extra)"),
         })
     }
 
@@ -763,6 +776,7 @@ impl fmt::Display for StartSource {
             Self::LabelAll => write!(f, "label(all)"),
             Self::Sample(k) => write!(f, "sample({k})"),
             Self::Aux => write!(f, "aux"),
+            Self::Extra => write!(f, "extra"),
         }
     }
 }
@@ -1264,6 +1278,13 @@ impl Kernel {
                     v => bail!("unknown cstar_members {v:?} (on, off)"),
                 }
             }
+            "tree_pairs" => {
+                self.tree_pairs = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown tree_pairs {v:?} (on, off)"),
+                }
+            }
             _ => bail!("unknown kernel option {key:?}"),
         }
         Ok(())
@@ -1441,8 +1462,21 @@ impl Kernel {
         );
         ensure!(
             !(self.static_bitsets_off
-                && matches!(self.tree_route, TreeRoute::Bitmap | TreeRoute::StaticBits)),
-            "static_bitsets = \"off\" excludes tree_route = \"bitmap\" and \"static_bits\" (their member checks use the static bitsets)"
+                && matches!(
+                    self.tree_route,
+                    TreeRoute::Bitmap | TreeRoute::StaticBits | TreeRoute::Cost
+                )),
+            "static_bitsets = \"off\" excludes tree_route = \"bitmap\", \"static_bits\" and \"cost\" (their member checks use the static bitsets)"
+        );
+        ensure!(
+            !self.tree_pairs
+                || (self.tree_route != TreeRoute::Off && self.tree_choice == TreeChoice::Always),
+            "tree_pairs = \"on\" needs the tree route with tree_choice = always"
+        );
+        ensure!(
+            self.tree_route != TreeRoute::Cost
+                || (self.tree_choice == TreeChoice::Always && self.exact.is_planned()),
+            "tree_route = \"cost\" needs tree_choice = always and a planned exact path (its unit costs)"
         );
         ensure!(
             !self.cstar_members
@@ -1563,7 +1597,50 @@ impl Kernel {
         if self.cstar_members {
             j["cstar_members"] = json!("on");
         }
+        if self.tree_pairs {
+            j["tree_pairs"] = json!("on");
+        }
         j
+    }
+
+    /// The kernels of the tree route's member checks under `tree_route = "cost"`, in the
+    /// order of `Plan::tree_checks`: row scan, static bitsets skipping c\*, per-query bitmap.
+    pub fn tree_check_kernels(&self) -> Vec<Kernel> {
+        if self.tree_route != TreeRoute::Cost {
+            return Vec::new();
+        }
+        [TreeRoute::RowScan, TreeRoute::StaticBits, TreeRoute::Bitmap]
+            .into_iter()
+            .filter_map(|r| {
+                Kernel {
+                    tree_route: r,
+                    ..self.clone()
+                }
+                .tree_kernel()
+            })
+            .collect()
+    }
+
+    /// The kernels of the pair-tree route (`tree_pairs`): the tree route's kernel (or, under
+    /// `tree_route = "cost"`, each of `tree_check_kernels`) started only at the searcher's
+    /// extra starts (the covering pairs' roots); their checks cover the clauses outside the
+    /// covered pair (set per query), not via `cstar_members`.
+    pub fn pair_kernels(&self) -> Vec<Kernel> {
+        if !self.tree_pairs {
+            return Vec::new();
+        }
+        let ks = if self.tree_route == TreeRoute::Cost {
+            self.tree_check_kernels()
+        } else {
+            self.tree_kernel().into_iter().collect()
+        };
+        ks.into_iter()
+            .map(|k| Kernel {
+                starts: vec![StartSource::Extra],
+                cstar_members: false,
+                ..k
+            })
+            .collect()
     }
 
     /// The kernel of the tree route's search (`None` when the route is off).
@@ -1574,6 +1651,8 @@ impl Kernel {
             TreeRoute::Bitmap => (PredicateMode::Bitmap, Materializer::DenseStatic),
             // θ = 0: the index's bitsets' θ (set by `Plan::new`).
             TreeRoute::StaticBits => (PredicateMode::StaticBits(0), Materializer::None),
+            // The first of `tree_kernels` (the others are chosen per query).
+            TreeRoute::Cost => (PredicateMode::RowScan, Materializer::None),
         };
         Some(Kernel {
             starts: vec![StartSource::LabelSmallest],

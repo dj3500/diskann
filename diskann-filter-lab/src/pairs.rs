@@ -79,6 +79,10 @@ pub enum Prior {
     /// A pair as likely as its smaller label is frequent: gain per entry times
     /// `min(|P_a|, |P_b|) / n`.
     Rare,
+    /// A pair as likely as a uniformly drawn data point carries both labels (base-derived
+    /// queries: sub-predicates of points' own label sets): gain per entry times `j / n` —
+    /// the conjunctions points actually have, by the members they save.
+    Data,
 }
 
 impl Prior {
@@ -86,6 +90,7 @@ impl Prior {
         match self {
             Self::Uniform => "uniform",
             Self::Rare => "rare",
+            Self::Data => "data",
         }
     }
 
@@ -93,7 +98,7 @@ impl Prior {
     fn key_min_log2(self) -> f64 {
         match self {
             Self::Uniform => -10.0,
-            Self::Rare => -40.0,
+            Self::Rare | Self::Data => -40.0,
         }
     }
 
@@ -104,6 +109,7 @@ impl Prior {
         match self {
             Self::Uniform => r,
             Self::Rare => r * min as f64 / n.max(1) as f64,
+            Self::Data => r * cost.saturating_sub(PAIR_OVERHEAD) as f64 / n.max(1) as f64,
         }
     }
 }
@@ -115,7 +121,8 @@ impl std::str::FromStr for Prior {
         match s {
             "uniform" => Ok(Self::Uniform),
             "rare" => Ok(Self::Rare),
-            _ => anyhow::bail!("unknown pair prior {s:?} (uniform, rare)"),
+            "data" => Ok(Self::Data),
+            _ => anyhow::bail!("unknown pair prior {s:?} (uniform, rare, data)"),
         }
     }
 }
@@ -219,6 +226,23 @@ impl Cover {
             .filter(|l| matches!(l, ListRef::Pair(..)))
             .count()
     }
+}
+
+/// An exact cover of a query's clause pair `(i, j)` by stored pairs that have a router tree
+/// (`PairIndex::tree_cover`): every label pair of the two clauses is empty or such a stored
+/// pair, so the trees' members are exactly the points satisfying both clauses.
+#[derive(Debug, Clone, Default)]
+pub struct TreeCover {
+    pub valid: bool,
+    pub i: usize,
+    pub j: usize,
+    /// Directory slots of the stored pairs (their trees' roots are the starts).
+    pub slots: Vec<usize>,
+    /// Sum of their joint posting sizes.
+    pub members: u64,
+    /// Directory lookups made.
+    pub lookups: u64,
+    scratch: Vec<usize>,
 }
 
 /// Largest product of clause sizes examined per clause pair (bounds the planning work).
@@ -853,6 +877,90 @@ impl PairIndex {
         &self.points[start as usize..end as usize]
     }
 
+    /// The directory slot of the stored pair whose list starts at `start` (stored lists are
+    /// never empty, so the offsets increase strictly).
+    #[inline]
+    pub fn slot_of(&self, start: u64) -> usize {
+        self.list_offsets.partition_point(|&o| o < start)
+    }
+
+    /// The stored points of directory slot `s`.
+    #[inline]
+    pub fn slot_list(&self, s: usize) -> &[u32] {
+        self.list(self.list_offsets[s], self.list_offsets[s + 1])
+    }
+
+    /// The clause pair of a query with `n_clauses` clauses (`clause(i)`: its labels) whose
+    /// label pairs are all empty or stored with a router tree (`has_tree(slot)`), with the
+    /// fewest members, into `out`; labels with empty postings are skipped (`posting_len`);
+    /// clause pairs with more than [`MAX_LOOKUPS`] label pairs are not examined. Returns
+    /// whether such a clause pair exists.
+    pub fn tree_cover<'c>(
+        &self,
+        n_clauses: usize,
+        clause: impl Fn(usize) -> &'c [u32],
+        posting_len: impl Fn(u32) -> usize,
+        has_tree: impl Fn(usize) -> bool,
+        out: &mut TreeCover,
+    ) -> bool {
+        out.valid = false;
+        out.slots.clear();
+        out.members = 0;
+        out.lookups = 0;
+        let mut best = u64::MAX;
+        for i in 0..n_clauses {
+            let ci = clause(i);
+            for j in (i + 1)..n_clauses {
+                let cj = clause(j);
+                if ci.len() * cj.len() > MAX_LOOKUPS {
+                    continue;
+                }
+                out.scratch.clear();
+                let (mut sum, mut ok) = (0u64, true);
+                'pairs: for &a in ci {
+                    if posting_len(a) == 0 {
+                        continue;
+                    }
+                    for &b in cj {
+                        if posting_len(b) == 0 {
+                            continue;
+                        }
+                        out.lookups += 1;
+                        match self.joint(a, b) {
+                            Joint::Empty => {}
+                            Joint::Stored(s, e) => {
+                                let slot = self.slot_of(s);
+                                if !has_tree(slot) {
+                                    ok = false;
+                                    break 'pairs;
+                                }
+                                out.scratch.push(slot);
+                                sum += e - s;
+                            }
+                            Joint::Unknown => {
+                                ok = false;
+                                break 'pairs;
+                            }
+                        }
+                        if sum >= best {
+                            ok = false;
+                            break 'pairs;
+                        }
+                    }
+                }
+                if ok && sum < best {
+                    best = sum;
+                    out.valid = true;
+                    out.i = i;
+                    out.j = j;
+                    out.members = sum;
+                    std::mem::swap(&mut out.slots, &mut out.scratch);
+                }
+            }
+        }
+        out.valid
+    }
+
     /// The clause pair with the fewest candidates (see [`Cover`]) of a query with `n_clauses`
     /// clauses (`clause(i)`: its labels) into `out`; labels with empty postings are skipped
     /// (`posting_len`). Clause pairs with more than [`MAX_LOOKUPS`] label pairs are not
@@ -1127,6 +1235,18 @@ mod tests {
             .copied()
             .filter(|p| pb.binary_search(p).is_ok())
             .collect()
+    }
+
+    #[test]
+    fn the_data_prior_prefers_the_diluted_conjunctions_points_carry() {
+        // A tiny joint of a small pair (j = 1, min 100) against a diluted joint of larger labels
+        // (j = 50, min 1,000): the uniform prior ranks the tiny one first, the data prior the
+        // conjunction that 50 points carry.
+        let n = 1_000_000;
+        let key = |p: Prior, min: u64, j: u64| p.key(min, min - j, j + PAIR_OVERHEAD, n);
+        assert!(key(Prior::Uniform, 100, 1) > key(Prior::Uniform, 1000, 50));
+        assert!(key(Prior::Data, 100, 1) < key(Prior::Data, 1000, 50));
+        assert_eq!("data".parse::<Prior>().unwrap(), Prior::Data);
     }
 
     #[test]
