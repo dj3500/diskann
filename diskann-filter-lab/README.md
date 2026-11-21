@@ -468,6 +468,13 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
   built. `--track graph`: a router tree per label and a pair tree per label pair, valued against
   the graph router alone; writes the selected labels (`sel-b<B>.trees.txt`, for `flab steiner
   --labels-file`) and pairs (`sel-b<B>.pairs.flab`, for `flab steiner --construction pairs`).
+  With `--fixed-trees-max-size SIZE` the label trees are fixed by a size cap instead (every label
+  of 1 to SIZE points, as `flab steiner --construction tree --min-size 0 --max-size SIZE` builds
+  them; their modelled bytes count in `B` unless `--index-bytes` is given) and only pair trees
+  are selected, each valued against the route its queries have with those trees. A router tree's
+  bytes are counted as a run's bytes are (`--tree-bytes compact`, default: 4 B per node and per
+  edge, the routers' vectors, a pair tree's root entry); `--tree-bytes rows` (a fixed row per
+  router) reproduces selections made before that accounting.
 - Each run writes a JSON report (the runs per threshold, bytes, the model's mean costs, coverage
   of `--report` predicate sets). `--save-candidates` / `--load-candidates` keep the counting
   pass over every co-occurring label pair (the costly part on large label stores); results do

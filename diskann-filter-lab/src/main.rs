@@ -610,18 +610,32 @@ struct SelectArgs {
     /// are selected, valued against the routes these trees give.
     #[arg(long)]
     fixed_trees_max_size: Option<String>,
-    /// `--track graph`: how a router tree's bytes are counted — `rows` (each router a graph row
-    /// at the degree bound, its vector and a kind byte) or `compact` (as a run's bytes are
-    /// counted, the memory ceiling's base: adjacency lists of 4 B per node and per edge, and the
-    /// routers' vectors; a pair tree also its root entry).
-    #[arg(long, value_enum, default_value = "rows")]
-    tree_bytes: SelectTreeBytes,
+    /// `--track graph`: how a router tree's bytes are counted — `compact` (default: as a run's
+    /// bytes are counted, the memory ceiling's base: adjacency lists of 4 B per node and per
+    /// edge, and the routers' vectors; a pair tree also its root entry) or `rows` (each router a
+    /// graph row at the degree bound, its vector and a kind byte: the count before the compact
+    /// accounting, kept to reproduce earlier selections).
+    #[arg(long, value_enum)]
+    tree_bytes: Option<SelectTreeBytes>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum SelectTreeBytes {
     Rows,
     Compact,
+}
+
+/// The router trees' byte count of a selection: `compact` unless `--tree-bytes` says otherwise;
+/// only track G has router trees, so the option is an error for the hybrid track.
+fn select_tree_bytes(
+    track: SelectTrack,
+    given: Option<SelectTreeBytes>,
+) -> Result<SelectTreeBytes> {
+    ensure!(
+        track == SelectTrack::Graph || given.is_none(),
+        "--tree-bytes counts track G's router trees (--track graph)"
+    );
+    Ok(given.unwrap_or(SelectTreeBytes::Compact))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2148,10 +2162,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let parts = select::IndexBytes::of(&a.dataset, &a.graph, &store, T::DTYPE.size())?;
     let n = store.n_points();
     let graph_track = a.track == SelectTrack::Graph;
-    ensure!(
-        graph_track || a.tree_bytes == SelectTreeBytes::Rows,
-        "--tree-bytes counts track G's router trees (--track graph)"
-    );
+    let tree_bytes = select_tree_bytes(a.track, a.tree_bytes)?;
     let fixed_max = match &a.fixed_trees_max_size {
         Some(s) => {
             ensure!(
@@ -2193,7 +2204,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
                 r_max,
                 dim * T::DTYPE.size(),
             ),
-            compact_vector_bytes: (a.tree_bytes == SelectTreeBytes::Compact)
+            compact_vector_bytes: (tree_bytes == SelectTreeBytes::Compact)
                 .then_some((dim * T::DTYPE.size()) as u64),
         })
     } else {
@@ -3234,4 +3245,24 @@ fn print_starts(s: &Starts) {
 
 fn print_vectors<T: Element>(m: &Matrix<T>) {
     println!("vectors: {} × {} {}", m.nrows(), m.ncols(), T::NAME);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_bytes_default_to_compact_and_belong_to_track_g() {
+        // the hybrid track runs with the default (it has no router trees) but rejects the option
+        assert!(select_tree_bytes(SelectTrack::Hybrid, None).is_ok());
+        assert!(select_tree_bytes(SelectTrack::Hybrid, Some(SelectTreeBytes::Compact)).is_err());
+        assert_eq!(
+            select_tree_bytes(SelectTrack::Graph, None).unwrap(),
+            SelectTreeBytes::Compact
+        );
+        assert_eq!(
+            select_tree_bytes(SelectTrack::Graph, Some(SelectTreeBytes::Rows)).unwrap(),
+            SelectTreeBytes::Rows
+        );
+    }
 }
