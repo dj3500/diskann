@@ -171,7 +171,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
-| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve; `effort_curve(cap)`: at most `cap` × the list size of an unselective query) |
+| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve; a target recall beyond the measured curve plans its largest measured list size, the curve's maximum, before the proportional growth beyond the largest calibrated `K'` (`flab run` warns, and `run.json` lists the capped efforts under `effort_curve_capped`); `effort_curve(cap)`: at most `cap` × the list size of an unselective query) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets), `dense_nav` (bitmap of the navigation clauses only — all clauses, or the projected ones such as `c*` — built with the static bitsets when the index has them; the other clauses of a projected query are checked on the row of the bitmap's members) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
@@ -292,7 +292,9 @@ unfiltered search per query and list size `10·2^i ≤ --effort-lmax` (default 4
 the first size where every `K'` reaches a mean recall of 0.995) from the global start (the `K'`
 nearest evaluated nodes answer every `K'` at once), and per target recall
 the smallest list size reaching it (log-linear between sizes; above the largest, the power law
-of the miss rate through the last two sizes, at most 8× it). It takes a few
+of the miss rate through the last two sizes, at most 8× it; the largest measured size is kept as
+`effort_l_top`, and `effort_curve` plans at most that list for a target recall the measured curve
+does not reach — calibrations written without it take the largest of `details.effort.l`). It takes a few
 seconds (1M points) to a few minutes (40M) per dataset; the costs are loaded with the experiment
 or configuration key `calibration`. Calibrations without the newer terms reproduce the batch-B6
 cost model.

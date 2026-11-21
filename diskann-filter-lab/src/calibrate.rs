@@ -514,6 +514,7 @@ pub fn calibrate<T: Element>(
     let mut distance_first_frac = 0.0;
     let (mut graph_dist_ns_l, mut graph_dist_ns_curve) = (Vec::new(), Vec::new());
     let (mut effort_r, mut effort_k, mut effort_l) = (Vec::new(), Vec::new(), Vec::new());
+    let mut effort_l_top = 0.0;
     let (mut graph_dist_ns, mut graph_pred_ns, mut graph_alpha, mut graph_beta) = {
         let d = UnitCosts::default();
         (
@@ -754,7 +755,7 @@ pub fn calibrate<T: Element>(
                 "distance_first_frac": distance_first_frac}});
         if opts.effort.queries > 0 || opts.effort.pairs.is_some() {
             let e = effort::effort_curve(base, &ix, labels, &opts.effort)?;
-            (effort_r, effort_k, effort_l) = (e.r, e.k, e.l);
+            (effort_r, effort_k, effort_l, effort_l_top) = (e.r, e.k, e.l, e.l_top);
             details.insert("effort".into(), e.doc);
         }
     }
@@ -798,6 +799,7 @@ pub fn calibrate<T: Element>(
         effort_r,
         effort_k,
         effort_l,
+        effort_l_top,
         // `reads_at_reach` comes from the kernel configuration (`row_reads`), not calibrated.
         ..UnitCosts::default()
     };

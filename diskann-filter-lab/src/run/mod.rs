@@ -53,7 +53,10 @@ use crate::{
     bitsets::LabelBitsets,
     islands::IslandIndex,
     kernel::{
-        config::{Crossover, EstimateSource, Materializer, PredicateMode, StartSource, TreeRoute},
+        config::{
+            Crossover, EstimateSource, Materializer, PredicateMode, StartSource, Terminator,
+            TreeRoute,
+        },
         cost::UnitCosts,
         entry::SampleIndex,
         profile,
@@ -419,6 +422,23 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 let u = read_costs(path)?;
                 let doc = json!({"source": path, "costs": &u});
                 cost_files.insert(path.clone(), (u, doc));
+            }
+        }
+    }
+    // `effort_curve`: target recalls beyond the measured effort curve plan its largest measured
+    // list (the curve's maximum) — said once per configuration, before the runs.
+    for c in &exp.configs {
+        let Some(costs) = c.calibration.as_ref().map(|p| &cost_files[p].0) else {
+            continue;
+        };
+        for &k in &exp.ks {
+            let capped =
+                effort_curve_capped(c, costs, c.efforts.as_ref().unwrap_or(&exp.efforts), k);
+            if !capped.is_empty() {
+                eprintln!(
+                    "warning: config {:?}, K = {k}: effort(s) {capped:?} reach beyond the calibrated effort curve (measured up to L = {}) for some match rates: those lists are capped there, at the curve's maximum recall",
+                    c.name, costs.effort_l_top
+                );
             }
         }
     }
@@ -802,6 +822,16 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 "skipped_reason",
                 json!("the collector returns at most L answers (L < K), or the configuration's own efforts"),
             );
+            if let Some(costs) = c.calibration.as_ref().map(|p| &cost_files[p].0) {
+                let capped = effort_curve_capped(c, costs, &out.efforts, k);
+                if !capped.is_empty() {
+                    put(
+                        "effort_curve_capped",
+                        json!({"efforts": capped, "l_top": costs.effort_l_top,
+                            "note": "target recalls beyond the measured effort curve at K or more neighbours (K / estimated match rate): those lists are capped at its largest measured list size"}),
+                    );
+                }
+            }
             put("reps", protocol["reps"].clone());
             put("protocol", protocol);
             put("eps_min", json!({"value": eps, "method": eps_method}));
@@ -911,8 +941,42 @@ pub fn read_costs(path: &Path) -> Result<UnitCosts> {
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let v: Value =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let c: UnitCosts = serde_json::from_value(v.get("costs").cloned().unwrap_or(v))
-        .with_context(|| format!("unit costs in {}", path.display()))?;
+    costs_from_json(&v).with_context(|| format!("unit costs in {}", path.display()))
+}
+
+/// The efforts of an `effort_curve` configuration whose target recall lies beyond the measured
+/// effort curve at `k` or more neighbours, i.e. whose lists are capped (for every query, or for
+/// the selective ones).
+fn effort_curve_capped(
+    c: &ConfigSpec,
+    costs: &UnitCosts,
+    efforts: &[usize],
+    k: usize,
+) -> Vec<usize> {
+    if !matches!(c.kernel.terminator, Terminator::EffortCurve { .. }) || costs.effort_l.is_empty() {
+        return Vec::new();
+    }
+    efforts
+        .iter()
+        .copied()
+        .filter(|&e| costs.effort_capped(e as f64 / 1000.0, k as f64))
+        .collect()
+}
+
+/// The unit costs of a calibration document (`flab calibrate`'s JSON, or the bare costs). An
+/// effort curve without its largest measured list size (older calibrations) takes it from the
+/// document's measured list sizes (`details.effort.l`), so that it is capped there too.
+pub fn costs_from_json(v: &Value) -> Result<UnitCosts> {
+    let mut c: UnitCosts = serde_json::from_value(v.get("costs").cloned().unwrap_or(v.clone()))?;
+    if c.effort_l_top <= 0.0 && !c.effort_l.is_empty() {
+        let measured = v
+            .pointer("/details/effort/l")
+            .and_then(Value::as_array)
+            .and_then(|ls| ls.iter().filter_map(Value::as_f64).reduce(f64::max));
+        if let Some(top) = measured {
+            c.effort_l_top = top;
+        }
+    }
     c.validate()?;
     Ok(c)
 }
@@ -1281,6 +1345,33 @@ fn write_run_files(dir: &Path, rows: &Rows, k: usize, out: &Outcome) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_calibrations_cap_the_effort_curve_at_their_measured_lists() {
+        // A calibration document without `effort_l_top` (written before it existed): the largest
+        // of its measured list sizes (`details.effort.l`) caps the curve; a recorded value stays.
+        let mut costs = serde_json::to_value(UnitCosts {
+            effort_r: vec![0.5, 0.99],
+            effort_k: vec![10.0],
+            effort_l: vec![vec![10.0], vec![500.0]],
+            ..UnitCosts::default()
+        })
+        .unwrap();
+        costs.as_object_mut().unwrap().remove("effort_l_top");
+        let old = json!({"costs": costs, "details": {"effort": {"l": [10, 20, 40, 80]}}});
+        let c = costs_from_json(&old).unwrap();
+        assert_eq!(c.effort_l_top, 80.0);
+        assert_eq!(c.effort_list(0.99, 10.0), Some(80.0));
+        let mut recorded = costs.clone();
+        recorded["effort_l_top"] = json!(200.0);
+        assert_eq!(
+            costs_from_json(&json!({"costs": recorded}))
+                .unwrap()
+                .effort_l_top,
+            200.0
+        );
+        assert_eq!(costs_from_json(&costs).unwrap().effort_l_top, 0.0);
+    }
 
     #[test]
     fn shuffle_is_seeded() {

@@ -73,6 +73,8 @@ pub struct Effort {
     pub r: Vec<f64>,
     pub k: Vec<f64>,
     pub l: Vec<Vec<f64>>,
+    /// The largest measured list size (the table is extrapolated beyond it).
+    pub l_top: f64,
     pub doc: Value,
 }
 
@@ -313,6 +315,7 @@ pub fn effort_curve<T: Element>(
         r: R_GRID.to_vec(),
         k: ks.iter().map(|&k| k as f64).collect(),
         l: table,
+        l_top: top,
         doc,
     })
 }
