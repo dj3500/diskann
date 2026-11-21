@@ -741,3 +741,25 @@ predicates = "view"
     assert!(outside > 0, "the queries' own predicates were not applied");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn start_tables_of_one_graph_share_it() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flab-run-shared-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = write_dataset(&dir);
+    let gdir = dir.join("graph");
+    // A second table of the same graph with an entry layer: more global starts.
+    let mut g = Graph::read(&gdir.join("graph.flab")).unwrap();
+    g.set_starts(vec![0, 7, 42]).unwrap();
+    Starts::new(&g).write(&dir.join("entry.flab")).unwrap();
+    let mut shared = std::collections::HashMap::new();
+    let a = run::data::load_graph_shared(&gdir, None, u8::DTYPE, &mut shared).unwrap();
+    let b =
+        run::data::load_graph_shared(&gdir, Some(&dir.join("entry.flab")), u8::DTYPE, &mut shared)
+            .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&a.graph, &b.graph));
+    assert_eq!(a.global, vec![0]);
+    assert_eq!(b.global, vec![0, 7, 42]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
