@@ -961,8 +961,8 @@ impl LabelKind for TreeGreedy<'_> {
 /// that route is faster. On the independent queries the selector values each pair through
 /// [`LabelKind::pair_cost`] (the pair tree diluted to each query's matches). With fixed label
 /// trees (`tree_max`: every label of 1 to `tree_max` points has one; [`TreeGreedy::fix`]) the
-/// smaller label's tree is the alternative where it exists, in both pricings; without them, any
-/// label's tree with the curves, and the router alone without (the analytic pricing).
+/// curves' alternative is the smaller label's tree only where that label has one. The analytic
+/// pricing values a pair against the router alone.
 pub fn pair_tree_values(
     pr: &Pricing,
     labels: &LabelStore,
@@ -976,11 +976,7 @@ pub fn pair_tree_values(
         .filter_map(|&p| {
             let j = f64::from(p.joint).max(1.0);
             let s = labels.posting_len(p.a).min(labels.posting_len(p.b));
-            let tree = s < pr.n
-                && match tree_max {
-                    Some(m) => s <= m,
-                    None => pr.curves.is_some(),
-                };
+            let tree = s < pr.n && pr.curves.is_some() && tree_max.is_none_or(|m| s <= m);
             let (mut alt, pair) = match pr.curves {
                 Some(_) => (pr.router_derived(j, true), pr.pair_tree_derived(j)),
                 None => (pr.router_pair(j), pr.pair_tree(j)),
@@ -1646,11 +1642,9 @@ mod tests {
             }
         }
         assert!(above > 0);
-        // The analytic pricing values a pair against the router alone, or with fixed trees against
-        // its smaller label's tree where that label has one.
+        // The analytic pricing values a pair against the router alone, with or without fixed trees.
         let pr_a = Pricing { curves: None, ..pr };
         let fixed_a = pair_tree_values(&pr_a, &s, &model, &f, &cands, Some(cap));
-        let mut below = 0;
         for v in pair_tree_values(&pr_a, &s, &model, &f, &cands, None) {
             assert_eq!(
                 v.saving_ns,
@@ -1658,14 +1652,8 @@ mod tests {
                     - pr_a.pair_tree(f64::from(v.cand.joint).max(1.0))
             );
             let w = fixed_a.iter().find(|w| w.cand == v.cand).unwrap();
-            if s.posting_len(v.cand.a).min(s.posting_len(v.cand.b)) > cap {
-                assert_eq!(w.saving_ns, v.saving_ns);
-            } else {
-                assert!(w.saving_ns <= v.saving_ns);
-                below += usize::from(w.saving_ns < v.saving_ns);
-            }
+            assert_eq!(w.saving_ns, v.saving_ns);
         }
-        assert!(below > 0);
         // The greedy takes pair trees only, starting from the mean cost with the fixed trees.
         let params = select::Params {
             k: 10,
