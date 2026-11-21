@@ -481,8 +481,11 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
   reference recall, a tree route by its frontier `--tree-frontier` at the query's dilution and a
   query no tree serves by the graph-only crossover's estimate under track G's run keys; a pair
   tree is worth only what it saves where `tree_pairs = "on"` would take it — cheaper than the
-  query's label tree, or than its graph route when it has none — and a query whose binding label
-  has a tree takes a pair tree only with fewer members than that label); `--pricing model` (the
+  query's label tree, or than its graph route as the run plans it (`effort_curve(4)`) when it has
+  none — and a query whose binding label has a tree takes a pair tree only with fewer members than
+  that label; its saving is priced at the reference recall, the graph route at the uncapped
+  effort curve; base-derived queries are valued one by one, each query's saving counted once,
+  as the independent ones); `--pricing model` (the
   selector's analytic model, or `--route-curves`) reproduces the selections before, and is the
   pricing without fixed trees. Track G also writes the pair trees taken with their savings
   (`sel-b<B>.pairs.tsv`).

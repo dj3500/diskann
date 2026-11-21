@@ -47,8 +47,11 @@
 //! match by its frontier at that dilution (as the run's `tree_effort = "fixed(F)"`), a query no
 //! tree serves by the graph-only crossover's estimate — so that selection and routing share one
 //! cost model: a pair tree saves only where the kernel would route a query to it (cheaper than
-//! the query's label tree, or than its graph route when it has none), and a query whose
-//! binding label has a tree takes a pair tree only with fewer members than that label. The
+//! the query's label tree, or than its graph route as the run plans it when it has none), and a
+//! query whose binding label has a tree takes a pair tree only with fewer members than that
+//! label. The route check decides at the run's prices (the graph route's list capped by
+//! `effort_curve(cap)`); the costs and savings are priced at the reference recall (the uncapped
+//! effort curve), since the cap buys a diluted query's time with its recall. The
 //! base-derived part is then valued on the sampled queries themselves, as the independent part:
 //! a pair tree serves a sampled query whose single-label clauses include both its labels, at
 //! its tree route diluted to the query's matches, against the query's current cost — each
@@ -356,14 +359,19 @@ impl RouteCurves {
 /// prices it at the reference level — a tree over `s` members of which `M` match by its
 /// frontier at that dilution (`tree_effort = "fixed(F)"`, `F` the reference frontier), a query
 /// no tree serves by the graph-only crossover's estimate (the filtered graph search at the list
-/// `effort_curve(cap)` plans for the reference recall, or the post-filter route when cheaper).
+/// the effort curve plans for the reference recall, or the post-filter route when cheaper).
 /// One cost model for selection and routing: a pair tree is worth what it saves on the queries
-/// the kernel would route to it, and nothing on the others.
+/// the kernel would route to it, and nothing on the others. Which queries those are, the
+/// kernel's check decides at the run's prices (the graph route's list capped by
+/// `effort_curve(cap)`); what a query costs, and so what a pair tree saves, is priced at the
+/// reference recall (the uncapped curve: the cap limits what a run spends on a diluted query, at
+/// the cost of its recall, and is no price of that recall).
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct KernelRoutes {
     /// Target recall of the graph route's planned list, per mille (the reference recall).
     pub effort: usize,
-    /// `terminator = "effort_curve(cap)"`.
+    /// `terminator = "effort_curve(cap)"`: the run's cap on the graph route's list, for the
+    /// route check's decisions.
     pub cap: f64,
     /// Start nodes of the graph route of a query no tree serves (`starts =
     /// "label(c*)+global"`: its binding label's starts and the global ones).
@@ -420,8 +428,14 @@ impl Pricing<'_> {
         fixed_tree_route_ns(self.c, self.tm.fanout, self.tm.frontier, s, m)
     }
 
-    /// [`KernelRoutes`]: a query with `m` matches that no tree serves.
+    /// [`KernelRoutes`]: a query with `m` matches that no tree serves, at the reference recall.
     fn kernel_graph(&self, kr: &KernelRoutes, m: f64) -> f64 {
+        self.graph_route(kr, m, f64::INFINITY)
+    }
+
+    /// The graph-only crossover's estimate for a query with `m` matches, its list capped by
+    /// `effort_curve(cap)`.
+    fn graph_route(&self, kr: &KernelRoutes, m: f64, cap: f64) -> f64 {
         let rate = (m / self.n.max(1) as f64).clamp(0.0, 1.0);
         graph_only_route_ns(
             self.c,
@@ -429,12 +443,21 @@ impl Pricing<'_> {
             self.tm.k,
             rate,
             self.n,
-            kr.cap,
+            cap,
             kr.laziness,
             kr.starts,
             kr.global_starts,
             kr.postfilter_starts,
         )
+    }
+
+    /// [`KernelRoutes`]: the price the route check compares a pair tree with for a query with `m`
+    /// matches that no tree serves — the graph route as the run plans it (`effort_curve(cap)`);
+    /// `None` under other pricings.
+    pub fn route_check_graph(&self, m: f64) -> Option<f64> {
+        self.kernel
+            .as_ref()
+            .map(|kr| self.graph_route(kr, m, kr.cap))
     }
 
     /// A base-derived (data-like) query with `m` matches: the router — for a conjunction
@@ -622,6 +645,10 @@ pub struct TreeSample {
     derived_binding: Vec<(u32, f32)>,
     derived_pairs: Vec<(u32, u32)>,
     derived_queries: Vec<u32>,
+    /// Under the kernel's prices, per query: the route check's price of its graph route
+    /// ([`Pricing::route_check_graph`]), which a pair tree must undercut when the query has no
+    /// label tree.
+    route_ns: Vec<f32>,
 }
 
 impl TreeSample {
@@ -670,12 +697,16 @@ impl TreeSample {
                 // Under the kernel's prices, per base-derived query: (match count, binding label
                 // and its tree cost, single-label clauses).
                 let mut derived: Vec<(f32, (u32, f32), Vec<u32>)> = Vec::new();
+                let mut route: Vec<f32> = Vec::new();
                 for qi in ci * chunk..((ci + 1) * chunk).min(n_total) {
                     if qi >= model.n_queries {
                         let w = &u[qi - model.n_queries];
                         let m = w.joint.max(1.0);
                         let c = w.labels.len();
                         base.push(pr.router_conj(c, m));
+                        if let Some(g) = pr.route_check_graph(m) {
+                            route.push(g as f32);
+                        }
                         let l = w
                             .labels
                             .iter()
@@ -694,11 +725,15 @@ impl TreeSample {
                         base.push(0.0);
                         if kernel {
                             derived.push((0.0, (u32::MAX, 0.0), Vec::new()));
+                            route.push(f32::INFINITY);
                         }
                         continue;
                     }
                     let (jmin, _, m) = query_matches(labels, &model, kl, clauses);
                     base.push(pr.router_derived(m, clauses.len() > 1));
+                    if let Some(g) = pr.route_check_graph(m) {
+                        route.push(g as f32);
+                    }
                     let (a, b) = clauses[jmin];
                     let mut nonempty = kl[a..b].iter().filter(|&&l| labels.posting_len(l) > 0);
                     let mut binding = (u32::MAX, 0.0);
@@ -720,16 +755,18 @@ impl TreeSample {
                         derived.push((m as f32, binding, singles));
                     }
                 }
-                (base, recs, derived)
+                (base, recs, derived, route)
             },
         );
         let mut base_ns = Vec::with_capacity(n_total);
         let mut recs = Vec::new();
         let (mut derived_m, mut derived_binding) = (Vec::new(), Vec::new());
         let mut pairs: Vec<((u32, u32), u32)> = Vec::new();
-        for (b, r, d) in parts {
+        let mut route_ns = Vec::new();
+        for (b, r, d, g) in parts {
             base_ns.extend(b);
             recs.extend(r);
+            route_ns.extend(g);
             for (m, binding, singles) in d {
                 let q = derived_m.len() as u32;
                 for (i, &x) in singles.iter().enumerate() {
@@ -752,6 +789,7 @@ impl TreeSample {
             derived_binding,
             derived_pairs,
             derived_queries,
+            route_ns,
         }
     }
 
@@ -1058,6 +1096,16 @@ impl<'s> TreeGreedy<'s> {
         (self.n_taken, saving, bytes)
     }
 
+    /// Under the kernel's prices: whether the route check takes a pair tree of cost `cost` for
+    /// sample query `q`, which has no label tree — cheaper than its graph route as the run plans
+    /// it.
+    fn route_check_takes(&self, q: usize, cost: f64) -> bool {
+        self.sample
+            .route_ns
+            .get(q)
+            .is_none_or(|&g| cost < f64::from(g))
+    }
+
     /// Under the kernel's prices: the size and cost of base-derived query `q`'s binding-label
     /// tree when that tree is taken (`None`: the query takes the graph route).
     fn derived_tree(&self, q: usize) -> Option<(usize, f64)> {
@@ -1134,29 +1182,30 @@ impl LabelKind for TreeGreedy<'_> {
             // Under the kernel's prices, a base-derived query holding the pair's labels as
             // single-label clauses, as an independent one below.
             let m = f64::from(*self.sample.derived_m.get(q)?);
-            if let Some(s) = self.derived_tree(q).map(|(s, _)| s) {
-                if joint as usize >= s {
-                    return None;
-                }
+            let cost = self.pr.pair_tree_on(j, m.clamp(1.0, j));
+            return match self.derived_tree(q) {
+                Some((s, _)) => (joint as usize) < s,
+                None => self.route_check_takes(q, cost),
             }
-            return Some(self.pr.pair_tree_on(j, m.clamp(1.0, j)));
+            .then_some(cost);
         }
         let w = self.sample.independent_query(q)?;
+        let cost = self.pr.pair_tree_on(j, w.joint.clamp(1.0, j));
         if self.pr.kernel.is_some() {
             // The kernel considers a pair tree for a query whose binding label has a tree only
-            // when it has fewer members than that label (`pair_covered`).
+            // when it has fewer members than that label (`pair_covered`), and for one without
+            // only when it undercuts the query's graph route as the run plans it.
             match self.ctx_cand[q - self.sample.n_data] {
-                (x, _)
-                    if x != u32::MAX
-                        && self.taken[x as usize]
-                        && joint as usize >= self.terms[x as usize].size =>
-                {
-                    return None;
+                (x, _) if x != u32::MAX && self.taken[x as usize] => {
+                    if joint as usize >= self.terms[x as usize].size {
+                        return None;
+                    }
                 }
+                _ if !self.route_check_takes(q, cost) => return None,
                 _ => {}
             }
         }
-        Some(self.pr.pair_tree_on(j, w.joint.clamp(1.0, j)))
+        Some(cost)
     }
 
     fn query_cost(&self, q: usize) -> f64 {
@@ -1265,12 +1314,16 @@ pub fn pair_tree_values(
                 if tree && p.joint as usize >= s {
                     return None;
                 }
+                let pair = pr.pair_tree(j);
                 let alt = if tree {
                     pr.tree_pair_label(s as f64, j)
+                } else if pr.route_check_graph(j).is_some_and(|g| pair >= g) {
+                    // The route check keeps the context on its graph route.
+                    pair
                 } else {
                     pr.router_pair(j)
                 };
-                (alt - pr.pair_tree(j)).max(0.0)
+                (alt - pair).max(0.0)
             } else {
                 let tree = s < pr.n
                     && tree_max.is_none_or(|m| s <= m)
@@ -2147,27 +2200,34 @@ mod tests {
             kernel: Some(KernelRoutes::recipe(0.9)),
         };
         // Every route at the kernel's price: a tree as the cost-checked route prices it, a query
-        // no tree serves as the graph-only crossover estimates it.
-        for (a, m) in [(200.0, 200.0), (2_000.0, 50.0), (10_000.0, 9_000.0)] {
-            let tree = fixed_tree_route_ns(&c, 26.0, 64.0, a, m);
-            assert_eq!(pr.tree_conj(3, a, m), tree);
-            assert_eq!(pr.tree_derived(a, m, true), tree);
-            assert_eq!(pr.pair_tree_on(a, m), tree);
-            let graph = graph_only_route_ns(
+        // no tree serves as the graph-only crossover estimates it — at the reference recall for
+        // its cost, at the run's cap on the planned list for the route check.
+        let graph = |m: f64, cap: f64| {
+            graph_only_route_ns(
                 &c,
                 900,
                 10,
                 m / n as f64,
                 n,
-                4.0,
+                cap,
                 Laziness::HeapBound,
                 5,
                 1,
                 PostfilterStarts::ByRateBothK,
-            );
-            assert_eq!(pr.router_conj(2, m), graph);
-            assert_eq!(pr.router_derived(m, true), graph);
+            )
+        };
+        let mut capped = 0;
+        for (a, m) in [(200.0, 200.0), (2_000.0, 50.0), (10_000.0, 9_000.0)] {
+            let tree = fixed_tree_route_ns(&c, 26.0, 64.0, a, m);
+            assert_eq!(pr.tree_conj(3, a, m), tree);
+            assert_eq!(pr.tree_derived(a, m, true), tree);
+            assert_eq!(pr.pair_tree_on(a, m), tree);
+            assert_eq!(pr.router_conj(2, m), graph(m, f64::INFINITY));
+            assert_eq!(pr.router_derived(m, true), graph(m, f64::INFINITY));
+            assert_eq!(pr.route_check_graph(m), Some(graph(m, 4.0)));
+            capped += usize::from(graph(m, 4.0) < graph(m, f64::INFINITY));
         }
+        assert!(capped > 0);
         let (counts, f) = select::label_weights(&s, 0.5, 2);
         let contexts = select::pair_contexts(&s, &counts, 0.5, 2);
         let model = QueryModel {
@@ -2206,12 +2266,15 @@ mod tests {
                 continue;
             }
             let j = f64::from(p.joint).max(1.0);
+            let pair = pr.pair_tree(j);
             let alt = if small <= cap {
                 pr.tree_pair_label(small as f64, j)
+            } else if pair >= pr.route_check_graph(j).unwrap() {
+                pair
             } else {
                 pr.router_pair(j)
             };
-            let want = (alt - pr.pair_tree(j)).max(0.0);
+            let want = (alt - pair).max(0.0);
             assert_eq!(v.expect("valued").saving_ns, want, "{p:?}");
             seen[1 + usize::from(want > 0.0)] += 1;
         }
@@ -2220,8 +2283,9 @@ mod tests {
             .iter()
             .any(|v| (v.cand.a, v.cand.b) == (id("c3").min(id("tr")), id("c3").max(id("tr")))));
         // The independent queries: a pair tree serves a query whose binding label has a tree
-        // only with fewer members than that label, and lowers a query's cost only where it is
-        // cheaper (the route check).
+        // only with fewer members than that label, one without only below its graph route as
+        // the run plans it (the route check), and lowers a query's cost only where it is
+        // cheaper.
         let mut g = TreeGreedy::with_classes(&sample, &s, &pr, &f, 30);
         g.fix(fixed);
         let nd = sample.n_data;
@@ -2243,12 +2307,18 @@ mod tests {
                 .filter(|p| s.postings(b).binary_search(p).is_ok())
                 .count() as u32;
             let cost = g.pair_cost(q, a, b, joint);
-            if fixed(binding) && joint as usize >= s.posting_len(binding) {
+            let j = f64::from(joint).max(1.0);
+            let want = pr.pair_tree_on(j, w.joint.clamp(1.0, j));
+            let route = pr.route_check_graph(w.joint.max(1.0)).unwrap();
+            if (fixed(binding) && joint as usize >= s.posting_len(binding))
+                || (!fixed(binding) && want >= f64::from(route as f32))
+            {
                 assert_eq!(cost, None, "{:?}", w.labels);
                 refused += 1;
                 continue;
             }
             let cost = cost.expect("a pair tree serves the query");
+            assert_eq!(cost, want);
             let before = g.query_cost(q);
             g.serve(q, cost);
             if cost < before {
@@ -2259,14 +2329,12 @@ mod tests {
                 dearer += 1;
             }
         }
-        assert!(
-            refused > 0 && cheaper > 0 && dearer > 0,
-            "{refused} {cheaper} {dearer}"
-        );
+        // (A pair tree dearer than the query's route is refused or lowers nothing.)
+        assert!(refused > 0 && cheaper > 0, "{refused} {cheaper} {dearer}");
         // The base-derived queries are valued one by one, not by their contexts' closed form:
         // a pair serves those holding both its labels as single-label clauses, at its tree
         // diluted to the query's matches, unless the query's binding label has a tree no larger
-        // than the pair.
+        // than the pair or, without one, the route check keeps the query's graph route.
         assert!(!g.derived_closed_form());
         let mut derived = [0; 2];
         for p in &cands {
@@ -2285,7 +2353,13 @@ mod tests {
                     }
                     None => {
                         let (l, _) = sample.derived_binding[q];
-                        assert!(fixed(l) && p.joint as usize >= s.posting_len(l));
+                        let m = f64::from(sample.derived_m[q]);
+                        let route = f64::from(pr.route_check_graph(m).unwrap() as f32);
+                        assert!(if fixed(l) {
+                            p.joint as usize >= s.posting_len(l)
+                        } else {
+                            pr.pair_tree_on(j, m.clamp(1.0, j)) >= route
+                        });
                         derived[1] += 1;
                     }
                 }
