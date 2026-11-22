@@ -1202,6 +1202,9 @@ impl MemberWork {
         at_reach: bool,
     ) -> Self {
         let c = q.n_clauses();
+        // A query of more than 64 clauses (no clause bits) is checked on the row whatever the
+        // static split (the evaluators fall back to `ClauseSearch`).
+        let split = split && c <= 64;
         let class_rows = q.residual_reads_rows(split);
         if c <= 1 || q.is_empty() {
             return Self {
@@ -1263,20 +1266,29 @@ impl MemberWork {
     /// Worst-case work of checking the clauses in `mask` (bit `j`: clause `j`): every bitset
     /// word of those clauses probed, and the row read once if one of them has row labels. The
     /// `pair` plan's checks: its candidates come from joint or single postings, without the
-    /// survival estimates of `union(c*)`, and its mask may include `c*`.
+    /// survival estimates of `union(c*)`, and its mask may include `c*`. A query without clause
+    /// bits (more than 64 clauses) is checked on the row, every clause, whatever the mask.
     pub fn of_mask(q: &Compiled, split: bool, mask: u64) -> Self {
-        if mask == 0 || q.is_empty() {
+        let row_work = Self {
+            words: 0.0,
+            prefetch: 1.0,
+            rows: 1.0,
+            class_rows: true,
+        };
+        if q.is_empty() {
+            return Self::default();
+        }
+        if !q.uses_bits() {
+            return row_work;
+        }
+        if mask == 0 {
             return Self::default();
         }
         if !split {
-            return Self {
-                words: 0.0,
-                prefetch: 1.0,
-                rows: 1.0,
-                class_rows: true,
-            };
+            return row_work;
         }
         let (mut words, mut row) = (0.0, false);
+        // With clause bits there are at most 64 clauses.
         for j in (0..q.n_clauses()).filter(|&j| mask >> j & 1 == 1) {
             words += q.static_slots(j).len() as f64;
             row |= !q.row_labels(j).is_empty();
@@ -1518,14 +1530,12 @@ impl PlanInputs<'_> {
         if lists > 1.0 {
             cost += e * c.merge_ns * lists.log2();
         }
-        // The check mask of `exact::planned`: every clause but the covered pair's (exact
-        // cover), else every clause.
-        let full = self.q.full_mask();
-        let mask = if cv.exact {
-            full & !(1u64 << cv.i) & !(1u64 << cv.j)
-        } else {
-            full
-        };
+        // The checks of `exact::planned`: every clause but the covered pair's (exact cover),
+        // else every clause; a query without clause bits checks every clause on the row.
+        let mask = self
+            .q
+            .pair_check_mask(cv.i, cv.j, cv.exact)
+            .unwrap_or(u64::MAX);
         if mask != 0 {
             let w = MemberWork::of_mask(self.q, self.bitsets.is_some(), mask);
             cost += e * c.member_at(&w, c.pos(e / x.n));

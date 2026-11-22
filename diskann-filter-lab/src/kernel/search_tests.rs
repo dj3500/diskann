@@ -3710,3 +3710,260 @@ fn island_search_with_a_list_of_the_whole_island_is_exact() {
         "some query has a single-label clause with an island"
     );
 }
+
+/// The fixture's vectors and graph with labels in 72 categories: `s` (2 values) and 71
+/// categories `kJ` whose points carry `kJ=0` (9 in 10) and `kJ=1` (3 in 10; every point has
+/// one of them): every label is big enough for combination postings (64 points). Queries alternate narrow ones (2 to 4 clauses) and wide ones (more than 64
+/// clauses: every `kJ` category, most clauses `[kJ=0, kJ=1]`, a few `[kJ=0]` or `[kJ=1]`).
+fn wide_fixture(n: usize, seed: u64) -> Fixture {
+    let f = fixture(n, seed, false);
+    let mut rng = Lcg(seed ^ 0x5eed);
+    let cats = 71;
+    let cat: Vec<String> = (0..cats).map(|j| format!("k{j}")).collect();
+    let val: Vec<[String; 2]> = (0..cats)
+        .map(|j| [format!("k{j}=0"), format!("k{j}=1")])
+        .collect();
+    let s_names: Vec<String> = (0..2).map(|v| format!("s={v}")).collect();
+    let mut b = LabelStoreBuilder::new();
+    for _ in 0..n {
+        let mut row: Vec<(&str, &str)> = vec![("s", s_names[rng.below(2) as usize].as_str())];
+        for (c, v) in cat.iter().zip(&val) {
+            let r = rng.below(10);
+            if r < 9 {
+                row.push((c.as_str(), v[0].as_str()));
+            }
+            if r >= 7 {
+                row.push((c.as_str(), v[1].as_str()));
+            }
+        }
+        b.push_point(row).unwrap();
+    }
+    let labels = b.finish().unwrap();
+    let mut pb = PredicateSetBuilder::new(&labels);
+    for q in 0..40 {
+        let mut clauses: Vec<Vec<String>> = vec![vec![s_names[rng.below(2) as usize].clone()]];
+        if q % 2 == 0 {
+            for _ in 0..1 + rng.below(3) {
+                let j = rng.below(cats as u32) as usize;
+                clauses.push(vec![val[j][rng.below(2) as usize].clone()]);
+            }
+        } else {
+            let picked: Vec<usize> = (0..2 + rng.below(3))
+                .map(|_| rng.below(cats as u32) as usize)
+                .collect();
+            for (j, v) in val.iter().enumerate() {
+                if !picked.contains(&j) {
+                    clauses.push(vec![v[0].clone(), v[1].clone()]);
+                } else if q % 3 == 0 {
+                    clauses.push(vec![v[1].clone()]);
+                } else {
+                    clauses.push(vec![v[0].clone()]);
+                }
+            }
+        }
+        pb.push(&clauses);
+    }
+    let preds = pb.finish();
+    let mut starts = Starts::new(&f.graph);
+    let pairs: Vec<(u32, u32)> = (0..labels.n_labels() as u32)
+        .filter_map(|l| labels.postings(l).first().map(|&p| (l, p)))
+        .collect();
+    starts.set_label_starts(&labels, &pairs).unwrap();
+    starts
+        .set_sample((0..n as u32).filter(|p| p % 3 != 1).collect(), None)
+        .unwrap();
+    let sample = SampleIndex::build(&starts, &labels).unwrap();
+    let bitsets = LabelBitsets::build(&labels, 1);
+    Fixture {
+        labels,
+        preds,
+        starts,
+        sample,
+        bitsets,
+        ..f
+    }
+}
+
+/// Queries of more than 64 clauses have no clause bits: on a searcher that alternates them
+/// with narrow queries they inherit nothing (answers and counters as on a fresh searcher),
+/// every check and price takes the mask-free path, and the answers of exhaustive searches are
+/// the brute-force ones.
+#[test]
+fn wide_predicates_alternating_with_narrow_ones_are_exact() {
+    use super::cost::UnitCosts;
+    let n = 300;
+    let f = wide_fixture(n, 61);
+    assert!((0..f.preds.len()).any(|q| f.preds.get(q).n_clauses() > 64));
+    let costs = UnitCosts {
+        enum_word_ns: 0.3,
+        enum_bit_ns: 2.0,
+        ..UnitCosts::default()
+    };
+    let sketches = crate::sketches::LabelSketches::build(&f.labels, 16, 3, 1);
+    // Every pair of labels stored.
+    let (px, _) = crate::pairs::PairIndex::build(&f.labels, 1 << 26, 1);
+    let ix = Index {
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        pairs: Some(&px),
+        ..f.index()
+    };
+    let hybrid = [
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("laziness", "heap_bound"),
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("estimates", "sketch"),
+        ("postfilter", "cost"),
+        ("postfilter_starts", "by_rate_both_k"),
+        ("df_evals", "lower"),
+    ];
+    let kernels: Vec<(&str, Kernel)> = vec![
+        (
+            "exact pair",
+            kernel(&[
+                ("exact", "planned(18446744073709551615)"),
+                ("exact_plans", "scan+pair"),
+                ("collector", "heap"),
+            ]),
+        ),
+        (
+            "exact all plans",
+            kernel(&[
+                ("exact", "planned(18446744073709551615)"),
+                ("estimates", "sketch"),
+                ("collector", "heap"),
+            ]),
+        ),
+        ("hybrid", kernel(&hybrid)),
+        (
+            "hybrid static bits",
+            kernel(&[&hybrid[..], &[("predicate", "static_bits(1)")]].concat()),
+        ),
+        (
+            "graph static bits",
+            kernel(&[
+                ("starts", "label(c*)+global"),
+                ("collector", "heap"),
+                ("predicate", "static_bits(1)"),
+            ]),
+        ),
+    ];
+    let (mut wide_pair, mut wide_runs) = (0, 0);
+    for (name, k) in &kernels {
+        let plan = Plan::new(k, &ix).unwrap();
+        let mut shared = Searcher::for_index(&ix, &[&plan]);
+        for q in 0..f.preds.len() {
+            for kk in [1, 10] {
+                let what = format!("{name} q={q} K={kk}");
+                let mut fresh = Searcher::for_index(&ix, &[&plan]);
+                let (a, ca) = search_ix(&f, &ix, &mut shared, &plan, q, n, kk);
+                let (b, cb) = search_ix(&f, &ix, &mut fresh, &plan, q, n, kk);
+                assert_eq!((&a, &ca), (&b, &cb), "{what}: state of an earlier query");
+                assert_eq!(a, f.truth(q, kk), "{what}");
+                if ca.n_clauses > 64 {
+                    wide_runs += 1;
+                    wide_pair += usize::from(ca.plan == super::cost::ExactPlan::Pair as u64);
+                }
+            }
+        }
+    }
+    assert!(wide_runs > 0 && wide_pair > 0, "{wide_runs} {wide_pair}");
+}
+
+/// The cost-chosen member check of the tree route prices a query of more than 64 clauses on
+/// the row (no clause bits), after and before a narrow query.
+#[test]
+fn the_cost_tree_route_takes_wide_predicates() {
+    use super::cost::UnitCosts;
+    // As there: a router (id 5) over the members 0, 2 and 4 of `x=1`; every point also
+    // carries the 70 labels `zJ=1` (one category).
+    let z: Vec<String> = (0..70).map(|j| format!("z{j}=1")).collect();
+    let short: [&[&str]; 5] = [
+        &["x=1", "y=1"],
+        &["y=1"],
+        &["x=1", "y=2"],
+        &["y=1"],
+        &["x=1", "y=1"],
+    ];
+    let row_refs: Vec<Vec<&str>> = short
+        .iter()
+        .map(|r| {
+            r.iter()
+                .copied()
+                .chain(z.iter().map(String::as_str))
+                .collect()
+        })
+        .collect();
+    let row_slices: Vec<&[&str]> = row_refs.iter().map(Vec::as_slice).collect();
+    let (base, mut g, labels) = line(&row_slices, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    let id = |s: &str| labels.name_index()[s];
+    let mut st = Starts::new(&g);
+    st.set_label_starts(&labels, &[(id("x=1"), 5), (id("y=1"), 1), (id("y=2"), 2)])
+        .unwrap();
+    let bitsets = LabelBitsets::build(&labels, 1);
+    let sketches = crate::sketches::LabelSketches::build(&labels, 1000, 1, 1);
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=1"], vec!["y=1"]]);
+    let wide: Vec<Vec<&str>> = std::iter::once(vec!["x=1"])
+        .chain(z.iter().map(|l| vec![l.as_str()]))
+        .collect();
+    pb.push(&wide);
+    let preds = pb.finish();
+    let costs = UnitCosts {
+        check_base_ns: vec![1.0; 6],
+        check_word_ns: vec![1.0; 6],
+        check_prefetch_ns: vec![0.0; 6],
+        check_row_ns: vec![100.0; 6],
+        word_ns: 1e6,
+        scatter_ns: 0.0,
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        graph: &g,
+        vectors: g.vectors(&base).unwrap(),
+        labels: &labels,
+        global: &[0],
+        label_starts: Some(&st),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 0.5,
+        bitsets: Some(&bitsets),
+        costs: Some(&costs),
+        sketches: Some(&sketches),
+        pairs: None,
+        islands: None,
+        pair_roots: None,
+    };
+    let k = kernel(&[
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("crossover", "graph"),
+        ("exact", "planned"),
+        ("estimates", "sketch"),
+        ("tree_route", "cost"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut s = Searcher::for_index(&ix, &[&plan]);
+    let mut answers = Vec::new();
+    for qi in [0, 1, 0, 1] {
+        let (mut ids, mut d) = (vec![0u32; 3], vec![0f32; 3]);
+        let q = Query {
+            vector: &[3.2f32],
+            cnf: preds.get(qi),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 4, &mut ids, &mut d, None);
+        assert_eq!(ctr.route, Route::Tree, "q={qi}");
+        answers.push((ctr.plan, ids));
+    }
+    // The narrow query: the static check (cheap words, expensive rows); the wide one: the row
+    // scan, whose price equals the static check's (both read the row) and comes first.
+    assert_eq!(answers[0], (102, vec![4, 0, u32::MAX]));
+    assert_eq!(answers[1], (101, vec![4, 2, 0]));
+    assert_eq!(answers[2], answers[0]);
+    assert_eq!(answers[3], answers[1]);
+}

@@ -132,6 +132,11 @@ impl Compiled {
         self.static_row_prefetch = false;
         self.residual_rows = false;
         self.residual_first = u32::MAX;
+        // No clause bits until they are assigned below: a query with an empty clause or more
+        // than 64 clauses must not inherit the previous query's masks.
+        self.use_bits = false;
+        self.full_mask = 0;
+        self.nav_mask = 0;
         for (i, clause) in cnf.clauses().enumerate() {
             if clause.is_empty() {
                 self.empty = true;
@@ -140,7 +145,6 @@ impl Compiled {
             self.scratch.push((u, i as u32));
         }
         if self.empty {
-            self.use_bits = false;
             return;
         }
         self.scratch.sort_unstable();
@@ -345,9 +349,25 @@ impl Compiled {
     }
 
     /// Bits of every clause position (the full check), `0` for a query whose clauses do not
-    /// use clause bits (more than 64 clauses).
+    /// use clause bits (more than 64 clauses, or an empty clause).
     pub fn full_mask(&self) -> u64 {
         self.full_mask
+    }
+
+    /// The clauses the `pair` plan checks on the candidates of the clause pair `(i, j)`: every
+    /// clause but the pair (`exact`: the candidates satisfy both), else every clause. `None` for
+    /// a query without clause bits, whose evaluators check every clause on the row whatever
+    /// the mask ([`Eval::masked`]).
+    pub fn pair_check_mask(&self, i: usize, j: usize, exact: bool) -> Option<u64> {
+        if !self.use_bits {
+            return None;
+        }
+        // With clause bits there are at most 64 clauses, so `i, j < 64`.
+        Some(if exact {
+            self.full_mask & !(1u64 << i) & !(1u64 << j)
+        } else {
+            self.full_mask
+        })
     }
 
     /// `min_c U_c` (`u64::MAX` without clauses).
@@ -1449,11 +1469,34 @@ mod tests {
         let mut pb = PredicateSetBuilder::new(&s);
         let clauses: Vec<Vec<&str>> = names.iter().map(|n| vec![n.as_str()]).collect();
         pb.push(&clauses);
+        pb.push(&clauses[..3]);
         let preds = pb.finish();
         let mut bits = vec![0u64; s.n_labels()];
         let mut q = Compiled::new();
+        // After a narrow query (its masks set), the wide one has none: no stale clause bits,
+        // and the pair plan's checks and prices take the mask-free path (every clause on the
+        // row), whatever the clause positions.
+        q.compile(&s, preds.get(1), Weights::Unit, None, &mut bits);
+        assert_eq!((q.full_mask(), q.pair_check_mask(0, 2, true)), (7, Some(2)));
+        q.clear_bits(&mut bits);
         q.compile(&s, preds.get(0), Weights::Unit, None, &mut bits);
         assert!(!q.uses_bits() && bits.iter().all(|&b| b == 0));
+        assert_eq!((q.full_mask(), q.nav_mask), (0, 0));
+        assert_eq!(q.pair_check_mask(66, 69, true), None);
+        let row = super::super::cost::MemberWork::of_mask(&q, false, u64::MAX);
+        assert_eq!((row.words, row.prefetch, row.rows), (0.0, 1.0, 1.0));
+        let sb = LabelBitsets::build(&s, 1);
+        q.split_static(&s, &sb, 1, false);
+        for w in [
+            super::super::cost::MemberWork::of_mask(&q, true, u64::MAX),
+            super::super::cost::MemberWork::of_mask(&q, true, 1 << 63),
+            super::super::cost::MemberWork::of(&q, true, &[], false, true, false),
+        ] {
+            assert_eq!(
+                (w.words, w.prefetch, w.rows, w.class_rows),
+                (0.0, 1.0, 1.0, true)
+            );
+        }
         let cx = EvalCtx::new(&s, &q, &bits, &[], &[]);
         assert!(all_modes(&cx, 0, true).m && RowScan::full(&cx, 0));
         let p = all_modes(&cx, 1, true);

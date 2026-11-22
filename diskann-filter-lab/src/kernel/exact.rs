@@ -573,15 +573,11 @@ fn planned<T: Element, P: Eval>(
             let cands: &[u32] = single.unwrap_or(&mat.cands);
             toc(t, &mut ctr.t_cand_ns);
             ctr.n_exact_cand += cands.len() as u64;
-            let full = cx.q.full_mask();
-            let mask = if cover.exact {
-                full & !(1u64 << cover.i) & !(1u64 << cover.j)
-            } else {
-                full
-            };
-            if mask != 0 || !cx.q.uses_bits() {
+            // Without clause bits (more than 64 clauses) every clause is checked on the row.
+            let mask = cx.q.pair_check_mask(cover.i, cover.j, cover.exact);
+            if mask != Some(0) {
                 let t = tic(ctr);
-                filter_masked::<P>(cx, cands, mask, &mut mat.matches, ctr);
+                filter_masked::<P>(cx, cands, mask.unwrap_or(u64::MAX), &mut mat.matches, ctr);
                 toc(t, &mut ctr.t_check_ns);
                 let t = tic(ctr);
                 distances(&mat.matches, vectors, query, answers, seeded, ctr);
