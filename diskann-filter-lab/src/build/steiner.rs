@@ -16,7 +16,8 @@
 //!   gets one router over all of them (a posting scan expressed as graph expansion). With
 //!   `--partition kmeans` the tree is instead built top-down over the label's own members:
 //!   a node's members are split by k-means (k = min(b, ⌈m / b⌉), a few Lloyd iterations, seeded)
-//!   until at most `b` remain under a leaf router.
+//!   until at most `b` remain under a leaf router. With `--leaf-starts` a label of at most `b`
+//!   members gets no router at all: its members are its starts (no router vector, no row).
 //! - `connector`: for every selected label, one entry per source strongly connected component
 //!   of the subgraph its members induce (the member nearest to the component's centroid);
 //!   with several such components, a b-ary tree of routers over these entries whose root
@@ -176,6 +177,11 @@ pub struct SteinerArgs {
     /// `tree`: keep the label's previous starts next to its root.
     #[arg(long)]
     pub keep_starts: bool,
+    /// `tree`: a label of at most `--block` members gets no router; its members become its
+    /// starts (a tree of height zero: the one leaf router it would get stores no vector and
+    /// routes nothing). The kernel's tree route checks such a label's members directly.
+    #[arg(long)]
+    pub leaf_starts: bool,
     /// Leaf size of the shared spatial order (random-projection tree).
     #[arg(long, default_value_t = 64)]
     pub order_block: usize,
@@ -251,7 +257,8 @@ struct LabelRouters {
     label: u32,
     /// Per router: its children, and its vector (centroid) or the data point it copies.
     routers: Vec<(Vec<Child>, RouterVec)>,
-    /// Entries of the label that are data points (`connector` with one source component).
+    /// Entries of the label that are data points (`connector` with one source component;
+    /// `tree` with `--leaf-starts`: every member of a label of at most one block).
     point_starts: Vec<u32>,
 }
 
@@ -576,13 +583,16 @@ struct Assembled {
     /// `pairs`: the root of every directory slot's tree (`u32::MAX`: none).
     pair_roots: Vec<u32>,
     labels_with_routers: usize,
+    /// `tree` with `--leaf-starts`: labels whose starts are their members (no router).
+    labels_with_member_starts: usize,
     routers: usize,
     router_edges: u64,
 }
 
 /// The base graph's nodes (rows unchanged, ids kept), then the routers label by label (each
 /// label's root last). Per-label starts: `tree`: the root (and the base starts with
-/// `keep_starts`); `connector`: the base starts, then the root or the single source entry;
+/// `keep_starts`), or the members of a label without routers that has them as starts
+/// (`--leaf-starts`); `connector`: the base starts, then the root or the single source entry;
 /// labels without routers keep their base starts.
 #[expect(clippy::too_many_arguments, reason = "the assembly's inputs")]
 fn assemble<T: Element>(
@@ -628,6 +638,7 @@ fn assemble<T: Element>(
     let mut next = n0 as u32;
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let mut with_routers = vec![false; n_labels];
+    let mut with_member_starts = 0usize;
     let mut pair_roots = vec![u32::MAX; n_slots];
     let mut router_edges = 0u64;
     let mut nbr: Vec<u32> = Vec::new();
@@ -660,6 +671,11 @@ fn assemble<T: Element>(
                     if keep_starts {
                         pairs.extend(base_starts(l).iter().map(|&s| (l, s)));
                     }
+                } else if !lr.point_starts.is_empty() {
+                    // `--leaf-starts`: the members replace the label's base starts.
+                    with_routers[l as usize] = true;
+                    with_member_starts += 1;
+                    pairs.extend(lr.point_starts.iter().map(|&s| (l, s)));
                 }
             }
             Construction::Connector => {
@@ -689,7 +705,8 @@ fn assemble<T: Element>(
         graph: g,
         pairs,
         pair_roots,
-        labels_with_routers: with_routers.iter().filter(|&&x| x).count(),
+        labels_with_routers: with_routers.iter().filter(|&&x| x).count() - with_member_starts,
+        labels_with_member_starts: with_member_starts,
         routers: n_routers,
         router_edges,
     })
@@ -716,6 +733,10 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
     }
     let b = args.block.max(2);
     let max_size = parse_size(&args.max_size, n)?;
+    ensure!(
+        !args.leaf_starts || args.construction == Construction::Tree,
+        "--leaf-starts belongs to --construction tree"
+    );
     let px = match (args.construction, &args.pairs) {
         (Construction::Pairs, Some(p)) => {
             let px = PairIndex::read(p)?;
@@ -773,6 +794,13 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
                 Some(px) => px.slot_list(l as usize),
                 None => labels.postings(l),
             };
+            if args.leaf_starts && members.len() <= b {
+                return LabelRouters {
+                    label: l,
+                    routers: Vec::new(),
+                    point_starts: members.to_vec(),
+                };
+            }
             let (routers, point_starts) = label_routers(
                 args.construction,
                 g0,
@@ -814,6 +842,11 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
     let elem = std::mem::size_of::<T>();
     let r_max = a.graph.r_max();
     let (n_aux, router_edges) = (a.routers, a.router_edges);
+    let member_start_entries: usize = if args.construction == Construction::Tree {
+        per_label.iter().map(|lr| lr.point_starts.len()).sum()
+    } else {
+        0
+    };
     let meta = json!({
         "tool": "flab steiner",
         "dataset": args.dataset, "graph": args.graph, "starts": args.starts,
@@ -830,6 +863,9 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
         "labels_selected": selected.len(),
         "pairs": args.pairs, "pairs_with_trees": a.pair_roots.iter().filter(|&&r| r != u32::MAX).count(),
         "labels_with_routers": a.labels_with_routers,
+        "leaf_starts": args.leaf_starts,
+        "labels_with_member_starts": a.labels_with_member_starts,
+        "member_start_entries": member_start_entries,
         "routers": n_aux, "router_edges": router_edges,
         "label_start_entries": a.pairs.len(),
         "bytes": {
@@ -1122,6 +1158,66 @@ mod tests {
         let (_, _, kept) = augment(Construction::Tree, true);
         assert_eq!(starts_of(&kept, id("a=1"))[1..], [3]);
         assert_eq!(a.graph.starts(), &[12]);
+    }
+
+    #[test]
+    fn leaf_start_labels_get_their_members_as_starts_and_no_router() {
+        // `--leaf-starts` with b = 4: b=1 (3 members) has no router, its members replace its
+        // base start; a=1 (5 members) gets its tree as before.
+        let (base, g0, labels, st0) = toy();
+        let leaf: Vec<u32> = (0..12).collect();
+        let (mut row, mut local) = (vec![0f32; 1], vec![u32::MAX; 12]);
+        let id = |s: &str| labels.name_index()[s];
+        let per_label: Vec<LabelRouters> = ["a=1", "b=1"]
+            .iter()
+            .map(|s| {
+                let l = id(s);
+                let members = labels.postings(l);
+                if members.len() <= 4 {
+                    return LabelRouters {
+                        label: l,
+                        routers: Vec::new(),
+                        point_starts: members.to_vec(),
+                    };
+                }
+                let (routers, point_starts) = label_routers(
+                    Construction::Tree,
+                    &g0,
+                    &base,
+                    members,
+                    &leaf,
+                    4,
+                    RouterVector::Centroid,
+                    None,
+                    &mut row,
+                    &mut local,
+                );
+                LabelRouters {
+                    label: l,
+                    routers,
+                    point_starts,
+                }
+            })
+            .collect();
+        let a = assemble(
+            &g0,
+            &base,
+            labels.n_labels(),
+            &st0,
+            &per_label,
+            Construction::Tree,
+            false,
+            4,
+            0,
+        )
+        .unwrap();
+        // a=1: 5 members under 2 leaf routers and the root; b=1: none.
+        assert_eq!(a.routers, 3);
+        assert_eq!((a.labels_with_routers, a.labels_with_member_starts), (1, 1));
+        assert_eq!(starts_of(&a, id("b=1")), [0, 1, 2]);
+        let s = starts_of(&a, id("a=1"));
+        assert_eq!(s.len(), 1);
+        assert_eq!(reached(&a.graph, s[0]).0, [0, 3, 6, 9, 11]);
     }
 
     #[test]

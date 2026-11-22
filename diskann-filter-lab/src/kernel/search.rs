@@ -1483,7 +1483,9 @@ impl Searcher {
 
     /// Whether query `q` is tree-eligible: every label of its binding clause (the first clause
     /// of the query compiled by the tree plan, the one `label(c*)` starts from) has points
-    /// only if its per-label starts are all auxiliary nodes (the roots of its router trees).
+    /// only if its per-label starts are all auxiliary nodes (the roots of its router trees) or
+    /// are exactly its members (a label of at most one block without routers, `flab steiner
+    /// --leaf-starts`).
     fn tree_eligible<T: Element>(
         &mut self,
         tp: &Plan,
@@ -1506,7 +1508,7 @@ impl Searcher {
             ix.labels.posting_len(l) == 0
                 || ((l as usize) < t.n_labels() && {
                     let s = t.label_starts(l);
-                    !s.is_empty() && s.iter().all(|&v| v >= n)
+                    !s.is_empty() && (s.iter().all(|&v| v >= n) || s == ix.labels.postings(l))
                 })
         })
     }
@@ -2830,6 +2832,19 @@ impl<T: Element, P: Eval, S: Score> Run<'_, '_, T, P, S> {
             self.navigate_aux::<true>(s, None, cached, c);
             return;
         }
+        if self.router_frontier {
+            // A member start of a label without routers (`flab steiner --leaf-starts`): checked,
+            // measured and collected when it matches; a frontier of routers never lists members.
+            let p = self.pred(s, c);
+            if p.m {
+                let d = self.distance(s, cached, c);
+                self.collect::<true>(s, d, p, c);
+                self.trace_only::<true>(s, None, Some(d), Some(p), "collected");
+            } else {
+                self.trace_only::<true>(s, None, None, Some(p), "rejected");
+            }
+            return;
+        }
         match (self.start_admission, self.laziness) {
             (_, Laziness::Deferred) => {
                 let d = self.distance(s, cached, c);
@@ -3223,7 +3238,13 @@ fn run<T: Element, P: Eval, S: Score>(
     let sc = S::new(&plan.score_params(compiled, &scales));
     let mut beam = std::mem::take(S::beam(beam32, beam64));
 
-    let n_starts = starts.len();
+    // A frontier of routers lists no member start (`offer_start_into`), so only the router
+    // starts pad it.
+    let n_starts = if kernel.expander == Expander::AuxFrontier {
+        starts.iter().filter(|&&s| s >= n_data).count()
+    } else {
+        starts.len()
+    };
     let (capacity, mut view) = match (reference, kernel.padding) {
         (Some(_), _) => (l.max(n_starts).max(1), usize::MAX),
         (None, Padding::Upstream) => (l + n_starts, l),

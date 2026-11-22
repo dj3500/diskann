@@ -1099,6 +1099,95 @@ fn the_tree_route_serves_tree_eligible_queries() {
 }
 
 #[test]
+fn a_label_whose_starts_are_its_members_takes_the_tree_route() {
+    // `flab steiner --leaf-starts`: `x=2` (members 1 and 3) has no router, its starts are its
+    // members; `x=1` (members 0, 2, 4) has a router (id 5); `w=1` (members 0 and 4) has only
+    // one of its members as a start (as a base start table may): not eligible.
+    let rows: &[&[&str]] = &[
+        &["x=1", "w=1", "v=1"],
+        &["x=2"],
+        &["x=1"],
+        &["x=2", "v=1"],
+        &["x=1", "w=1", "v=1"],
+    ];
+    let (base, mut g, labels) = line(rows, true);
+    g.set_neighbors(5, &[0, 2, 4]).unwrap();
+    let id = |s: &str| labels.name_index()[s];
+    let mut st = Starts::new(&g);
+    st.set_label_starts(
+        &labels,
+        &[
+            (id("x=1"), 5),
+            (id("x=2"), 1),
+            (id("x=2"), 3),
+            (id("w=1"), 4),
+        ],
+    )
+    .unwrap();
+    let ix = Index {
+        graph: &g,
+        vectors: g.vectors(&base).unwrap(),
+        labels: &labels,
+        global: &[0],
+        label_starts: Some(&st),
+        sample: None,
+        label_view: false,
+        view_postings: None,
+        eps_min: 0.5,
+        bitsets: None,
+        costs: None,
+        sketches: None,
+        pairs: None,
+        islands: None,
+        pair_roots: None,
+    };
+    let mut pb = PredicateSetBuilder::new(&labels);
+    pb.push(&[vec!["x=2"]]);
+    pb.push(&[vec!["x=2"], vec!["v=1"]]);
+    pb.push(&[vec!["x=1", "x=2"]]);
+    pb.push(&[vec!["w=1"]]);
+    let preds = pb.finish();
+    // A router frontier (fixed effort): member starts are checked and only matches measured.
+    let k = kernel(&[
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("tree_route", "row_scan"),
+        ("tree_effort", "fixed(1)"),
+    ]);
+    let plan = Plan::new(&k, &ix).unwrap();
+    let mut s = Searcher::for_index(&ix, &[&plan]);
+    let mut run = |qi: usize, k: usize| {
+        let (mut ids, mut d) = (vec![0u32; k], vec![0f32; k]);
+        let q = Query {
+            vector: &[3.2f32],
+            cnf: preds.get(qi),
+            view: None,
+        };
+        let ctr = s.search(&plan, &ix, &q, 4, &mut ids, &mut d, None);
+        (ids, ctr)
+    };
+    let (ids, ctr) = run(0, 2);
+    assert_eq!(ids, [3, 1]);
+    assert_eq!(ctr.route, Route::Tree);
+    assert_eq!((ctr.n_expand, ctr.n_aux_expand, ctr.n_dist), (0, 0, 2));
+    // With a second clause only the matching member (3) is measured.
+    let (ids, ctr) = run(1, 2);
+    assert_eq!(ids, [3, u32::MAX]);
+    assert_eq!(ctr.route, Route::Tree);
+    assert_eq!((ctr.n_pred, ctr.n_dist), (2, 1));
+    // A clause with a tree and member starts: the router frontier (list 1 plus its one router
+    // start) expands the router; the member starts are collected besides; every point found.
+    let (ids, ctr) = run(2, 5);
+    assert_eq!(ids, [3, 4, 2, 1, 0]);
+    assert_eq!(ctr.route, Route::Tree);
+    assert_eq!((ctr.n_expand, ctr.n_aux_expand), (1, 1));
+    // Starts that are not all of the label's members: not eligible.
+    let (ids, ctr) = run(3, 2);
+    assert_eq!(ids, [4, 0]);
+    assert_eq!(ctr.route, Route::Graph);
+}
+
+#[test]
 fn the_static_bits_tree_route_checks_only_the_other_clauses() {
     // A router (id 5) over the members 0, 2 and 4 of `x=1` (c*: 3 points vs `y=1`'s 4) is
     // that label's only start; the members 0 and 4 also carry `y=1`.
