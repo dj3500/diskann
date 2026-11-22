@@ -1290,7 +1290,9 @@ pub enum PairAlternative {
 /// Without fixed trees the curves' alternative is any label's tree and the analytic pricing's the
 /// router alone. Under the kernel's prices ([`KernelRoutes`]) the alternative is the kernel's: the
 /// smaller label's fixed tree where it has one (a pair with as many points as that label is never
-/// routed to, and has no value), else the graph route; a negative saving is none (the
+/// routed to, and has no value, but stays a candidate: the candidates' labels make the stored
+/// pairs' big labels, whose co-occurrence the kernel's cover reads), else the graph route; a
+/// negative saving is none (the
 /// cost-checked route does not take the pair tree there). The greedy then values the
 /// base-derived part on the sampled queries ([`LabelKind::derived_queries`]) where they hold
 /// the pair's context, and by these closed-form terms only where they do not.
@@ -1313,11 +1315,13 @@ pub fn pair_tree_values(
                 // has one (taken whatever it costs), else the graph route; the pair tree is
                 // taken only where cheaper (and, against a label tree, only with fewer members).
                 let tree = s < pr.n && tree_max.is_some_and(|m| s <= m);
-                if tree && p.joint as usize >= s {
-                    return None;
-                }
                 let pair = pr.pair_tree(j);
-                let alt = if tree {
+                let alt = if tree && p.joint as usize >= s {
+                    // Never routed to (a pair tree with as many points as the label's tree): no
+                    // value, but still a candidate — the candidates' labels are the stored
+                    // pairs' big labels, whose co-occurrence the kernel's cover reads.
+                    pair
+                } else if tree {
                     pr.tree_pair_label(s as f64, j)
                 } else if pr.route_check_graph(j).is_some_and(|g| pair >= g) {
                     // The route check keeps the context on its graph route.
@@ -2263,7 +2267,7 @@ mod tests {
             let small = s.posting_len(p.a).min(s.posting_len(p.b));
             let v = values.iter().find(|v| v.cand == *p);
             if small <= cap && p.joint as usize >= small {
-                assert!(v.is_none(), "{p:?}");
+                assert_eq!(v.expect("a candidate").saving_ns, 0.0, "{p:?}");
                 seen[0] += 1;
                 continue;
             }
@@ -2281,9 +2285,12 @@ mod tests {
             seen[1 + usize::from(want > 0.0)] += 1;
         }
         assert!(seen.iter().all(|&x| x > 0), "{seen:?}");
-        assert!(!values
+        // Every candidate stays one (its labels are the stored pairs' big labels).
+        assert_eq!(values.len(), cands.len());
+        let tr_c3 = (id("c3").min(id("tr")), id("c3").max(id("tr")));
+        assert!(values
             .iter()
-            .any(|v| (v.cand.a, v.cand.b) == (id("c3").min(id("tr")), id("c3").max(id("tr")))));
+            .any(|v| (v.cand.a, v.cand.b) == tr_c3 && v.saving_ns == 0.0));
         // The independent queries: a pair tree serves a query whose binding label has a tree
         // only with fewer members than that label, one without only below its graph route as
         // the run plans it (the route check), and lowers a query's cost only where it is
