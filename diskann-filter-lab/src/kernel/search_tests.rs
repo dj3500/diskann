@@ -3967,3 +3967,68 @@ fn the_cost_tree_route_takes_wide_predicates() {
     assert_eq!(answers[2], answers[0]);
     assert_eq!(answers[3], answers[1]);
 }
+
+/// `price_second_search = "on"` adds the nominal cost of `by_rate_both_k`'s second search (a
+/// list of `K` from the configured starts) to the post-filter price of broad predicates only,
+/// and changes nothing else.
+#[test]
+fn price_second_search_prices_the_broad_post_filter_route_only() {
+    use super::cost::UnitCosts;
+    let f = fixture(300, 17, false);
+    // An expensive exact path: the crossover prices the graph routes of both predicates.
+    let costs = UnitCosts {
+        dist_ns: vec![1e4; 6],
+        pred_ns: vec![1e4; 6],
+        ..UnitCosts::default()
+    };
+    let ix = Index {
+        costs: Some(&costs),
+        ..f.index()
+    };
+    let mut pb = PredicateSetBuilder::new(&f.labels);
+    // Broad (half of the points: global starts, then the second search) and selective.
+    pb.push(&[vec!["c=0"]]);
+    pb.push(&[vec!["a=0"], vec!["b=1"]]);
+    let preds = pb.finish();
+    let edits = [
+        ("starts", "label(c*)+global"),
+        ("collector", "heap"),
+        ("laziness", "heap_bound"),
+        ("exact", "planned"),
+        ("crossover", "cost"),
+        ("postfilter", "always"),
+        ("postfilter_starts", "by_rate_both_k"),
+    ];
+    let off = kernel(&edits);
+    let on = kernel(&[&edits[..], &[("price_second_search", "on")]].concat());
+    assert_eq!(on.to_json()["price_second_search"], "on");
+    assert!(off.to_json().get("price_second_search").is_none());
+    let mut wrong = kernel(&[]);
+    wrong.set("price_second_search", "on").unwrap();
+    assert!(wrong.validate().is_err());
+    let run = |k: &Kernel, qi: usize| {
+        let plan = Plan::new(k, &ix).unwrap();
+        let mut st = Searcher::for_index(&ix, &[&plan]);
+        let (mut ids, mut d) = (vec![0u32; 10], vec![0f32; 10]);
+        let q = Query {
+            vector: f.queries.row(0),
+            cnf: preds.get(qi),
+            view: None,
+        };
+        let ctr = st.search(&plan, &ix, &q, 10, &mut ids, &mut d, None);
+        (ids, ctr)
+    };
+    let (a, ca) = run(&off, 0);
+    let (b, cb) = run(&on, 0);
+    let rate = f.labels.posting_len(f.labels.name_index()["c=0"]) as f64 / 300.0;
+    assert!(rate >= super::cost::BROAD_RATE);
+    // Two configured starts: c=0's label start and the global one.
+    let second = costs.postfilter_cost(10.0, 10, rate) + 2.0 * costs.graph_dist_ns;
+    let extra = cb.est_graph_ns as f64 - ca.est_graph_ns as f64;
+    assert!((extra - second).abs() <= 1.0, "{extra} vs {second}");
+    if ca.route == cb.route {
+        assert_eq!(a, b);
+    }
+    // The selective predicate searches from its label starts: no second search, no change.
+    assert_eq!(run(&off, 1), run(&on, 1));
+}

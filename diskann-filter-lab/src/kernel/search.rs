@@ -16,8 +16,8 @@ use super::{
         Admission, Expander, Family, Kernel, Laziness, Padding, PredicateMode, Preset, Scorer,
     },
     config::{
-        Crossover, EstimateSource, ExactChecks, PostfilterRoute, RowReads, StartAdmission,
-        StartSource, Terminator, TreeChoice, TreeEffort, TreePairs, TreeRoute,
+        Crossover, EstimateSource, ExactChecks, PostfilterRoute, PostfilterStarts, RowReads,
+        StartAdmission, StartSource, Terminator, TreeChoice, TreeEffort, TreePairs, TreeRoute,
     },
     cost::{
         kth_match_rank, l_multiplier, Estimates, ExactPlan, MemberWork, PlanInputs, UnitCosts, Z,
@@ -1338,9 +1338,15 @@ impl Searcher {
                 global_starts
             }
         };
+        // `price_second_search`: the second search of `by_rate_both*` from the configured starts.
+        let pf_second = |rate: f64| {
+            (kernel.price_second_search && kernel.postfilter_starts.both_at(rate))
+                .then_some((kernel.postfilter_starts, configured_starts))
+        };
         if kernel.postfilter != PostfilterRoute::Off {
             let rate = bounds.m / bounds.n;
-            g0 = g0.min(postfilter_option(costs, l0, k, rate, n, pf_starts(rate)).1);
+            g0 = g0
+                .min(postfilter_option(costs, l0, k, rate, n, pf_starts(rate), pf_second(rate)).1);
         }
         let pi = PlanInputs {
             q: &self.compiled,
@@ -1440,7 +1446,8 @@ impl Searcher {
         // The post-filter alternative at a list size that holds the K nearest matches.
         let mut postfilter = false;
         if kernel.postfilter != PostfilterRoute::Off {
-            let (l_pf, g_pf) = postfilter_option(costs, l_run, k, rate, n, pf_starts(rate));
+            let (l_pf, g_pf) =
+                postfilter_option(costs, l_run, k, rate, n, pf_starts(rate), pf_second(rate));
             if g_pf.is_finite()
                 && (kernel.postfilter == PostfilterRoute::Always || hopeless || g_pf <= g)
             {
@@ -1453,7 +1460,7 @@ impl Searcher {
         if let Some(isl) = ix.islands {
             if let Some((i, s)) = island_choice(&self.compiled, isl, ix.labels) {
                 let rate_in = (est.m / s as f64).clamp(0.0, 1.0);
-                let (l_is, g_is) = postfilter_option(costs, l_base, k, rate_in, s, 1);
+                let (l_is, g_is) = postfilter_option(costs, l_base, k, rate_in, s, 1, None);
                 if g_is.is_finite() && g_is < g {
                     island = Some((i, l_is));
                     g = g_is;
@@ -2182,7 +2189,9 @@ fn effort_l(costs: &UnitCosts, effort: usize, k: usize, rate: f64, n: usize, cap
 /// `l`, and large enough for the search to evaluate as many nodes as the rank of the `K`-th
 /// match at the match rate with `Z` standard deviations, so that the `K` nearest matches are
 /// evaluated with high probability without label starts; at most `n`) and its nominal cost
-/// with `starts` start nodes (infinite without matches).
+/// with `starts` start nodes (infinite without matches). `second = Some((policy, starts₂))`
+/// adds the nominal cost of the second search of `by_rate_both*` (`price_second_search`): its
+/// list size `policy.second_list(l_pf, K)` from `starts₂` starts.
 fn postfilter_option(
     costs: &UnitCosts,
     l: usize,
@@ -2190,13 +2199,19 @@ fn postfilter_option(
     rate: f64,
     n: usize,
     starts: usize,
+    second: Option<(PostfilterStarts, usize)>,
 ) -> (usize, f64) {
     if !kth_match_rank(k, rate, Z).is_finite() {
         return (l, f64::INFINITY);
     }
     let l_pf = rank_l(costs, k, rate, n).max(l).min(n.max(1));
     let starts = starts as f64 * costs.graph_dist_ns;
-    (l_pf, costs.postfilter_cost(l_pf as f64, k, rate) + starts)
+    let mut cost = costs.postfilter_cost(l_pf as f64, k, rate) + starts;
+    if let Some((policy, starts2)) = second {
+        let l2 = policy.second_list(l_pf, k);
+        cost += costs.postfilter_cost(l2 as f64, k, rate) + starts2 as f64 * costs.graph_dist_ns;
+    }
+    (l_pf, cost)
 }
 
 /// The list size at which a graph search evaluates as many nodes as the rank of the `K`-th match
@@ -3408,6 +3423,42 @@ mod tests {
         assert_eq!(adaptive_l(100, 0, 0, 16.0), 1600);
         assert_eq!(adaptive_l(100, 1000, 1, 4.0), 400);
         assert_eq!(adaptive_l(100, 1000, 10, 1.5), 150);
+    }
+
+    #[test]
+    fn the_second_search_of_by_rate_both_k_is_priced_only_when_asked() {
+        let c = UnitCosts::default();
+        let (l, k, rate, n) = (200, 10, 0.6, 100_000);
+        let (l_pf, one) = postfilter_option(&c, l, k, rate, n, 1, None);
+        assert_eq!(l_pf, 200);
+        let (l2, both) = postfilter_option(
+            &c,
+            l,
+            k,
+            rate,
+            n,
+            1,
+            Some((PostfilterStarts::ByRateBothK, 3)),
+        );
+        // The same list; plus a list-K search from three starts.
+        assert_eq!(l2, l_pf);
+        let second = c.postfilter_cost(k as f64, k, rate) + 3.0 * c.graph_dist_ns;
+        assert!(
+            (both - one - second).abs() < 1e-6 * both,
+            "{both} {one} {second}"
+        );
+        // `by_rate_both`: the second search at the first one's list size.
+        let (_, both_l) = postfilter_option(
+            &c,
+            l,
+            k,
+            rate,
+            n,
+            1,
+            Some((PostfilterStarts::ByRateBoth, 3)),
+        );
+        let second_l = c.postfilter_cost(l_pf as f64, k, rate) + 3.0 * c.graph_dist_ns;
+        assert!((both_l - one - second_l).abs() < 1e-6 * both_l);
     }
 
     #[test]

@@ -461,6 +461,11 @@ pub struct Kernel {
     pub phase_times: bool,
     pub postfilter: PostfilterRoute,
     pub postfilter_starts: PostfilterStarts,
+    /// `price_second_search = "on"`: the post-filter route's price includes the second search of
+    /// `by_rate_both*` (its nominal cost at its list size from the configured starts, an upper
+    /// bound: it shares the first search's visited nodes) wherever the route runs one. Off by
+    /// default (the first search only, as before).
+    pub price_second_search: bool,
     /// The cost crossovers route to the exact path when the planned graph search is hopeless
     /// (fewer than one match met at the upper confidence bound of the match count; A1c);
     /// `off` for the ablation. Inert under the graph crossover.
@@ -726,6 +731,7 @@ impl Default for Kernel {
             phase_times: false,
             postfilter: PostfilterRoute::Off,
             postfilter_starts: PostfilterStarts::Global,
+            price_second_search: false,
             hopeless_gate: true,
             row_reads: RowReads::Clause,
             row_prefetch: false,
@@ -1238,6 +1244,13 @@ impl Kernel {
             }
             "postfilter" => self.postfilter = PostfilterRoute::parse(value)?,
             "postfilter_starts" => self.postfilter_starts = PostfilterStarts::parse(value)?,
+            "price_second_search" => {
+                self.price_second_search = match value.trim() {
+                    "on" => true,
+                    "off" => false,
+                    v => bail!("unknown price_second_search {v:?} (on, off)"),
+                }
+            }
             "hopeless_gate" => {
                 self.hopeless_gate = match value.trim() {
                     "on" => true,
@@ -1472,6 +1485,15 @@ impl Kernel {
                 "the post-filter route needs a cost crossover (its estimates and costs)"
             );
         }
+        ensure!(
+            !self.price_second_search
+                || (self.postfilter != PostfilterRoute::Off
+                    && matches!(
+                        self.postfilter_starts,
+                        PostfilterStarts::ByRateBoth | PostfilterStarts::ByRateBothK
+                    )),
+            "price_second_search = \"on\" needs the post-filter route with postfilter_starts = by_rate_both or by_rate_both_k (the only ones with a second search)"
+        );
         if let PredicateMode::StaticBits(t) = self.predicate {
             ensure!(t >= 1, "static_bits(θ) needs θ >= 1");
         }
@@ -1583,6 +1605,9 @@ impl Kernel {
         }
         if self.postfilter_starts != PostfilterStarts::Global {
             j["postfilter_starts"] = json!(self.postfilter_starts.to_string());
+        }
+        if self.price_second_search {
+            j["price_second_search"] = json!("on");
         }
         if !self.hopeless_gate {
             j["hopeless_gate"] = json!("off");
