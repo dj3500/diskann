@@ -36,8 +36,8 @@
 //! own, `FLABPRV\0` followed by the JSON object; the pair contexts of `flab select`
 //! (`SELCAND3`) after their records; JSON outputs (calibrations, selections, `flab steiner`'s
 //! `meta.json`) under the key `provenance`; label lists (`trees.txt`) in a first comment line
-//! `# provenance {…}`. `flab provenance` prints the fingerprints of a dataset and a graph;
-//! `flab info` prints a file's recorded provenance.
+//! `# provenance {…}`. `flab provenance` prints the fingerprints of a dataset and a graph, and
+//! with `--file` what a file records.
 //!
 //! **What is compared**: the label store for every file; the graph's data part for
 //! calibrations (unit costs and effort curves are those of the data points' graph, shared by its
