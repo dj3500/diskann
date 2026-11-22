@@ -21,10 +21,12 @@
 //! **Costs** (ns, the kernel's unit costs):
 //!
 //! - router: its post-filter route at the query's match rate `M/n` with the list that finds the
-//!   `K`-th match at the reference recall `R` — the kernel's effort curve (`effort_list(R, k')`,
-//!   the calibrated unfiltered list for recall `R` at `k'` neighbours) at the rank of the `K`-th
-//!   match, `k' = K/rate + z·√(K(1 − rate))/rate` (the graph route is not modelled; without an
-//!   effort curve, the islands' `postfilter_nominal`);
+//!   `K`-th match at the reference recall `R` — the kernel's effort curve
+//!   (`effort_list_grown(R, k')`, the calibrated unfiltered list for recall `R` at `k'`
+//!   neighbours, growing past the measured range beyond the largest calibrated `k'`, as before
+//!   the kernel's cap after that growth) at the rank of the `K`-th match,
+//!   `k' = K/rate + z·√(K(1 − rate))/rate` (the graph route is not modelled; without an effort
+//!   curve, the islands' `postfilter_nominal`);
 //! - tree route over `s` members of which `M` match: `E` router expansions, each checking the
 //!   router's `b̄` children against the query's other clauses, computing a distance for the
 //!   matching ones and one for the router: `E·(b̄·check + b̄·(M/s)·dist + graph_dist)`, the members'
@@ -114,7 +116,7 @@ impl TreeModel {
         if !rank.is_finite() {
             return f64::INFINITY;
         }
-        match c.effort_list(self.recall, rank) {
+        match c.effort_list_grown(self.recall, rank) {
             Some(l) => {
                 let l = l.max(self.k as f64).min(n as f64);
                 c.postfilter_cost(l, self.k, rate) + c.graph_dist_ns

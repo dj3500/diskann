@@ -31,7 +31,7 @@ use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 
 use super::{
-    effort::{fit_table, midpoint, Dist, K_GRID, R_GRID},
+    effort::{fit_table, midpoint, tie_capped_hits, Dist, K_GRID, R_GRID},
     Rng,
 };
 use crate::{
@@ -237,14 +237,12 @@ fn class_curve<T: Element>(
             let c = st.search(&plan, ix, &query, l, &mut ids, &mut ds, None);
             n_dist[li] += c.n_dist as f64;
             n_aux[li] += c.n_aux_expand as f64;
-            // Tie-aware recall@K': answers within the K'-th true distance.
+            // Recall@K' as the evaluator counts it.
             for (row, &kp) in recall.iter_mut().zip(&ks) {
                 if d_gt.len() < kp {
                     continue;
                 }
-                let bound = d_gt[kp - 1];
-                let hits = ds[..kp].iter().filter(|&&d| d <= bound).count();
-                row[li] += hits as f64 / kp as f64;
+                row[li] += tie_capped_hits(&ds[..kp], &d_gt[..kp]) as f64 / kp as f64;
             }
         }
         for (row, &c) in recall.iter_mut().zip(&count) {

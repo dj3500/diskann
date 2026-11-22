@@ -1561,6 +1561,8 @@ fn the_tree_effort_curve_sets_the_tree_list_size() {
         effort_r: vec![0.5, 0.9],
         effort_k: vec![10.0, 100.0],
         effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        // Measured far beyond the table: no list is cut.
+        effort_l_top: 1e9,
         tree_r: vec![0.5, 0.9],
         tree_k: vec![1.0, 100.0],
         tree_l: vec![vec![1.0, 1.0], vec![2.0, 2.0]],
@@ -1730,6 +1732,8 @@ fn the_capped_tree_effort_bounds_diluted_queries() {
         effort_r: vec![0.5, 0.9],
         effort_k: vec![10.0, 100.0],
         effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        // Measured far beyond the table: no list is cut.
+        effort_l_top: 1e9,
         tree_r: vec![0.5, 0.9],
         tree_k: vec![1.0, 100.0],
         tree_l: vec![vec![1.2, 120.0], vec![1.2, 120.0]],
@@ -1787,6 +1791,8 @@ fn tree_choice_cost_takes_the_tree_route_only_when_it_is_cheaper() {
         effort_r: vec![0.5, 0.9],
         effort_k: vec![10.0, 100.0],
         effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        // Measured far beyond the table: no list is cut.
+        effort_l_top: 1e9,
         tree_r: vec![0.5, 0.9],
         tree_k: vec![1.0, 100.0],
         tree_l: vec![vec![1.2, 120.0], vec![1.2, 120.0]],
@@ -2785,6 +2791,8 @@ fn the_effort_curve_plans_the_list_size_from_the_match_rate() {
         effort_r: vec![0.5, 0.9],
         effort_k: vec![10.0, 100.0],
         effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        // Measured far beyond the table: no list is cut.
+        effort_l_top: 1e9,
         pred_ns: vec![1e9; 6],
         dist_ns: vec![1e9; 6],
         ..UnitCosts::default()
@@ -2829,7 +2837,48 @@ fn the_effort_curve_plans_the_list_size_from_the_match_rate() {
         let kprime = 10.0 * 300.0 / ctr.m_hat as f64;
         let want = costs.effort_list(0.7, kprime).unwrap().ceil().min(300.0) as u64;
         assert_eq!(ctr.final_l, want + ctr.n_start, "q={q}");
+        assert_eq!(ctr.list_capped, 0, "q={q}");
     }
+    // Measured up to L = 50 only: the lists of selective queries (their growth beyond K' = 100
+    // passes it) are cut there, and counted.
+    let capped = UnitCosts {
+        effort_l_top: 50.0,
+        ..costs.clone()
+    };
+    let ix50 = Index {
+        costs: Some(&capped),
+        ..ix
+    };
+    let plan50 = Plan::new(&k, &ix50).unwrap();
+    let mut st = Searcher::for_index(&ix50, &[&plan50]);
+    let mut hits = 0;
+    for q in 0..f.preds.len() {
+        let (_, ctr) = search_ix(&f, &ix50, &mut st, &plan50, q, 700, 10);
+        if ctr.m_hat == 0 {
+            continue;
+        }
+        let kprime = 10.0 * 300.0 / ctr.m_hat as f64;
+        let (l, raw) = capped.effort_list_capped(0.7, kprime).unwrap();
+        let (l, raw) = ((l.ceil() as u64).min(300), (raw.ceil() as u64).min(300));
+        assert_eq!(ctr.final_l, l + ctr.n_start, "q={q}");
+        assert!(l <= 50, "q={q}");
+        assert_eq!(ctr.list_capped, u64::from(raw > l), "q={q}");
+        hits += usize::from(raw > l);
+    }
+    assert!(hits > 0);
+    // A calibration without its largest measured list size plans nothing from the curve.
+    let unknown = UnitCosts {
+        effort_l_top: 0.0,
+        ..costs.clone()
+    };
+    let ix0 = Index {
+        costs: Some(&unknown),
+        ..ix
+    };
+    let Err(e) = Plan::new(&k, &ix0) else {
+        panic!("a calibration without effort_l_top is refused")
+    };
+    assert!(e.to_string().contains("effort_l_top"), "{e}");
     // Without a curve, the plan is rejected.
     let ix0 = Index {
         costs: Some(&free_graph_costs()),
@@ -2982,6 +3031,8 @@ fn the_graph_crossover_never_takes_the_exact_path() {
         effort_r: vec![0.5, 0.9],
         effort_k: vec![10.0, 100.0],
         effort_l: vec![vec![10.0, 40.0], vec![40.0, 160.0]],
+        // Measured far beyond the table: no list is cut.
+        effort_l_top: 1e9,
         ..UnitCosts::default()
     };
     let ix = Index {

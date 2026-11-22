@@ -212,6 +212,10 @@ pub struct Counters {
     pub t_decide_ns: u64,
     /// Directory lookups in the combination postings (the `pair` plan's clause pair).
     pub n_pair_lookups: u64,
+    /// `effort_curve`: 1 when the query's planned list was cut at the effort curve's largest
+    /// measured list size (a list-limit hit: its target recall, or its growth with `K / r̂`,
+    /// lies beyond the measured curve), else 0.
+    pub list_capped: u64,
     /// The phase timers are on (set per query; not a counter).
     pub timing: bool,
 }
@@ -250,7 +254,7 @@ impl Counters {
     }
 
     /// Names of the numeric counters, in [`Self::values`] order.
-    pub const NAMES: [&'static str; 39] = [
+    pub const NAMES: [&'static str; 40] = [
         "n_dist",
         "n_pred",
         "n_expand",
@@ -290,10 +294,11 @@ impl Counters {
         "t_decide_ns",
         "n_late",
         "n_pair_lookups",
+        "list_capped",
     ];
 
     /// The numeric counters, in [`Self::NAMES`] order.
-    pub fn values(&self) -> [u64; 39] {
+    pub fn values(&self) -> [u64; 40] {
         [
             self.n_dist,
             self.n_pred,
@@ -334,6 +339,7 @@ impl Counters {
             self.t_decide_ns,
             self.n_late,
             self.n_pair_lookups,
+            self.list_capped,
         ]
     }
 }
@@ -518,6 +524,10 @@ impl Plan {
             ensure!(
                 costs.as_ref().is_some_and(|c| !c.effort_r.is_empty()),
                 "effort_curve needs unit costs with an effort curve (effort_r, effort_k, effort_l)"
+            );
+            ensure!(
+                costs.as_ref().is_some_and(|c| c.effort_l_top > 0.0),
+                "effort_curve needs the effort curve's largest measured list size (effort_l_top), which this calibration does not record (nor details.effort.l): recalibrate, or add `effort_l_top` (the largest list size the curve was measured at) to its unit costs"
             );
         }
         if matches!(kernel.tree_effort, TreeEffort::Curve | TreeEffort::Capped) {
@@ -1325,7 +1335,11 @@ impl Searcher {
         let bounds = Estimates::from_bounds(&self.compiled, n);
         // The cheapest graph search: the list size of an unselective query.
         let l0 = match kernel.terminator {
-            Terminator::EffortCurve { .. } => effort_l(costs, l, k, 1.0, n, f64::INFINITY),
+            Terminator::EffortCurve { .. } => {
+                let (l0, capped) = effort_l(costs, l, k, 1.0, n, f64::INFINITY);
+                ctr.list_capped = u64::from(capped);
+                l0
+            }
             _ => l,
         };
         let mut g0 = costs.graph_cost(l0 as f64, k, bounds.m / bounds.n, kernel.laziness) + starts;
@@ -1415,7 +1429,11 @@ impl Searcher {
         };
         let rate = if est.n > 0.0 { est.m / est.n } else { 0.0 };
         let mut l_plan = match kernel.terminator {
-            Terminator::EffortCurve { cap } => effort_l(costs, l, k, rate, n, cap),
+            Terminator::EffortCurve { cap } => {
+                let (l_plan, capped) = effort_l(costs, l, k, rate, n, cap);
+                ctr.list_capped |= u64::from(capped);
+                l_plan
+            }
             _ => planned_l(l, &est, scale),
         };
         // `inline_rank`: the inline search must evaluate as many nodes as the rank of the K-th
@@ -2164,25 +2182,36 @@ pub(super) fn tree_route_option(
 
 /// `effort_curve(cap)`: the calibrated unfiltered list size for the target recall `effort / 1000`
 /// at `K / rate` neighbours (at most `n`; `n` without matches), at most `cap` times the list
-/// size at `K` neighbours.
-fn effort_l(costs: &UnitCosts, effort: usize, k: usize, rate: f64, n: usize, cap: f64) -> usize {
+/// size at `K` neighbours; and whether the curve's largest measured list size cut it (a
+/// list-limit hit, [`UnitCosts::effort_list_capped`]).
+fn effort_l(
+    costs: &UnitCosts,
+    effort: usize,
+    k: usize,
+    rate: f64,
+    n: usize,
+    cap: f64,
+) -> (usize, bool) {
     let n = n.max(1) as f64;
     let r = effort as f64 / 1000.0;
+    // The list and the list without the cut at the largest measured list size.
     let curve = |kprime: f64| {
         costs
-            .effort_list(r, kprime)
-            .expect("validated: effort_curve has a curve")
+            .effort_list_capped(r, kprime)
+            .expect("validated: effort_curve has a curve and its largest measured list")
     };
-    let mut l = if rate > 0.0 {
+    let (mut l, mut raw) = if rate > 0.0 {
         curve(k.max(1) as f64 / rate.min(1.0))
     } else {
-        n
+        (n, n)
     };
     if cap.is_finite() {
         // At most `cap` times the list size of an unselective query (r̂ = 1).
-        l = l.min(cap * curve(k.max(1) as f64));
+        let (at_k, raw_at_k) = curve(k.max(1) as f64);
+        (l, raw) = (l.min(cap * at_k), raw.min(cap * raw_at_k));
     }
-    l.ceil().clamp(1.0, n) as usize
+    let size = |x: f64| x.ceil().clamp(1.0, n) as usize;
+    (size(l), size(raw) > size(l))
 }
 
 /// The post-filter alternative of a graph search with list size `l`: its list size (at least

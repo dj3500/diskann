@@ -934,6 +934,30 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                             "note": "target recalls beyond the measured effort curve at K or more neighbours (K / estimated match rate): those lists are capped at its largest measured list size"}),
                     );
                 }
+                // Per effort, the rows whose planned list was cut at the curve's largest measured
+                // list size (`list_capped`; the recall above, or the growth with K / r̂).
+                let hits: serde_json::Map<String, Value> = summary
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(e, v)| {
+                        let n = v["list_limit_hits"].as_u64().unwrap_or(0);
+                        (n > 0).then(|| (e.clone(), json!(n)))
+                    })
+                    .collect();
+                if !hits.is_empty() {
+                    eprintln!(
+                        "warning: config {:?}, K = {k}: planned lists cut at the effort curve's largest measured list L = {} (rows per effort, rep 0): {}",
+                        c.name,
+                        costs.effort_l_top,
+                        Value::Object(hits.clone())
+                    );
+                    put(
+                        "list_limit_hits",
+                        json!({"rows": hits, "l_top": costs.effort_l_top,
+                            "note": "rows (rep 0) whose effort_curve list was cut at the curve's largest measured list size: their target recall or K / estimated match rate lies beyond the measured curve (perquery.tsv: list_capped)"}),
+                    );
+                }
             }
             put("provenance", prov.to_json());
             put("reps", protocol["reps"].clone());
@@ -1019,6 +1043,7 @@ fn counter_docs() -> Value {
         "n_probe": "predicate evaluations of the sketch probe (also in n_pred)",
         "plan": "exact plan chosen: 0 none / version-1 path, 1 scan, 2 distance-first, 3 gallop, 4 bitmap, 5 rowand, 6 pair",
         "n_pair_lookups": "directory lookups in the combination postings (the pair plan's clause pair)",
+        "list_capped": "effort_curve: 1 if the planned list was cut at the effort curve's largest measured list size (a list-limit hit), else 0",
         "fallback": "guarded trial: 0 none, 1 forecast, 2 budget, 3 incomplete heap, 4 witness",
         "est_exact_ns": "estimated exact-path cost (model ns; 0 if not computed)",
         "est_graph_ns": "nominal graph cost at the planned L (model ns; 0 if not computed)",
@@ -1434,6 +1459,7 @@ fn write_run_files(dir: &Path, rows: &Rows, k: usize, out: &Outcome) -> Result<V
         for (i, name) in Counters::NAMES.iter().enumerate() {
             counters.insert((*name).to_owned(), json!(mean_ctr(i)));
         }
+        let list_limit_hits = first.iter().filter(|r| r.ctr.list_capped > 0).count();
         let mw = median(&mean_wall);
         summary.insert(
             l.to_string(),
@@ -1445,6 +1471,7 @@ fn write_run_files(dir: &Path, rows: &Rows, k: usize, out: &Outcome) -> Result<V
                 "qps_wall": mw.map(|w| 1e9 / w),
                 "qps_cpu": median(&mean_cpu).map(|w| 1e9 / w),
                 "mean_counters_rep0": counters,
+                "list_limit_hits": list_limit_hits,
                 "nondeterministic_rows": out.nondeterministic.get(&l).copied().unwrap_or(0),
             }),
         );
@@ -1480,7 +1507,11 @@ mod tests {
                 .effort_l_top,
             200.0
         );
-        assert_eq!(costs_from_json(&costs).unwrap().effort_l_top, 0.0);
+        // Without either (a bare cost object of an older curve): no plan from the curve, never
+        // an uncapped one; `Plan::new` refuses it for `effort_curve`.
+        let bare = costs_from_json(&costs).unwrap();
+        assert_eq!(bare.effort_l_top, 0.0);
+        assert_eq!(bare.effort_list(0.99, 10.0), None);
     }
 
     #[test]

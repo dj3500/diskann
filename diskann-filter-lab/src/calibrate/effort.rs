@@ -15,8 +15,10 @@
 //!   collector, so the `K'` nearest of them are the answers of a heap(K') search at the same list
 //!   size, for every `K' ≤ kmax`. List sizes 10·2^i up to `l_max`, stopping after the first size at
 //!   which every K' has a mean recall of at least 0.995 (above the largest target recall, 0.99).
-//! - **Table**: mean tie-aware recall@K' per list size (made non-decreasing in L); per target
-//!   recall R and K', the smallest list size reaching R, log-linear in L between measured sizes.
+//! - **Table**: mean recall@K' per list size (made non-decreasing in L), counted as the
+//!   evaluator counts it ([`tie_capped_hits`]: answers strictly closer than the K'-th true
+//!   distance, plus those at it up to the true points tied there); per target recall R and K',
+//!   the smallest list size reaching R, log-linear in L between measured sizes.
 //!   Above the largest size the last two sizes give a power law, 1 − recall ∝ L^b, at most 8×
 //!   the largest size and n.
 
@@ -117,6 +119,21 @@ pub(super) fn midpoint<T: Element>(a: &[T], b: &[T]) -> Vec<T> {
             bytemuck::cast_slice(&m).to_vec()
         }
     }
+}
+
+/// The hits of answers with distances `ds` against the `K' = gt.len()` smallest true distances
+/// `gt` (ascending), as a tie-aware evaluator counts them: the answers strictly closer than the
+/// K'-th true distance `d`, plus the answers at `d` up to the number of tie slots (K' minus the
+/// true points strictly closer than `d`). Distinct answers tied at `d` beyond the slots (e.g.
+/// exact duplicates of a point) earn nothing more.
+pub(super) fn tie_capped_hits(ds: &[f32], gt: &[f32]) -> usize {
+    let Some(&d) = gt.last() else {
+        return 0;
+    };
+    let slots = gt.len() - gt.partition_point(|&x| x < d);
+    let strict = ds.iter().filter(|&&x| x < d).count();
+    let tied = ds.iter().filter(|&&x| x == d).count();
+    strict + tied.min(slots)
 }
 
 /// The `kmax` smallest squared distances from each query to the base (ascending), in one scan.
@@ -264,11 +281,9 @@ pub fn effort_curve<T: Element>(
             };
             let c = st.search(&plan, ix, &query, l, &mut ids, &mut ds, None);
             n_dist[li] += c.n_dist as f64;
-            // Tie-aware recall@K': answers within the K'-th true distance.
+            // Recall@K' as the evaluator counts it.
             for (row, &kp) in recall.iter_mut().zip(&ks) {
-                let bound = d_gt[kp - 1];
-                let hits = ds[..kp].iter().filter(|&&d| d <= bound).count();
-                row[li] += hits as f64 / kp as f64;
+                row[li] += tie_capped_hits(&ds[..kp], &d_gt[..kp]) as f64 / kp as f64;
             }
         }
         for x in recall
@@ -342,6 +357,20 @@ mod tests {
         // No progress at the end: the cap.
         let t = fit_table(&ls, &[vec![0.5, 0.8, 0.8]], &[0.9], 5000.0);
         assert_eq!(t[0][0], 5000.0);
+    }
+
+    #[test]
+    fn tied_answers_earn_at_most_the_tie_slots() {
+        // True [1, 2]; two distinct answers at 2: one slot at 2 (the evaluator's 0.5, not 1.0).
+        assert_eq!(tie_capped_hits(&[2.0, 2.0], &[1.0, 2.0]), 1);
+        // The true point at 1 and one at 2: both.
+        assert_eq!(tie_capped_hits(&[1.0, 2.0], &[1.0, 2.0]), 2);
+        // Three true points tied at 2 (K' = 3, all slots tied): any three answers at 2 count.
+        assert_eq!(tie_capped_hits(&[2.0, 2.0, 2.0], &[2.0, 2.0, 2.0]), 3);
+        // Ties beyond the K'-th distance and farther answers earn nothing; padding neither.
+        assert_eq!(tie_capped_hits(&[1.0, 3.0, f32::MAX], &[1.0, 2.0, 2.0]), 1);
+        assert_eq!(tie_capped_hits(&[0.5, 2.0, 2.0], &[1.0, 2.0, 2.0]), 3);
+        assert_eq!(tie_capped_hits(&[], &[]), 0);
     }
 
     #[test]

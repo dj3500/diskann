@@ -175,7 +175,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `scorer` | `distance`, `bonus(β)` (matches keyed `β·d`), `additive(λ)`, `normalized_additive(η)`, `multiplicative(η)`, `shifted(η)`, `shell_adaptive(κ)`, `lexicographic` |
 | `collector` | `final_beam`, `heap` (best `K` matches seen), `all` (every match seen; the sorted list is truncated to `L`) |
 | `expander` | `one_hop`, `two_hop` / `two_hop(cap)` (second hop through the closest rejected neighbours; default cap `r_max / 2`) |
-| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve; a target recall beyond the measured curve plans its largest measured list size, the curve's maximum, before the proportional growth beyond the largest calibrated `K'` (`flab run` warns, and `run.json` lists the capped efforts under `effort_curve_capped`); `effort_curve(cap)`: at most `cap` × the list size of an unselective query) |
+| `terminator` | `exhaust`, `adaptive_l(sample, scale)` (default 1000, 16), `budget(W)` (distance computations), `match_aware` (heap collector), `posting_l(scale)` (posting-based adaptive L: `L₀ ×` upstream's multiplier of the estimated match rate `M̂/n`, fixed before navigation; default scale 16), `effort_curve` (the effort is a target recall `R` in per mille; the list size is the graph's calibrated unfiltered effort for recall `R` at `K/r̂` neighbours, `r̂ = M̂/n`, fixed before navigation; needs a cost crossover and the unit costs' effort curve; no planned list exceeds the curve's largest measured list size `effort_l_top`, after the proportional growth beyond the largest calibrated `K'` (a target recall beyond the measured curve plans that maximum: `flab run` warns, and `run.json` lists those efforts under `effort_curve_capped`; every query whose list was cut has `list_capped = 1`, counted per effort in `run.json` under `list_limit_hits`); a calibration that records neither `effort_l_top` nor `details.effort.l` is refused; `effort_curve(cap)`: at most `cap` × the list size of an unselective query) |
 | `predicate` | `mode1` (row scan with clause bits), `mode2` (per-clause search in the row), `bitmap` (needs a materializer), `static_bits(θ)` (static bitsets for labels with at least `θ` points, the row for the others) |
 | `materializer` | `none`, `dense` (match bitmap), `sparse` (sorted match list), `dense_static` (match bitmap built with the static bitsets), `dense_nav` (bitmap of the navigation clauses only — all clauses, or the projected ones such as `c*` — built with the static bitsets when the index has them; the other clauses of a projected query are checked on the row of the bitmap's members) |
 | `exact` | `none`, `scan_smallest_clause(T)`, `intersect_then_scan(T)`, `planned(T)` (the exact path v2 below) |
@@ -298,8 +298,13 @@ the first size where every `K'` reaches a mean recall of 0.995) from the global 
 nearest evaluated nodes answer every `K'` at once), and per target recall
 the smallest list size reaching it (log-linear between sizes; above the largest, the power law
 of the miss rate through the last two sizes, at most 8× it; the largest measured size is kept as
-`effort_l_top`, and `effort_curve` plans at most that list for a target recall the measured curve
-does not reach — calibrations written without it take the largest of `details.effort.l`). It takes a few
+`effort_l_top`, and `effort_curve` plans at most that list — calibrations written without it take
+the largest of `details.effort.l`). Recall@`K'` is counted with tie credit capped as a
+tie-aware evaluator caps it: the answers strictly closer than the `K'`-th true distance plus
+those at that distance up to the number of true points tied there (distinct answers tied beyond those slots, e.g. exact
+duplicates, earn nothing; earlier calibrations counted every answer within the distance);
+`flab tree-calibrate`'s tree curve counts recall the same way. The report records its provenance (the label
+store, the graph's data points, the base and the CPU model; see "Provenance"). It takes a few
 seconds (1M points) to a few minutes (40M) per dataset; the costs are loaded with the experiment
 or configuration key `calibration`. Calibrations without the newer terms reproduce the batch-B6
 cost model.
@@ -351,7 +356,8 @@ Counters per query: `n_dist`, `n_pred`, `n_expand`, `n_hops`, `n_match_seen`, `n
 route, `n_aux_dist`, `n_lazy`, `n_aux_expand`, `n_two_hop`, `n_evict`, `n_exact_cand`,
 `n_start`, `n_late` (starts admitted after a post-filter search ended, `by_rate_late`), the final list size, and for the planned exact path and the crossover the plan, the
 probe's predicate evaluations, the estimated exact and nominal graph costs, the estimates of
-`A` and `M`, a guarded trial's fallback reason and its graph work (model ns). A trace mode records per-node events (offers with keys,
+`A` and `M`, a guarded trial's fallback reason and its graph work (model ns), `list_capped`
+(`effort_curve`: the planned list was cut at the effort curve's largest measured list size). A trace mode records per-node events (offers with keys,
 predicate results and outcomes, expansions, answers), and a reference mode runs with a
 resizable candidate list until a distance budget is spent.
 
@@ -483,9 +489,15 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
   edge, the routers' vectors, a pair tree's root entry); `--tree-bytes rows` (a fixed row per
   router) reproduces selections made before that accounting.
 - Each run writes a JSON report (the runs per threshold, bytes, the model's mean costs, coverage
-  of `--report` predicate sets). `--save-candidates` / `--load-candidates` keep the counting
-  pass over every co-occurring label pair (the costly part on large label stores); results do
-  not depend on `--threads`.
+  of `--report` predicate sets, `provenance`). `--save-candidates` / `--load-candidates` keep the
+  counting pass over every co-occurring label pair (the costly part on large label stores; the
+  file, magic `SELCAND3`, records the label store's fingerprint after its records: a `u64`
+  length and the provenance JSON; `SELCAND2` / `SELCAND1` files of earlier versions load with a
+  warning); results do not depend on `--threads`. The calibration must belong to the dataset, the
+  graph's data points and the machine, the pair contexts to the label store (see "Provenance").
+- Track G's router pricing keeps the effort list as it was before that cap (`UnitCosts::effort_list_grown`:
+  capped at the curve's largest measured list before the growth with the rank of the `K`-th
+  match), so its selections do not change with the kernel's list cap (`effort_curve` above).
 
 ## Importing DiskANN indices
 

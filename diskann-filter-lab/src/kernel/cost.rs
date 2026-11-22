@@ -238,9 +238,9 @@ pub struct UnitCosts {
     #[serde(default)]
     pub effort_l: Vec<Vec<f64>>,
     /// The largest list size at which the effort curve was measured (`effort_l` is extrapolated
-    /// beyond it): a target recall the measured curve does not reach plans this list, the curve's
-    /// maximum ([`Self::effort_list`]). 0: not recorded (older calibrations without their details;
-    /// [`crate::run::read_costs`] fills it from the calibration's measured list sizes).
+    /// beyond it): no plan of the curve exceeds it ([`Self::effort_list`]). 0: not recorded
+    /// (older calibrations without their details, from whose measured list sizes
+    /// [`crate::run::read_costs`] fills it otherwise): such a curve plans nothing.
     #[serde(default)]
     pub effort_l_top: f64,
     /// Effort curve of the router trees of a Steiner graph (`flab tree-calibrate`, base-derived
@@ -320,14 +320,7 @@ impl Default for UnitCosts {
 /// A list size from a recall × neighbour-count table (`ls[i][j]` for recall `rs[i]` at `ks[j]`):
 /// log-linear interpolation in the recall and log-log in the neighbours, clamped to the table's
 /// recalls; beyond its largest neighbour count it grows in proportion. `None` without a table.
-fn curve_list(
-    rs: &[f64],
-    ks: &[f64],
-    ls: &[Vec<f64>],
-    r: f64,
-    kprime: f64,
-    l_top: f64,
-) -> Option<f64> {
+fn curve_list(rs: &[f64], ks: &[f64], ls: &[Vec<f64>], r: f64, kprime: f64) -> Option<f64> {
     if rs.is_empty() || ks.is_empty() {
         return None;
     }
@@ -351,9 +344,7 @@ fn curve_list(
         let row = &ls[i];
         (1.0 - u) * row[j0].ln() + u * row[j1].ln()
     };
-    // At most the largest measured list size: beyond it the table is extrapolated, so a target
-    // recall the measured curve does not reach plans the list at the curve's maximum.
-    let l = ((1.0 - t) * row(i0) + t * row(i1)).exp().min(l_top);
+    let l = ((1.0 - t) * row(i0) + t * row(i1)).exp();
     let top = ks[ks.len() - 1];
     Some(if kp > top { l * kp / top } else { l })
 }
@@ -824,26 +815,54 @@ impl UnitCosts {
 
     /// The calibrated unfiltered list size for mean recall `r` at `kprime` neighbours:
     /// log-linear interpolation in the recall and log-log in the neighbours, clamped to the
-    /// calibrated recalls and to the largest measured list size (`effort_l_top`: a recall the
-    /// measured curve does not reach is capped at the curve's maximum); beyond the largest
-    /// calibrated neighbour count it grows in proportion to it. `None` without a curve.
+    /// calibrated recalls; beyond the largest calibrated neighbour count it grows in proportion to
+    /// it; the result at most the largest measured list size (`effort_l_top`: beyond it the table
+    /// is extrapolated, so a recall the measured curve does not reach, or a neighbour count whose
+    /// growth passes it, plans the curve's maximum). `None` without a curve or without its
+    /// largest measured list size.
     pub fn effort_list(&self, r: f64, kprime: f64) -> Option<f64> {
-        curve_list(
+        self.effort_list_capped(r, kprime).map(|(l, _)| l)
+    }
+
+    /// [`Self::effort_list`] and the list before the cut at the largest measured list size (a
+    /// list-limit hit where it is larger).
+    pub fn effort_list_capped(&self, r: f64, kprime: f64) -> Option<(f64, f64)> {
+        if self.effort_l_top <= 0.0 {
+            return None;
+        }
+        let l = curve_list(&self.effort_r, &self.effort_k, &self.effort_l, r, kprime)?;
+        Some((l.min(self.effort_l_top), l))
+    }
+
+    /// The list size as it was before the cap after the growth: capped at the largest measured
+    /// list size before the proportional growth beyond the largest calibrated neighbour count (so
+    /// it grows past the measured range for large `kprime`). The track-G selector's router pricing
+    /// ([`crate::select_g::TreeModel::router_ns`]) keeps it, so that its selections do not
+    /// change with the kernel's guard. `None` as [`Self::effort_list`].
+    pub fn effort_list_grown(&self, r: f64, kprime: f64) -> Option<f64> {
+        if self.effort_l_top <= 0.0 {
+            return None;
+        }
+        let top = *self.effort_k.last()?;
+        let kp = kprime.max(1.0);
+        let l = curve_list(
             &self.effort_r,
             &self.effort_k,
             &self.effort_l,
             r,
-            kprime,
-            self.effort_l_cap(),
-        )
+            kp.min(top),
+        )?
+        .min(self.effort_l_top);
+        Some(if kp > top { l * kp / top } else { l })
     }
 
-    /// Whether [`Self::effort_list`] caps the list for target recall `r` at some `K' >= k`
-    /// neighbours (`effort_curve` plans at `K' = k / r̂`): the uncapped table at `k` or at a larger
-    /// calibrated neighbour count exceeds the largest measured list size (between them the
-    /// interpolation is log-linear, beyond the largest the proportional growth is not capped).
+    /// Whether target recall `r` lies beyond the measured effort curve at `k` or at a larger
+    /// calibrated neighbour count (`effort_curve` plans at `K' = k / r̂`): the uncapped table
+    /// there exceeds the largest measured list size (between them the interpolation is
+    /// log-linear). Queries whose growth beyond the largest calibrated `K'` passes it are counted
+    /// per query instead ([`Self::effort_list_capped`]).
     pub fn effort_capped(&self, r: f64, k: f64) -> bool {
-        let cap = self.effort_l_cap();
+        let cap = self.effort_l_top;
         let Some(&top) = self.effort_k.last() else {
             return false;
         };
@@ -854,19 +873,10 @@ impl UnitCosts {
                 &self.effort_l,
                 r,
                 kp.min(top),
-                f64::INFINITY,
             )
             .is_some_and(|l| l > cap)
         };
-        cap.is_finite() && (beyond(k) || self.effort_k.iter().any(|&kj| kj > k && beyond(kj)))
-    }
-
-    fn effort_l_cap(&self) -> f64 {
-        if self.effort_l_top > 0.0 {
-            self.effort_l_top
-        } else {
-            f64::INFINITY
-        }
+        cap > 0.0 && (beyond(k) || self.effort_k.iter().any(|&kj| kj > k && beyond(kj)))
     }
 
     /// The calibrated router frontier of a tree search for mean recall `r` at `kprime` members
@@ -882,7 +892,6 @@ impl UnitCosts {
                 &self.tree_l[c * nr..(c + 1) * nr],
                 r,
                 kprime,
-                f64::INFINITY,
             )
         };
         let g = &self.tree_a;
@@ -1776,12 +1785,23 @@ mod tests {
         assert!((l(&c, 0.5, 10.0) - 10.0).abs() < 1e-9);
         assert!((l(&c, 0.9, 100.0) - 80.0).abs() < 1e-9);
         assert!(!c.effort_capped(0.9, 10.0));
-        // Beyond it: the largest measured list, also between grid rows, and proportional in the
-        // neighbours beyond the grid's largest K' as before.
+        // Beyond it: the largest measured list, also between grid rows, and also after the
+        // proportional growth beyond the grid's largest K' (the list used to grow past it).
         assert_eq!(l(&c, 0.99, 10.0), 100.0);
         assert_eq!(l(&c, 0.95, 10.0), 100.0);
-        assert_eq!(l(&c, 0.99, 400.0), 400.0);
+        assert_eq!(l(&c, 0.99, 400.0), 100.0);
+        assert_eq!(c.effort_list_grown(0.99, 400.0), Some(400.0));
         assert!(c.effort_capped(0.99, 10.0) && c.effort_capped(0.99, 400.0));
+        // A recall within the curve whose growth passes the measured range: 40 × 2 = 80 is
+        // planned, 40 × 4 = 160 is a list-limit hit; the warning (recall only) stays silent.
+        assert_eq!(c.effort_list_capped(0.5, 200.0), Some((80.0, 80.0)));
+        assert_eq!(c.effort_list_capped(0.5, 400.0), Some((100.0, 160.0)));
+        assert_eq!(c.effort_list_grown(0.5, 400.0), Some(160.0));
+        assert!(!c.effort_capped(0.5, 10.0));
+        // Out-of-range targets and neighbour counts: clamped to the table's rows and columns,
+        // never above the cap.
+        assert_eq!(c.effort_list_capped(1.5, 1e9), Some((100.0, 1.2e10)));
+        assert!((l(&c, 0.1, 0.5) - 10.0).abs() < 1e-9);
         // 0.92 is within the curve for an unselective query (K' = 10: about 63) but not for a
         // selective one (K' = 100: about 146 extrapolated): flagged at K = 10, capped at K' = 100.
         assert!(
@@ -1791,9 +1811,11 @@ mod tests {
         assert_eq!(l(&c, 0.92, 100.0), 100.0);
         assert!(c.effort_capped(0.92, 10.0) && c.effort_capped(0.92, 100.0));
         assert!(!c.effort_capped(0.905, 10.0) && l(&c, 0.905, 100.0) < 100.0);
-        // Not recorded (0): uncapped, the extrapolated table as it is.
+        // Not recorded (0): no plan from the curve (never an uncapped extrapolation); a run
+        // refuses such a calibration for `effort_curve` (`Plan::new`).
         c.effort_l_top = 0.0;
-        assert!((l(&c, 0.99, 10.0) - 300.0).abs() < 1e-9);
+        assert_eq!(c.effort_list(0.99, 10.0), None);
+        assert_eq!(c.effort_list_grown(0.5, 10.0), None);
         assert!(!c.effort_capped(0.99, 10.0));
     }
 
