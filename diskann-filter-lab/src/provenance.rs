@@ -186,7 +186,8 @@ impl GraphFp {
     }
 
     /// The fingerprint of a graph file: of `graph.flab` (or a directory holding one) from its
-    /// degrees and the sampled rows only; of a DiskANN graph file by loading it.
+    /// degrees and the sampled rows only (unbuffered reads: a buffered reader would refill its
+    /// buffer at every seek); of a DiskANN graph file by loading it.
     pub fn of_path(path: &Path) -> Result<Self> {
         let p = if path.is_dir() {
             path.join("graph.flab")
@@ -196,7 +197,8 @@ impl GraphFp {
         if container::peek_magic(&p)? != *graph::MAGIC {
             return Ok(Self::of(&diskann_io::open(&p, None)?));
         }
-        let mut r = container::Reader::open(&p, graph::MAGIC)?;
+        let file = std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
+        let mut r = container::Reader::new(file, graph::MAGIC)?;
         let [n_data, n_nodes, r_max, ..] = *r.params();
         let (n_data, n_nodes, r_max) = (n_data as usize, n_nodes as usize, r_max as usize);
         let degrees: Vec<u32> = r.section(0, n_nodes)?;

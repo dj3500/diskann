@@ -856,6 +856,10 @@ struct ProvenanceArgs {
     /// Derived files whose recorded provenance is printed (`null`: none recorded).
     #[arg(long)]
     file: Vec<PathBuf>,
+    /// Also load the graph and fingerprint it in memory, as `flab run` does (the times of both
+    /// are reported).
+    #[arg(long)]
+    in_memory: bool,
 }
 
 /// `flab provenance`: the current fingerprints (`labels`, `base`, `graph`, `cpu_model`, as files
@@ -885,8 +889,25 @@ fn provenance_command(a: &ProvenanceArgs) -> Result<()> {
     }
     if let Some(g) = &a.graph {
         let t = Instant::now();
-        out.insert("graph".into(), json!(GraphFp::of_path(g)?));
+        let fp = GraphFp::of_path(g)?;
         times.insert("graph_fingerprint_from_file".into(), json!(secs(t)));
+        if a.in_memory {
+            let t = Instant::now();
+            let file = if g.is_dir() {
+                g.join("graph.flab")
+            } else {
+                g.clone()
+            };
+            let graph = diskann_io::open(&file, None)?;
+            times.insert("graph_load".into(), json!(secs(t)));
+            let t = Instant::now();
+            ensure!(
+                GraphFp::of(&graph) == fp,
+                "the in-memory fingerprint differs from the file's"
+            );
+            times.insert("graph_fingerprint_in_memory".into(), json!(secs(t)));
+        }
+        out.insert("graph".into(), json!(fp));
     }
     out.insert("cpu_model".into(), json!(prov::cpu_model()));
     let files: Vec<Value> = a
