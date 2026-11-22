@@ -20,12 +20,14 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 
-use crate::{container, labels::LabelStore};
+use crate::{container, labels::LabelStore, provenance::Provenance};
 
 /// File magic of `bitsets.flab`.
 pub const MAGIC: &[u8; 8] = b"FLABBIT\0";
 /// Version of the `bitsets.flab` format.
 pub const VERSION: u32 = 1;
+/// Sections of the `bitsets.flab` format (a provenance section may follow).
+pub const N_SECTIONS: usize = 2;
 
 /// No bitset for this label.
 const NONE: u32 = u32::MAX;
@@ -198,12 +200,22 @@ impl LabelBitsets {
 
     /// Writes `bitsets.flab` (see the crate `README.md` for the layout).
     pub fn write(&self, path: &Path) -> Result<()> {
-        self.write_to(container::create(path)?)
+        self.write_with(path, None)
+    }
+
+    /// [`Self::write`] with a provenance section ([`crate::provenance`]) when given.
+    pub fn write_with(&self, path: &Path, prov: Option<&Provenance>) -> Result<()> {
+        self.write_to_with(container::create(path)?, prov)
             .with_context(|| format!("writing {}", path.display()))
     }
 
     /// Writes the `bitsets.flab` format to any writer.
     pub fn write_to<W: Write>(&self, w: W) -> Result<()> {
+        self.write_to_with(w, None)
+    }
+
+    /// [`Self::write_to`] with a provenance section when given.
+    pub fn write_to_with<W: Write>(&self, w: W, prov: Option<&Provenance>) -> Result<()> {
         let params = [
             self.n_points as u64,
             self.slot.len() as u64,
@@ -214,16 +226,13 @@ impl LabelBitsets {
             0,
             0,
         ];
-        container::write(
-            w,
-            MAGIC,
-            VERSION,
-            &params,
-            &[
-                bytemuck::cast_slice(&self.labels),
-                bytemuck::cast_slice(&self.bits),
-            ],
-        )
+        let prov = prov.map(Provenance::section);
+        let mut sections: Vec<&[u8]> = vec![
+            bytemuck::cast_slice(&self.labels),
+            bytemuck::cast_slice(&self.bits),
+        ];
+        sections.extend(prov.as_deref());
+        container::write(w, MAGIC, VERSION, &params, &sections)
     }
 
     /// Reads and validates `bitsets.flab` (structure only; [`Self::check`] compares it with

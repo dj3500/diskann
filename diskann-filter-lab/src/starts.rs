@@ -30,13 +30,15 @@ use hashbrown::HashMap;
 
 use crate::{
     container, diskann_io::read_bin_header, graph::Graph, labels::LabelStore, permute::Permutation,
-    text,
+    provenance::Provenance, text,
 };
 
 /// File magic of `starts.flab`.
 pub const MAGIC: &[u8; 8] = b"FLABSTR\0";
 /// Version of the `starts.flab` format.
 pub const VERSION: u32 = 1;
+/// Sections of the `starts.flab` format (a provenance section may follow).
+pub const N_SECTIONS: usize = 5;
 
 /// Start nodes of one graph (see the module documentation).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,12 +232,22 @@ impl Starts {
 
     /// Writes `starts.flab` (see the crate `README.md` for the layout).
     pub fn write(&self, path: &Path) -> Result<()> {
-        self.write_to(container::create(path)?)
+        self.write_with(path, None)
+    }
+
+    /// [`Self::write`] with a provenance section ([`crate::provenance`]) when given.
+    pub fn write_with(&self, path: &Path, prov: Option<&Provenance>) -> Result<()> {
+        self.write_to_with(container::create(path)?, prov)
             .with_context(|| format!("writing {}", path.display()))
     }
 
     /// Writes the `starts.flab` format to any writer.
     pub fn write_to<W: Write>(&self, w: W) -> Result<()> {
+        self.write_to_with(w, None)
+    }
+
+    /// [`Self::write_to`] with a provenance section when given.
+    pub fn write_to_with<W: Write>(&self, w: W, prov: Option<&Provenance>) -> Result<()> {
         let params = [
             u64::from(self.n_nodes),
             u64::from(self.n_data),
@@ -246,19 +258,16 @@ impl Starts {
             self.sample.len() as u64,
             0,
         ];
-        container::write(
-            w,
-            MAGIC,
-            VERSION,
-            &params,
-            &[
-                bytemuck::cast_slice(&self.global),
-                bytemuck::cast_slice(&self.label_offsets),
-                bytemuck::cast_slice(&self.label_starts),
-                bytemuck::cast_slice(&self.sample),
-                bytemuck::cast_slice(&self.sample_start),
-            ],
-        )
+        let prov = prov.map(Provenance::section);
+        let mut sections: Vec<&[u8]> = vec![
+            bytemuck::cast_slice(&self.global),
+            bytemuck::cast_slice(&self.label_offsets),
+            bytemuck::cast_slice(&self.label_starts),
+            bytemuck::cast_slice(&self.sample),
+            bytemuck::cast_slice(&self.sample_start),
+        ];
+        sections.extend(prov.as_deref());
+        container::write(w, MAGIC, VERSION, &params, &sections)
     }
 
     /// Reads and validates `starts.flab`.

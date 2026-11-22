@@ -29,6 +29,7 @@ pub mod pairs;
 pub mod parallel;
 pub mod permute;
 pub mod predicate;
+pub mod provenance;
 pub mod run;
 pub mod select;
 pub mod select_g;

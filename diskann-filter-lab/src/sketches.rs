@@ -24,12 +24,14 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 
-use crate::{container, labels::LabelStore, parallel};
+use crate::{container, labels::LabelStore, parallel, provenance::Provenance};
 
 /// File magic of `sketches.flab`.
 pub const MAGIC: &[u8; 8] = b"FLABSKT\0";
 /// Version of the `sketches.flab` format.
 pub const VERSION: u32 = 1;
+/// Sections of the `sketches.flab` format (a provenance section may follow).
+pub const N_SECTIONS: usize = 2;
 
 /// Priority of data point `p` under `seed` (SplitMix64 of the id, high 32 bits).
 #[inline(always)]
@@ -257,12 +259,22 @@ impl LabelSketches {
 
     /// Writes `sketches.flab` (see the crate `README.md` for the layout).
     pub fn write(&self, path: &Path) -> Result<()> {
-        self.write_to(container::create(path)?)
+        self.write_with(path, None)
+    }
+
+    /// [`Self::write`] with a provenance section ([`crate::provenance`]) when given.
+    pub fn write_with(&self, path: &Path, prov: Option<&Provenance>) -> Result<()> {
+        self.write_to_with(container::create(path)?, prov)
             .with_context(|| format!("writing {}", path.display()))
     }
 
     /// Writes the `sketches.flab` format to any writer.
     pub fn write_to<W: Write>(&self, w: W) -> Result<()> {
+        self.write_to_with(w, None)
+    }
+
+    /// [`Self::write_to`] with a provenance section when given.
+    pub fn write_to_with<W: Write>(&self, w: W, prov: Option<&Provenance>) -> Result<()> {
         let params = [
             self.n_points as u64,
             self.n_labels() as u64,
@@ -273,16 +285,13 @@ impl LabelSketches {
             0,
             0,
         ];
-        container::write(
-            w,
-            MAGIC,
-            VERSION,
-            &params,
-            &[
-                bytemuck::cast_slice(&self.offsets),
-                bytemuck::cast_slice(&self.entries),
-            ],
-        )
+        let prov = prov.map(Provenance::section);
+        let mut sections: Vec<&[u8]> = vec![
+            bytemuck::cast_slice(&self.offsets),
+            bytemuck::cast_slice(&self.entries),
+        ];
+        sections.extend(prov.as_deref());
+        container::write(w, MAGIC, VERSION, &params, &sections)
     }
 
     /// Reads and validates `sketches.flab` (structure only; [`Self::check`] compares it with a

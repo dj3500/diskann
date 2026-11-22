@@ -78,6 +78,7 @@ use crate::{
     },
     labels::LabelStore,
     predicate::{PredicateSet, PredicateSetBuilder},
+    provenance::{self, BaseShape, GraphFp, LabelsFp, Provenance},
     run::{data, sys},
     vectors::{Element, Matrix},
 };
@@ -515,6 +516,7 @@ pub fn calibrate<T: Element>(
     let (mut graph_dist_ns_l, mut graph_dist_ns_curve) = (Vec::new(), Vec::new());
     let (mut effort_r, mut effort_k, mut effort_l) = (Vec::new(), Vec::new(), Vec::new());
     let mut effort_l_top = 0.0;
+    let mut graph_fp = None;
     let (mut graph_dist_ns, mut graph_pred_ns, mut graph_alpha, mut graph_beta) = {
         let d = UnitCosts::default();
         (
@@ -527,6 +529,7 @@ pub fn calibrate<T: Element>(
     if let Some(gpath) = graph {
         let g = data::load_graph(gpath, starts, T::DTYPE)?;
         ensure!(g.graph.n_data() == n, "the graph has another point count");
+        graph_fp = Some(GraphFp::of(&g.graph));
         // With per-label starts, the searches start as the crossover's graph route does.
         let label_starts = g.starts.as_ref().filter(|s| s.n_labels() > 0);
         let start_policy = if label_starts.is_some() {
@@ -805,8 +808,17 @@ pub fn calibrate<T: Element>(
     };
     costs.validate()?;
     details.insert("graph".into(), graph_doc);
+    // What the costs are bound to: the label store, the graph's data points (when one was
+    // measured), the base and the machine.
+    let provenance = Provenance {
+        labels: Some(LabelsFp::of(labels)),
+        graph: graph_fp,
+        base: Some(BaseShape::of(base)),
+        cpu_model: provenance::cpu_model(),
+    };
     Ok(json!({
         "tool": "flab calibrate",
+        "provenance": provenance.to_json(),
         "dataset": dataset,
         "dtype": T::NAME,
         "n_points": n,

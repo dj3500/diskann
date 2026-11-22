@@ -189,6 +189,43 @@ impl<R: Read + Seek> Reader<R> {
             .with_context(|| format!("reading section {i}"))
     }
 
+    /// Reads section `i` as raw bytes (whatever its length).
+    pub fn section_bytes(&mut self, i: usize) -> Result<Vec<u8>> {
+        let &(offset, bytes) = self
+            .sections
+            .get(i)
+            .with_context(|| format!("missing section {i}"))?;
+        let mut out = vec![0u8; bytes as usize];
+        self.inner.seek(SeekFrom::Start(offset))?;
+        self.inner
+            .read_exact(&mut out)
+            .with_context(|| format!("reading section {i}"))?;
+        Ok(out)
+    }
+
+    /// Reads `out.len()` elements of section `i`, which must hold exactly `len` elements of
+    /// `T`, from element `start` on.
+    pub fn read_range<T: Pod>(
+        &mut self,
+        i: usize,
+        len: usize,
+        start: usize,
+        out: &mut [T],
+    ) -> Result<()> {
+        let offset = self.locate::<T>(i, len)?;
+        ensure!(
+            start.checked_add(out.len()).is_some_and(|end| end <= len),
+            "elements {start}..{} lie beyond section {i} ({len} elements)",
+            start + out.len()
+        );
+        let size = std::mem::size_of::<T>() as u64;
+        self.inner
+            .seek(SeekFrom::Start(offset + start as u64 * size))?;
+        self.inner
+            .read_exact(bytemuck::cast_slice_mut(out))
+            .with_context(|| format!("reading section {i}"))
+    }
+
     /// Byte offset of section `i` after checking that it holds exactly `len` elements of `T`.
     fn locate<T>(&self, i: usize, len: usize) -> Result<u64> {
         let &(offset, bytes) = self

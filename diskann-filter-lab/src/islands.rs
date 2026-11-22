@@ -59,6 +59,7 @@ use crate::{
     container,
     kernel::cost::{kth_match_rank, UnitCosts, Z},
     labels::LabelStore,
+    provenance::Provenance,
     select::pair_plan_ns,
     vectors::Matrix,
     workload::{query_point, Independent, Part},
@@ -68,6 +69,8 @@ use crate::{
 pub const MAGIC: &[u8; 8] = b"FLABISL\0";
 /// Version of the `islands.flab` format.
 pub const VERSION: u32 = 1;
+/// Sections of the `islands.flab` format (a provenance section may follow).
+pub const N_SECTIONS: usize = 6;
 
 const NONE: u32 = u32::MAX;
 /// Smallest label with an island.
@@ -1203,11 +1206,21 @@ impl IslandIndex {
 
     /// Writes `islands.flab`.
     pub fn write(&self, path: &Path) -> Result<()> {
-        self.write_to(container::create(path)?)
+        self.write_with(path, None)
+    }
+
+    /// [`Self::write`] with a provenance section ([`crate::provenance`]) when given.
+    pub fn write_with(&self, path: &Path, prov: Option<&Provenance>) -> Result<()> {
+        self.write_to_with(container::create(path)?, prov)
             .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn write_to<W: Write>(&self, w: W) -> Result<()> {
+        self.write_to_with(w, None)
+    }
+
+    /// [`Self::write_to`] with a provenance section when given.
+    pub fn write_to_with<W: Write>(&self, w: W, prov: Option<&Provenance>) -> Result<()> {
         let params = [
             self.n_points as u64,
             self.island_of.len() as u64,
@@ -1218,20 +1231,17 @@ impl IslandIndex {
             u64::from(self.r),
             u64::from(self.l_build),
         ];
-        container::write(
-            w,
-            MAGIC,
-            VERSION,
-            &params,
-            &[
-                bytemuck::cast_slice(&self.island_of),
-                bytemuck::cast_slice(&self.labels),
-                bytemuck::cast_slice(&self.medoids),
-                bytemuck::cast_slice(&self.node_base),
-                bytemuck::cast_slice(&self.offsets),
-                bytemuck::cast_slice(&self.edges),
-            ],
-        )
+        let prov = prov.map(Provenance::section);
+        let mut sections: Vec<&[u8]> = vec![
+            bytemuck::cast_slice(&self.island_of),
+            bytemuck::cast_slice(&self.labels),
+            bytemuck::cast_slice(&self.medoids),
+            bytemuck::cast_slice(&self.node_base),
+            bytemuck::cast_slice(&self.offsets),
+            bytemuck::cast_slice(&self.edges),
+        ];
+        sections.extend(prov.as_deref());
+        container::write(w, MAGIC, VERSION, &params, &sections)
     }
 
     /// Reads and validates `islands.flab` (structure only; [`Self::check`] compares it with a

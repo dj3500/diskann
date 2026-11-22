@@ -50,12 +50,14 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 
-use crate::{container, labels::LabelStore, parallel};
+use crate::{container, labels::LabelStore, parallel, provenance::Provenance};
 
 /// File magic of `pairs.flab`.
 pub const MAGIC: &[u8; 8] = b"FLABPRS\0";
 /// Version of the `pairs.flab` format.
 pub const VERSION: u32 = 1;
+/// Sections of the `pairs.flab` format (a provenance section may follow).
+pub const N_SECTIONS: usize = 6;
 
 /// Not a big label.
 const NONE: u32 = u32::MAX;
@@ -1086,11 +1088,21 @@ impl PairIndex {
 
     /// Writes `pairs.flab`.
     pub fn write(&self, path: &Path) -> Result<()> {
-        self.write_to(container::create(path)?)
+        self.write_with(path, None)
+    }
+
+    /// [`Self::write`] with a provenance section ([`crate::provenance`]) when given.
+    pub fn write_with(&self, path: &Path, prov: Option<&Provenance>) -> Result<()> {
+        self.write_to_with(container::create(path)?, prov)
             .with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn write_to<W: Write>(&self, w: W) -> Result<()> {
+        self.write_to_with(w, None)
+    }
+
+    /// [`Self::write_to`] with a provenance section when given.
+    pub fn write_to_with<W: Write>(&self, w: W, prov: Option<&Provenance>) -> Result<()> {
         let params = [
             self.n_points as u64,
             self.big.len() as u64,
@@ -1101,20 +1113,17 @@ impl PairIndex {
             self.points.len() as u64,
             self.ratio.to_bits(),
         ];
-        container::write(
-            w,
-            MAGIC,
-            VERSION,
-            &params,
-            &[
-                bytemuck::cast_slice(&self.big),
-                bytemuck::cast_slice(&self.cooc),
-                bytemuck::cast_slice(&self.row_offsets),
-                bytemuck::cast_slice(&self.partners),
-                bytemuck::cast_slice(&self.list_offsets),
-                bytemuck::cast_slice(&self.points),
-            ],
-        )
+        let prov = prov.map(Provenance::section);
+        let mut sections: Vec<&[u8]> = vec![
+            bytemuck::cast_slice(&self.big),
+            bytemuck::cast_slice(&self.cooc),
+            bytemuck::cast_slice(&self.row_offsets),
+            bytemuck::cast_slice(&self.partners),
+            bytemuck::cast_slice(&self.list_offsets),
+            bytemuck::cast_slice(&self.points),
+        ];
+        sections.extend(prov.as_deref());
+        container::write(w, MAGIC, VERSION, &params, &sections)
     }
 
     /// Reads and validates `pairs.flab` (structure only; [`Self::check_sample`] compares it

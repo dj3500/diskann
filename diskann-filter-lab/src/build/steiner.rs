@@ -44,6 +44,7 @@ use crate::{
     labels::LabelStore,
     pairs::PairIndex,
     parallel::par_map,
+    provenance::{Checker, Expect, GraphFp, GraphPart, LabelsFp, Provenance},
     run::data::{dataset_dtype, load_graph},
     starts::Starts,
     vectors::{DType, Element, Matrix},
@@ -52,10 +53,18 @@ use crate::{
 /// Magic of `pair_roots.flab` (the roots of the pair trees by directory slot).
 pub const PAIR_ROOTS_MAGIC: &[u8; 8] = b"FLABPRT\0";
 const PAIR_ROOTS_VERSION: u32 = 1;
+/// Sections of `pair_roots.flab` (a provenance section may follow).
+pub const PAIR_ROOTS_SECTIONS: usize = 1;
 
 /// Writes `pair_roots.flab`: params `[n_pairs, n_entries, dict_hash, n_points]` of the pairs
-/// file, then the root of every directory slot (`u32::MAX`: no tree).
-pub fn write_pair_roots(path: &std::path::Path, px: &PairIndex, roots: &[u32]) -> Result<()> {
+/// file, then the root of every directory slot (`u32::MAX`: no tree), and the provenance
+/// section when given.
+pub fn write_pair_roots(
+    path: &std::path::Path,
+    px: &PairIndex,
+    roots: &[u32],
+    prov: Option<&Provenance>,
+) -> Result<()> {
     ensure!(roots.len() == px.n_pairs(), "one root per stored pair");
     let params = [
         px.n_pairs() as u64,
@@ -67,12 +76,15 @@ pub fn write_pair_roots(path: &std::path::Path, px: &PairIndex, roots: &[u32]) -
         0,
         0,
     ];
+    let prov = prov.map(Provenance::section);
+    let mut sections: Vec<&[u8]> = vec![bytemuck::cast_slice(roots)];
+    sections.extend(prov.as_deref());
     container::write(
         container::create(path)?,
         PAIR_ROOTS_MAGIC,
         PAIR_ROOTS_VERSION,
         &params,
-        &[bytemuck::cast_slice(roots)],
+        &sections,
     )
     .with_context(|| format!("writing {}", path.display()))
 }
@@ -188,6 +200,9 @@ pub struct SteinerArgs {
     /// Output directory (`graph.flab`, `starts.flab`, `meta.json`).
     #[arg(long)]
     pub out_dir: PathBuf,
+    /// Accept inputs built from other inputs (provenance) with a warning: for experiments only.
+    #[arg(long)]
+    pub allow_provenance_mismatch: bool,
 }
 
 /// Runs `flab steiner`.
@@ -714,6 +729,25 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
     if st0.n_labels() > 0 {
         st0.check_dictionary(&labels)?;
     }
+    // Provenance of the inputs and of the outputs.
+    let labels_fp = LabelsFp::of(&labels);
+    let g0_fp = GraphFp::of(g0);
+    let mut prov = Checker::new(args.allow_provenance_mismatch);
+    let labels_only = Expect {
+        labels: Some(&labels_fp),
+        ..Expect::default()
+    };
+    prov.file(
+        &format!("start table {}", args.starts.display()),
+        &args.starts,
+        crate::starts::MAGIC,
+        crate::starts::N_SECTIONS,
+        &Expect {
+            labels: Some(&labels_fp),
+            graph: (st0.n_nodes() == g0.n_nodes()).then_some((&g0_fp, GraphPart::Full)),
+            ..Expect::default()
+        },
+    )?;
     let b = args.block.max(2);
     let max_size = parse_size(&args.max_size, n)?;
     let px = match (args.construction, &args.pairs) {
@@ -723,6 +757,13 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
                 px.dict_hash() == labels.dict_hash() && px.n_points() == n,
                 "the combination postings belong to another label store"
             );
+            prov.file(
+                &format!("pairs {}", p.display()),
+                p,
+                crate::pairs::MAGIC,
+                crate::pairs::N_SECTIONS,
+                &labels_only,
+            )?;
             Some(px)
         }
         (Construction::Pairs, None) => anyhow::bail!("--construction pairs needs --pairs"),
@@ -740,7 +781,14 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
                 args.construction == Construction::Tree,
                 "--labels-file selects the labels of --construction tree"
             );
-            read_label_list(path, labels.n_labels())?
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading the label list {}", path.display()))?;
+            prov.check(
+                &format!("label list {}", path.display()),
+                Provenance::from_text(&text)?.as_ref(),
+                &labels_only,
+            )?;
+            parse_label_list(&text, labels.n_labels(), &path.display().to_string())?
         }
         None => (0..n_items as u32)
             .filter(|&x| {
@@ -806,10 +854,21 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
     )?;
     let mut starts = Starts::new(&a.graph);
     starts.set_label_starts(&labels, &a.pairs)?;
+    // The start table and the pair roots name routers of the new graph: bound to all of it.
+    let out_prov = Provenance {
+        labels: Some(labels_fp.clone()),
+        graph: Some(GraphFp::of(&a.graph)),
+        ..Provenance::default()
+    };
     a.graph.write(&args.out_dir.join("graph.flab"))?;
-    starts.write(&args.out_dir.join("starts.flab"))?;
+    starts.write_with(&args.out_dir.join("starts.flab"), Some(&out_prov))?;
     if let Some(px) = &px {
-        write_pair_roots(&args.out_dir.join("pair_roots.flab"), px, &a.pair_roots)?;
+        write_pair_roots(
+            &args.out_dir.join("pair_roots.flab"),
+            px,
+            &a.pair_roots,
+            Some(&out_prov),
+        )?;
     }
     let elem = std::mem::size_of::<T>();
     let r_max = a.graph.r_max();
@@ -839,6 +898,9 @@ fn run_typed<T: Element>(args: &SteinerArgs) -> Result<()> {
             "id_backed_router_vectors": n_aux * 4,
         },
         "time_s": {"order": t_order, "routers": t_routers - t_order, "total": t0.elapsed().as_secs_f64()},
+        "provenance": out_prov.to_json(),
+        "base_graph_fingerprint": &g0_fp,
+        "provenance_checks": prov.to_json(),
     });
     std::fs::write(
         args.out_dir.join("meta.json"),

@@ -763,3 +763,151 @@ fn start_tables_of_one_graph_share_it() {
     assert_eq!(b.global, vec![0, 7, 42]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Provenance: a sidecar built from another label store of the same shape
+/// (two points swap their labels: the same counts, sizes and dictionary) is rejected, loads with
+/// `allow_provenance_mismatch` and a warning in `run.json`; one written before provenance was
+/// recorded loads with a warning; a calibration of another point count is rejected.
+#[test]
+fn sidecars_of_another_label_store_are_rejected() {
+    use diskann_filter_lab::{pairs::PairIndex, provenance::Provenance};
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flab-run-provenance-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = write_dataset(&dir);
+    let (px, _) = PairIndex::build(&d.labels, 1 << 20, 1);
+    px.write_with(
+        &dir.join("pairs.flab"),
+        Some(&Provenance::of_labels(&d.labels)),
+    )
+    .unwrap();
+    px.write(&dir.join("pairs-legacy.flab")).unwrap();
+    // Two points of one `m` label and different `g` labels other than `g=0` and `g=1` swap
+    // their rows: the same counts, sizes and dictionary; the stored pair the loader's sampled
+    // content check reads (the first) keeps its list.
+    let name = |p: u32, c: &str| -> String {
+        let row = d.labels.row(p);
+        row.iter()
+            .map(|&l| d.labels.label_name(l))
+            .find(|n| n.starts_with(c))
+            .unwrap()
+            .to_owned()
+    };
+    let ok = |p: u32| !["g=0", "g=1"].contains(&name(p, "g").as_str());
+    let (x, y) = (0..N as u32)
+        .flat_map(|p| (p + 1..N as u32).map(move |q| (p, q)))
+        .find(|&(p, q)| {
+            ok(p) && ok(q) && name(p, "m") == name(q, "m") && name(p, "g") != name(q, "g")
+        })
+        .unwrap();
+    let (rx, ry) = (d.labels.row(x).to_vec(), d.labels.row(y).to_vec());
+    let mut b = LabelStoreBuilder::new();
+    for p in 0..N as u32 {
+        let row = match p {
+            _ if p == x => &ry,
+            _ if p == y => &rx,
+            _ => d.labels.row(p),
+        };
+        let names: Vec<(String, String)> = row
+            .iter()
+            .map(|&l| {
+                let name = d.labels.label_name(l);
+                (name[..1].to_owned(), name.to_owned())
+            })
+            .collect();
+        b.push_point(names.iter().map(|(c, n)| (c.as_str(), n.as_str())))
+            .unwrap();
+    }
+    let swapped = b.finish().unwrap();
+    assert_eq!(swapped.dict_hash(), d.labels.dict_hash());
+    swapped.write(&dir.join("labels.flab")).unwrap();
+    let toml = |pairs: &str, calibration: &str| {
+        let p = dir.join(format!("prov-{pairs}-{}.toml", calibration.len()));
+        std::fs::write(
+            &p,
+            format!(
+                r#"
+[experiment]
+name = "provenance-test"
+dataset = "{ds}"
+graph = "{ds}/graph"
+panel = "panels/p.tsv"
+split = "discovery"
+k = [5]
+efforts = [10]
+mode = "trace"
+runs_dir = "{ds}/runs"
+{calibration}
+
+[[config]]
+name = "post"
+preset = "postfilter"
+pairs_sidecar = "{ds}/{pairs}"
+"#,
+                ds = dir.display()
+            ),
+        )
+        .unwrap();
+        p
+    };
+    let opts = run::Options::default();
+    let err = run::run(&toml("pairs.flab", ""), &opts).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("built from other inputs"),
+        "{err:#}"
+    );
+    let allow = run::Options {
+        allow_provenance_mismatch: true,
+        ..run::Options::default()
+    };
+    let warnings = |dirs: Vec<PathBuf>| -> Vec<String> {
+        let run: Value =
+            serde_json::from_str(&std::fs::read_to_string(dirs[0].join("run.json")).unwrap())
+                .unwrap();
+        run["provenance"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let w = warnings(run::run(&toml("pairs.flab", ""), &allow).unwrap());
+    assert!(
+        w.iter()
+            .any(|w| w.contains("pairs.flab") && w.contains("mismatch")),
+        "{w:?}"
+    );
+    let w = warnings(run::run(&toml("pairs-legacy.flab", ""), &opts).unwrap());
+    assert!(
+        w.iter()
+            .any(|w| w.contains("pairs-legacy.flab") && w.contains("no provenance")),
+        "{w:?}"
+    );
+    // A calibration document of another point count (the shape older calibrations record).
+    let doc = serde_json::json!({
+        "tool": "flab calibrate", "n_points": 40 * N, "dim": DIM, "dtype": "u8",
+        "costs": UnitCosts::default(),
+    });
+    std::fs::write(dir.join("calib.json"), doc.to_string()).unwrap();
+    let with_costs = |name: &str| {
+        let p = dir.join(format!("prov-{name}.toml"));
+        // Loaded (and checked) by the configuration that names it.
+        let text = std::fs::read_to_string(toml("pairs-legacy.flab", ""))
+            .unwrap()
+            .replace(
+                "preset = \"postfilter\"",
+                &format!(
+                    "preset = \"postfilter\"\ncalibration = \"{}/calib.json\"",
+                    dir.display()
+                ),
+            );
+        std::fs::write(&p, text).unwrap();
+        p
+    };
+    let err = run::run(&with_costs("calib"), &opts).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("measured on other data"),
+        "{err:#}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

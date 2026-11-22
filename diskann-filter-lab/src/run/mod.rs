@@ -64,6 +64,7 @@ use crate::{
         trace::Trace,
     },
     pairs::PairIndex,
+    provenance::{self, BaseShape, Checker, Expect, GraphFp, GraphPart, LabelsFp},
     sketches::LabelSketches,
     vectors::{DType, Element},
 };
@@ -81,6 +82,9 @@ pub struct Options {
     pub commit: Option<String>,
     /// The command line (recorded).
     pub command_line: Vec<String>,
+    /// A sidecar or calibration built from other inputs (provenance) is a warning, not an
+    /// error.
+    pub allow_provenance_mismatch: bool,
 }
 
 /// Runs an experiment file; returns the run directories written.
@@ -312,6 +316,15 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             "row {i} of query set {q} does not exist"
         );
     }
+    // Provenance: the fingerprints every sidecar and calibration is compared with.
+    let labels_fp = LabelsFp::of(&ds.labels);
+    let base_shape = BaseShape::of(&ds.base);
+    let cpu_model = provenance::cpu_model();
+    let mut prov = Checker::new(opts.allow_provenance_mismatch);
+    let labels_only = Expect {
+        labels: Some(&labels_fp),
+        ..Expect::default()
+    };
 
     // Graphs, start tables and sample indices.
     let mut graphs: HashMap<GraphKey, LoadedGraph> = HashMap::new();
@@ -346,6 +359,29 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 format!("config {:?}: sample starts need a start table", c.name)
             })?;
             g.sample = Some(SampleIndex::build(table, &ds.labels)?);
+        }
+    }
+    let mut graph_fps: HashMap<PathBuf, GraphFp> = HashMap::new();
+    for g in graphs.values() {
+        if !graph_fps.contains_key(&g.path) {
+            graph_fps.insert(g.path.clone(), GraphFp::of(&g.graph));
+        }
+        if let (Some(s), Some(p)) = (&g.starts, &g.starts_path) {
+            // A table of the graph's node count may name its auxiliary nodes; a table of
+            // another graph holds data-point starts only (checked by the loader).
+            let e = Expect {
+                labels: Some(&labels_fp),
+                graph: (s.n_nodes() == g.graph.n_nodes())
+                    .then(|| (&graph_fps[&g.path], GraphPart::Full)),
+                ..Expect::default()
+            };
+            prov.file(
+                &format!("start table {} of graph {}", p.display(), g.path.display()),
+                p,
+                crate::starts::MAGIC,
+                crate::starts::N_SECTIONS,
+                &e,
+            )?;
         }
     }
     let needs_pilot: Vec<&ConfigSpec> = exp
@@ -394,6 +430,13 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
         (Some(_), Some(path)) => {
             let t = Instant::now();
             let b = LabelBitsets::read(path)?;
+            prov.file(
+                &format!("bitsets_sidecar {}", path.display()),
+                path,
+                crate::bitsets::MAGIC,
+                crate::bitsets::N_SECTIONS,
+                &labels_only,
+            )?;
             b.check(&ds.labels)
                 .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
             let doc = json!({
@@ -415,14 +458,34 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
 
     // Unit costs of the cost model (per configuration) and bottom-b sketches (untimed
     // sidecars).
+    let mut cost_docs: BTreeMap<PathBuf, Value> = BTreeMap::new();
     let mut cost_files: BTreeMap<PathBuf, (UnitCosts, Value)> = BTreeMap::new();
     for c in &exp.configs {
         if let Some(path) = &c.calibration {
             if !cost_files.contains_key(path) {
-                let u = read_costs(path)?;
+                let (u, file) = read_costs_doc(path)?;
                 let doc = json!({"source": path, "costs": &u});
                 cost_files.insert(path.clone(), (u, doc));
+                cost_docs.insert(path.clone(), file);
             }
+            // A calibration is bound to the data points' graph (the routers of a Steiner graph
+            // leave its unit costs and effort curve unchanged), the base and the machine.
+            let g = &graphs[&graph_key(c)];
+            let e = Expect {
+                labels: Some(&labels_fp),
+                graph: Some((&graph_fps[&g.path], GraphPart::Data)),
+                base: Some(&base_shape),
+                cpu_model: cpu_model.as_deref(),
+            };
+            prov.calibration(
+                &format!(
+                    "calibration {} with graph {}",
+                    path.display(),
+                    g.path.display()
+                ),
+                &cost_docs[path],
+                &e,
+            )?;
         }
     }
     // `effort_curve`: target recalls beyond the measured effort curve plan its largest measured
@@ -449,6 +512,13 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             if !sketch_files.contains_key(path) {
                 let t = Instant::now();
                 let sk = LabelSketches::read(path)?;
+                prov.file(
+                    &format!("sketches_sidecar {}", path.display()),
+                    path,
+                    crate::sketches::MAGIC,
+                    crate::sketches::N_SECTIONS,
+                    &labels_only,
+                )?;
                 sk.check_sample(&ds.labels, 97)
                     .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
                 let doc = json!({
@@ -471,6 +541,13 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             if !pair_files.contains_key(path) {
                 let t = Instant::now();
                 let px = PairIndex::read(path)?;
+                prov.file(
+                    &format!("pairs_sidecar {}", path.display()),
+                    path,
+                    crate::pairs::MAGIC,
+                    crate::pairs::N_SECTIONS,
+                    &labels_only,
+                )?;
                 px.check_sample(&ds.labels, 997)
                     .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
                 let doc = json!({
@@ -494,6 +571,13 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
             if !island_files.contains_key(path) {
                 let t = Instant::now();
                 let isl = IslandIndex::read(path)?;
+                prov.file(
+                    &format!("islands_sidecar {}", path.display()),
+                    path,
+                    crate::islands::MAGIC,
+                    crate::islands::N_SECTIONS,
+                    &labels_only,
+                )?;
                 isl.check(&ds.labels)
                     .with_context(|| format!("{} vs the dataset's labels", path.display()))?;
                 let doc = json!({
@@ -518,6 +602,24 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 let roots = crate::build::steiner::read_pair_roots(path, &pair_files[px].0)?;
                 pair_root_files.insert(path.clone(), roots);
             }
+            // Router ids of the pair-tree graph: bound to every node of the graph.
+            let g = &graphs[&graph_key(c)];
+            let e = Expect {
+                labels: Some(&labels_fp),
+                graph: Some((&graph_fps[&g.path], GraphPart::Full)),
+                ..Expect::default()
+            };
+            prov.file(
+                &format!(
+                    "pair_roots {} with graph {}",
+                    path.display(),
+                    g.path.display()
+                ),
+                path,
+                crate::build::steiner::PAIR_ROOTS_MAGIC,
+                crate::build::steiner::PAIR_ROOTS_SECTIONS,
+                &e,
+            )?;
         }
     }
 
@@ -778,6 +880,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                 },
                 "pairs": pairs_doc(c),
                 "islands": islands_doc(c),
+                "fingerprints": {"labels": &labels_fp, "graph": graph_fps.get(&g.path)},
             });
             let protocol = json!({
                 "reps": if exp.mode == Mode::Timed { exp.reps } else { 1 },
@@ -832,6 +935,7 @@ fn drive<T: Element>(exp: &Experiment, opts: &Options) -> Result<Vec<PathBuf>> {
                     );
                 }
             }
+            put("provenance", prov.to_json());
             put("reps", protocol["reps"].clone());
             put("protocol", protocol);
             put("eps_min", json!({"value": eps, "method": eps_method}));
@@ -937,11 +1041,17 @@ fn uses_costs(c: &ConfigSpec) -> bool {
 
 /// Reads unit costs: a `flab calibrate` report (its `costs` member) or a bare cost object.
 pub fn read_costs(path: &Path) -> Result<UnitCosts> {
+    read_costs_doc(path).map(|(c, _)| c)
+}
+
+/// [`read_costs`] and the whole document (its provenance, [`Checker::calibration`]).
+pub fn read_costs_doc(path: &Path) -> Result<(UnitCosts, Value)> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let v: Value =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    costs_from_json(&v).with_context(|| format!("unit costs in {}", path.display()))
+    let c = costs_from_json(&v).with_context(|| format!("unit costs in {}", path.display()))?;
+    Ok((c, v))
 }
 
 /// The efforts of an `effort_curve` configuration whose target recall lies beyond the measured

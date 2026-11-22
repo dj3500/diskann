@@ -123,6 +123,10 @@ flab build --dataset <dir> --prune 'alpha(64, 1.2)' --l-build 100 -t 3 \
 flab build --dataset <dir> --replay pools/pools.flab --prune 'label_containment(64, 1.2)' \
         -t 3 --compare graphs/vamana/graph.flab -o graphs/lc
 
+# Provenance fingerprints (JSON) of a dataset, a graph, and what derived files record (see
+# "Provenance" below)
+flab provenance --dataset <dir> --graph <graph> --file pairs.flab --file costs.json
+
 # Summaries
 flab info labels.flab
 flab info queries.fpred
@@ -643,6 +647,55 @@ distance `f32::MAX`.
 `gt-compare` accepts a reference row when it has `min(k, |M|)` distinct valid ids, each of them is
 in our band with exactly the reference distance, and its sorted distances equal ours.
 
+## Provenance
+
+Derived files record cheap fingerprints of what they were built from, and the commands that load
+them compare those with their inputs (module `provenance`). A mismatch is an
+error unless the command is given `--allow-provenance-mismatch` (then a warning: for experiments
+only); a file written before the fingerprints existed loads with a warning (older calibrations:
+their recorded `n_points`, `dim` and `dtype` are still compared). `flab run` records the checks'
+warnings and the flag in `run.json` (`provenance`) and the run's fingerprints in its `index`
+(`fingerprints`). `flab provenance --dataset D --graph G` prints the current fingerprints (the
+JSON objects below, with `cpu_model`); `--file F` prints what a file records (`null`: nothing).
+
+| file | written by | records | compared with |
+|---|---|---|---|
+| `pairs.flab`, `islands.flab` (also `flab select`'s), `bitsets.flab`, `sketches.flab` | `flab pairs build`, `islands build`, `select`, `bitsets build`, `sketches build` | `labels` | the dataset's label store |
+| pair contexts (`SELCAND3`) | `flab select --save-candidates` | `labels` | the label store (`--load-candidates`) |
+| label lists (`sel-b<B>.trees.txt`) | `flab select --track graph` | `labels` (first line `# provenance {…}`) | the label store (`flab steiner --labels-file`) |
+| `starts.flab` | `flab starts build`, `flab steiner` | `labels`, `graph` (all nodes) | the label store; the graph it is loaded with when the table has the graph's node count (it may name routers or frozen points; a table of another graph holds data-point starts only and is not bound to a graph) |
+| `pair_roots.flab` | `flab steiner --construction pairs` | `labels`, `graph` (the pair-tree graph) | the label store and every node of the run's graph |
+| calibrations (`provenance` member) | `flab calibrate` (kept by `flab tree-calibrate`) | `labels`, `graph` (when measured with one), `base`, `cpu_model` | the label store, the data points' rows of the graph (a Steiner graph keeps its base graph's), the base shape and the CPU model (`flab run`, `flab select`, `flab islands build`, `flab tree-calibrate`) |
+| selection reports, `flab steiner`'s `meta.json` | `flab select`, `flab steiner` | `labels`, `graph` (and the base graph's fingerprint) | (records) |
+
+Fingerprints (JSON; 64-bit hashes as `"0x"` and 16 hexadecimal digits):
+
+- `labels`: `n_points`, `n_labels`, `n_entries`, `dict_hash` (that of `labels.flab`) and
+  `postings_hash` = `H(|P_0|, …, |P_{L−1}|, p[s] for s in samples(E))`: every label's posting
+  size in label id order, then the sampled entries of the concatenated postings `p` (section 9
+  of `labels.flab`, `E` entries).
+- `graph`: `n_data`, `n_nodes`, `data_edges` (the out-degrees of the data points summed),
+  `edges` (of all nodes), `data_hash` and `hash`: `H` over the rows of the nodes
+  `samples(m)` with `m = n_data` resp. `n_nodes`, a row contributing its degree, then its
+  neighbour ids in stored order. Graphs are fingerprinted as loaded (`graph.flab`, or a
+  DiskANN index read as `flab import-graph` reads it). `flab steiner` appends routers without
+  changing the rows of the base graph's nodes, so a Steiner graph and its base graph share the
+  data part (`n_data`, `data_edges`, `data_hash`).
+- `base`: `n`, `dim`, `dtype` (`"u8"` or `"f32"`); `cpu_model`: `model name` of
+  `/proc/cpuinfo`.
+- `samples(m)`: every position `0..m` when `m ≤ 65,536`, else 1,024 runs of 64 consecutive
+  positions starting at `⌊i·m/1,024⌋`, `i = 0..1,024`, in increasing order (few random reads of
+  a file).
+- `H(w_1, …, w_m) = mix(acc ⊕ mix(m))`, `acc = Σ_i mix(w_i + i·φ)` with `i` from 1,
+  `φ = 0x9e3779b97f4a7c15`, all arithmetic modulo 2⁶⁴, and `mix(z)`: `z ^= z >> 30;
+  z *= 0xbf58476d1ce4e5b9; z ^= z >> 27; z *= 0x94d049bb133111eb; z ^= z >> 31` (SplitMix64's
+  finalizer; vectorizable with NumPy `uint64`).
+
+They take a fraction of a second at 40M points (the posting sizes, 65,536 sampled entries, the
+degrees and 2 × 65,536 sampled rows; `flab provenance` reports the times). A same-shape change
+(the same counts and sizes) is found when a sampled entry or row changes; a new data version
+changes many.
+
 ## Binary formats
 
 All lab formats share one container. Integers are little-endian.
@@ -657,7 +710,10 @@ All lab formats share one container. Integers are little-endian.
 
 Each section starts at a 64-byte-aligned offset, so a memory-mapped file can be viewed as typed
 arrays. Offset arrays are `u64`; ids are `u32`; distances are `f32`. A CSR `(offsets, values)`
-stores row `i` as `values[offsets[i]..offsets[i + 1]]`.
+stores row `i` as `values[offsets[i]..offsets[i + 1]]`. The sidecars of the provenance table
+(`pairs.flab`, `islands.flab`, `bitsets.flab`, `sketches.flab`, `starts.flab`,
+`pair_roots.flab`) may hold one more section after their own (their sections below, 1 for
+`pair_roots.flab`): `FLABPRV\0` followed by the provenance JSON; readers of a format ignore it.
 
 ### Labels: `labels.flab` (magic `FLABLBL\0`)
 

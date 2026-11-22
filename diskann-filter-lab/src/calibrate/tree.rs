@@ -79,6 +79,8 @@ pub struct TreeOptions {
     /// Largest measured frontier.
     pub l_max: usize,
     pub queries_from: TreeQueries,
+    /// `tree_calibrate`: accept a base calibration of other inputs with a warning.
+    pub allow_provenance_mismatch: bool,
 }
 
 impl Default for TreeOptions {
@@ -88,6 +90,7 @@ impl Default for TreeOptions {
             seed: 0,
             l_max: 65_536,
             queries_from: TreeQueries::Label,
+            allow_provenance_mismatch: false,
         }
     }
 }
@@ -421,6 +424,23 @@ pub fn tree_calibrate<T: Element>(
         islands: None,
         pair_roots: None,
     };
+    // The base calibration must belong to this dataset and to the graph's data points (the
+    // routers leave them unchanged).
+    let labels_fp = crate::provenance::LabelsFp::of(&ds.labels);
+    let graph_fp = crate::provenance::GraphFp::of(&g.graph);
+    let base_shape = crate::provenance::BaseShape::of(&ds.base);
+    let cpu = crate::provenance::cpu_model();
+    let mut checks = crate::provenance::Checker::new(opts.allow_provenance_mismatch);
+    checks.calibration(
+        "the base calibration",
+        calibration,
+        &crate::provenance::Expect {
+            labels: Some(&labels_fp),
+            graph: Some((&graph_fp, crate::provenance::GraphPart::Data)),
+            base: Some(&base_shape),
+            cpu_model: cpu.as_deref(),
+        },
+    )?;
     let e = tree_curve(&ds.base, &ix, &ds.labels, opts)?;
     let mut doc = calibration.clone();
     let mut costs: crate::kernel::cost::UnitCosts = serde_json::from_value(
@@ -437,6 +457,7 @@ pub fn tree_calibrate<T: Element>(
     tree["host"] = json!(crate::run::sys::host_info());
     tree["cpu"] = json!(crate::run::sys::current_cpu());
     tree["time"] = json!(crate::run::sys::utc_timestamp(false));
+    tree["provenance_checks"] = checks.to_json();
     if !doc["details"].is_object() {
         doc["details"] = json!({});
     }
@@ -524,6 +545,7 @@ mod tests {
                 seed: 3,
                 l_max: 64,
                 queries_from: TreeQueries::Label,
+                ..TreeOptions::default()
             },
         )
         .unwrap();
@@ -559,6 +581,7 @@ mod tests {
                 seed: 3,
                 l_max: 64,
                 queries_from: TreeQueries::Base,
+                ..TreeOptions::default()
             },
         )
         .unwrap();

@@ -22,6 +22,7 @@ use diskann_filter_lab::{
     labels::LabelStore,
     pairs::{Cover, PairIndex},
     predicate::{self, PredicateSet, PredicateSetBuilder},
+    provenance::{self as prov, Checker, Expect, GraphFp, GraphPart, LabelsFp, Provenance},
     run,
     sketches::{self, LabelSketches},
     starts::{self, Starts},
@@ -100,6 +101,9 @@ enum Command {
     /// Steiner augmentation of a graph: auxiliary router nodes with protected out-edges,
     /// reached only from the start table (per-label trees or component connectors).
     Steiner(diskann_filter_lab::build::steiner::SteinerArgs),
+    /// Provenance fingerprints (JSON): of a dataset's label store and base, of a graph, and the
+    /// provenance that derived files record (see the README's provenance section).
+    Provenance(ProvenanceArgs),
     /// Summarize a lab file (labels, predicates, ground truth, graph, starts) or a vector file.
     Info {
         path: PathBuf,
@@ -474,6 +478,10 @@ enum IslandsCommand {
         /// counterfactual or oracle selection); output files `islands-restricted-b*`.
         #[arg(long)]
         restrict: Option<PathBuf>,
+        /// Accept a calibration of other inputs (provenance) with a warning: for experiments
+        /// only.
+        #[arg(long)]
+        allow_provenance_mismatch: bool,
     },
 }
 
@@ -624,6 +632,10 @@ struct SelectArgs {
     /// counting the fixed trees' saving again: the selection before, kept to reproduce it).
     #[arg(long, value_enum)]
     pair_alternative: Option<SelectPairAlternative>,
+    /// Accept a calibration or pair contexts of other inputs (provenance) with a warning: for
+    /// experiments only.
+    #[arg(long)]
+    allow_provenance_mismatch: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -786,6 +798,10 @@ struct TreeCalibrateArgs {
     /// Output JSON.
     #[arg(short, long)]
     output: PathBuf,
+    /// Accept a base calibration of other inputs (provenance) with a warning: for experiments
+    /// only.
+    #[arg(long)]
+    allow_provenance_mismatch: bool,
 }
 
 #[derive(Args)]
@@ -829,6 +845,102 @@ struct CalibrateArgs {
 }
 
 #[derive(Args)]
+struct ProvenanceArgs {
+    /// Dataset directory: the fingerprints of its `labels.flab` and the shape of its base.
+    #[arg(long)]
+    dataset: Option<PathBuf>,
+    /// Graph (a directory with `graph.flab`, a `graph.flab`, or a DiskANN graph file): its
+    /// fingerprint.
+    #[arg(long)]
+    graph: Option<PathBuf>,
+    /// Derived files whose recorded provenance is printed (`null`: none recorded).
+    #[arg(long)]
+    file: Vec<PathBuf>,
+}
+
+/// `flab provenance`: the current fingerprints (`labels`, `base`, `graph`, `cpu_model`, as files
+/// record them) and the recorded provenance of `--file`s.
+fn provenance_command(a: &ProvenanceArgs) -> Result<()> {
+    let mut out = serde_json::Map::new();
+    let mut times = serde_json::Map::new();
+    if let Some(d) = &a.dataset {
+        let t = Instant::now();
+        let store = LabelStore::read(&d.join("labels.flab"))?;
+        times.insert("labels_load".into(), json!(secs(t)));
+        let t = Instant::now();
+        out.insert("labels".into(), json!(LabelsFp::of(&store)));
+        times.insert("labels_fingerprint".into(), json!(secs(t)));
+        let base = run::data::base_file(d)?;
+        let dtype = DType::from_path(&base)?;
+        let mut f = std::fs::File::open(&base)?;
+        let (n, dim) = diskann_io::read_bin_header(&mut f)?;
+        out.insert(
+            "base".into(),
+            json!(prov::BaseShape {
+                n: n as u64,
+                dim: dim as u64,
+                dtype: dtype.name().to_owned()
+            }),
+        );
+    }
+    if let Some(g) = &a.graph {
+        let t = Instant::now();
+        out.insert("graph".into(), json!(GraphFp::of_path(g)?));
+        times.insert("graph_fingerprint_from_file".into(), json!(secs(t)));
+    }
+    out.insert("cpu_model".into(), json!(prov::cpu_model()));
+    let files: Vec<Value> = a
+        .file
+        .iter()
+        .map(|f| Ok(json!({"file": f, "provenance": recorded_provenance(f)?.map(|p| p.to_json())})))
+        .collect::<Result<_>>()?;
+    if !files.is_empty() {
+        out.insert("files".into(), json!(files));
+    }
+    out.insert("seconds".into(), Value::Object(times));
+    println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
+    Ok(())
+}
+
+/// The provenance a derived file records: a container sidecar, pair contexts, a JSON document
+/// (calibration, selection, `meta.json`) or a label list.
+fn recorded_provenance(path: &Path) -> Result<Option<Provenance>> {
+    let magic = container::peek_magic(path)?;
+    let formats: [(&[u8; 8], usize); 6] = [
+        (
+            diskann_filter_lab::pairs::MAGIC,
+            diskann_filter_lab::pairs::N_SECTIONS,
+        ),
+        (islands::MAGIC, islands::N_SECTIONS),
+        (bitsets::MAGIC, bitsets::N_SECTIONS),
+        (sketches::MAGIC, sketches::N_SECTIONS),
+        (starts::MAGIC, starts::N_SECTIONS),
+        (
+            diskann_filter_lab::build::steiner::PAIR_ROOTS_MAGIC,
+            diskann_filter_lab::build::steiner::PAIR_ROOTS_SECTIONS,
+        ),
+    ];
+    if let Some(&(m, n)) = formats.iter().find(|(m, _)| **m == magic) {
+        return prov::of_file(path, m, n);
+    }
+    let b = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    if u64::from_le_bytes(magic) == CONTEXTS_PROV_MAGIC {
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
+        let end = 40 + 8 * u64_at(16) as usize + 20 * u64_at(32) as usize;
+        ensure!(b.len() >= end + 8, "truncated candidates file");
+        return Ok(Some(serde_json::from_slice(&b[end + 8..])?));
+    }
+    if [CANDS_MAGIC, CONTEXTS_MAGIC].contains(&u64::from_le_bytes(magic)) {
+        return Ok(None);
+    }
+    let text = String::from_utf8(b).context("not a lab file, JSON or text")?;
+    if text.trim_start().starts_with('{') {
+        return Provenance::from_doc(&serde_json::from_str(&text)?);
+    }
+    Provenance::from_text(&text)
+}
+
+#[derive(Args)]
 struct RunArgs {
     /// The experiment file (TOML).
     experiment: PathBuf,
@@ -844,6 +956,11 @@ struct RunArgs {
     /// Code version recorded in the outputs (default: the `FLAB_COMMIT` environment variable).
     #[arg(long)]
     commit: Option<String>,
+    /// Load sidecars and calibrations built from other inputs (another label store, graph,
+    /// base or CPU model; see the README's provenance section) with a warning instead of an
+    /// error: for experiments only.
+    #[arg(long)]
+    allow_provenance_mismatch: bool,
 }
 
 fn run_experiment(a: &RunArgs) -> Result<()> {
@@ -856,6 +973,7 @@ fn run_experiment(a: &RunArgs) -> Result<()> {
             .clone()
             .or_else(|| std::env::var("FLAB_COMMIT").ok()),
         command_line: std::env::args().collect(),
+        allow_provenance_mismatch: a.allow_provenance_mismatch,
     };
     let dirs = run::run(&a.experiment, &opts)?;
     for d in dirs {
@@ -949,6 +1067,7 @@ fn main() -> Result<()> {
                 seed: a.seed,
                 l_max: a.l_max,
                 queries_from: calibrate::TreeQueries::parse(&a.queries_from)?,
+                allow_provenance_mismatch: a.allow_provenance_mismatch,
             };
             let input: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&a.calibration)?)?;
@@ -987,6 +1106,7 @@ fn main() -> Result<()> {
             DType::F32 => permute::<f32>(&args),
         },
         Command::Info { path, dtype: d } => info(&path, d),
+        Command::Provenance(a) => provenance_command(&a),
     }
 }
 
@@ -1069,7 +1189,8 @@ fn permute<T: Element>(a: &PermuteArgs) -> Result<()> {
     let mut sketch_files = Vec::new();
     for &b in &a.sketches {
         let out = a.out_dataset.join(format!("sketches-b{b}.flab"));
-        LabelSketches::build(&store, b, a.sketch_seed, a.threads).write(&out)?;
+        LabelSketches::build(&store, b, a.sketch_seed, a.threads)
+            .write_with(&out, Some(&Provenance::of_labels(&store)))?;
         sketch_files.push(out);
     }
     drop(store);
@@ -1133,6 +1254,19 @@ fn permute<T: Element>(a: &PermuteArgs) -> Result<()> {
         a.out_dataset.display()
     );
     Ok(())
+}
+
+/// The shape of a dataset's base vectors (from the file header).
+fn base_shape<T: Element>(dataset: &Path) -> Result<prov::BaseShape> {
+    let path = run::data::base_file(dataset)?;
+    let mut f =
+        std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let (n, dim) = diskann_io::read_bin_header(&mut f)?;
+    Ok(prov::BaseShape {
+        n: n as u64,
+        dim: dim as u64,
+        dtype: T::NAME.to_owned(),
+    })
 }
 
 fn secs(since: Instant) -> f64 {
@@ -1656,6 +1790,11 @@ fn build_starts<T: Element>(a: &StartsBuildArgs) -> Result<()> {
     );
     std::fs::create_dir_all(&a.out_dir)
         .with_context(|| format!("creating {}", a.out_dir.display()))?;
+    let starts_prov = Provenance {
+        labels: Some(LabelsFp::of(&store)),
+        graph: Some(GraphFp::of(&g.graph)),
+        ..Provenance::default()
+    };
     let params = label_starts::Params {
         exact_max: a.exact_max,
         sample: a.sample,
@@ -1675,7 +1814,7 @@ fn build_starts<T: Element>(a: &StartsBuildArgs) -> Result<()> {
         let mut s = Starts::new(&g.graph);
         s.set_label_starts(&store, &built.pairs())?;
         let out = a.out_dir.join(format!("starts-{}.flab", strategy.tag()));
-        s.write(&out)?;
+        s.write_with(&out, Some(&starts_prov))?;
         ensure!(
             Starts::read(&out)? == s,
             "{} does not read back identically",
@@ -1757,7 +1896,7 @@ fn bitsets_command(c: BitsetsCommand) -> Result<()> {
             let t = Instant::now();
             let b = LabelBitsets::build(&store, theta);
             let build_s = secs(t);
-            b.write(&output)?;
+            b.write_with(&output, Some(&Provenance::of_labels(&store)))?;
             ensure!(
                 LabelBitsets::read(&output)? == b,
                 "{} does not read back identically",
@@ -1822,6 +1961,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         singleton,
         dry_run,
         restrict,
+        allow_provenance_mismatch,
     } = c;
     let stem = match (prior, &restrict) {
         (_, Some(_)) => "islands-restricted".to_owned(),
@@ -1829,7 +1969,20 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         (p, None) => format!("islands-{}", p.as_str()),
     };
     let store = LabelStore::read(&dataset.join("labels.flab"))?;
-    let costs = run::read_costs(&calibration)?;
+    let (costs, cost_doc) = run::read_costs_doc(&calibration)?;
+    let labels_fp = LabelsFp::of(&store);
+    let base_shape = base_shape::<T>(&dataset)?;
+    let cpu = prov::cpu_model();
+    Checker::new(allow_provenance_mismatch).calibration(
+        &format!("calibration {}", calibration.display()),
+        &cost_doc,
+        &Expect {
+            labels: Some(&labels_fp),
+            base: Some(&base_shape),
+            cpu_model: cpu.as_deref(),
+            ..Expect::default()
+        },
+    )?;
     std::fs::create_dir_all(&out_dir)?;
     let gains = islands::gains(&store, &costs, k, r);
     let mut tsv = String::from("label\tsize\texact_ns\tbase_ns\tisland_ns\tgain_ns\tbytes\n");
@@ -1961,7 +2114,7 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
         let ix = union.subset(&sel);
         let tag = format!("{}", (f * 1000.0).round() as u64);
         let out = out_dir.join(format!("{stem}-b{tag}.flab"));
-        ix.write(&out)?;
+        ix.write_with(&out, Some(&Provenance::of_labels(&store)))?;
         ensure!(
             IslandIndex::read(&out)? == ix,
             "{} does not read back identically",
@@ -2015,20 +2168,23 @@ fn islands_command<T: diskann_filter_lab::build::BuildElement>(c: IslandsCommand
 
 const CANDS_MAGIC: u64 = 0x5345_4c43_414e_4431; // "SELCAND1": the candidates only
 const CONTEXTS_MAGIC: u64 = 0x5345_4c43_414e_4432; // "SELCAND2": every co-occurring pair
+const CONTEXTS_PROV_MAGIC: u64 = 0x5345_4c43_414e_4433; // "SELCAND3": SELCAND2 + provenance
 
 /// Writes the pair contexts of `flab select` (every co-occurring pair of labels of different
-/// categories; header: magic, points, labels, singleton, count; then `f` per label, then
-/// `(a, b, joint, g)` per pair, little-endian).
+/// categories; header: magic `SELCAND3`, points, labels, singleton, count; then `f` per label,
+/// then `(a, b, joint, g)` per pair, then the provenance: its byte length and JSON;
+/// little-endian).
 fn write_candidates(
     path: &Path,
     store: &LabelStore,
     singleton: f64,
     f: &[f64],
     cands: &[diskann_filter_lab::select::PairCand],
+    provenance: &Provenance,
 ) -> Result<()> {
     let mut b: Vec<u8> = Vec::with_capacity(40 + 8 * f.len() + 20 * cands.len());
     for x in [
-        CONTEXTS_MAGIC,
+        CONTEXTS_PROV_MAGIC,
         store.n_points() as u64,
         store.n_labels() as u64,
         singleton.to_bits(),
@@ -2045,24 +2201,32 @@ fn write_candidates(
         b.extend_from_slice(&c.joint.to_le_bytes());
         b.extend_from_slice(&c.g.to_le_bytes());
     }
+    let p = provenance.to_json().to_string();
+    b.extend_from_slice(&(p.len() as u64).to_le_bytes());
+    b.extend_from_slice(p.as_bytes());
     std::fs::write(path, b).with_context(|| format!("writing {}", path.display()))
 }
 
+/// The pair contexts or candidates read from a file, with the file's provenance (`None`:
+/// written before it was recorded) and whether every co-occurring pair is held.
+struct Candidates {
+    f: Vec<f64>,
+    cands: Vec<diskann_filter_lab::select::PairCand>,
+    complete: bool,
+    provenance: Option<Provenance>,
+}
+
 /// Reads [`write_candidates`]' file, checking it belongs to `store` and `singleton`; also
-/// files of earlier versions that hold only the candidates (labels of 64 to `n − 1` points),
-/// flagged by `false`.
-fn read_candidates(
-    path: &Path,
-    store: &LabelStore,
-    singleton: f64,
-) -> Result<(Vec<f64>, Vec<diskann_filter_lab::select::PairCand>, bool)> {
+/// files of earlier versions: without provenance (`SELCAND2`), or holding only the candidates
+/// (labels of 64 to `n − 1` points, `SELCAND1`; not complete).
+fn read_candidates(path: &Path, store: &LabelStore, singleton: f64) -> Result<Candidates> {
     let b = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
     ensure!(
-        b.len() >= 40 && (u64_at(0) == CANDS_MAGIC || u64_at(0) == CONTEXTS_MAGIC),
+        b.len() >= 40 && [CANDS_MAGIC, CONTEXTS_MAGIC, CONTEXTS_PROV_MAGIC].contains(&u64_at(0)),
         "not a candidates file"
     );
-    let complete = u64_at(0) == CONTEXTS_MAGIC;
+    let complete = u64_at(0) != CANDS_MAGIC;
     ensure!(
         u64_at(8) == store.n_points() as u64
             && u64_at(16) == store.n_labels() as u64
@@ -2070,10 +2234,19 @@ fn read_candidates(
         "the candidates belong to another label store or singleton probability"
     );
     let (nl, nc) = (store.n_labels(), u64_at(32) as usize);
-    ensure!(
-        b.len() == 40 + 8 * nl + 20 * nc,
-        "truncated candidates file"
-    );
+    let end = 40 + 8 * nl + 20 * nc;
+    let provenance = if u64_at(0) == CONTEXTS_PROV_MAGIC {
+        ensure!(b.len() >= end + 8, "truncated candidates file");
+        let len = u64_at(end) as usize;
+        ensure!(b.len() == end + 8 + len, "truncated candidates file");
+        Some(
+            serde_json::from_slice(&b[end + 8..])
+                .with_context(|| format!("the provenance of {}", path.display()))?,
+        )
+    } else {
+        ensure!(b.len() == end, "truncated candidates file");
+        None
+    };
     let f: Vec<f64> = (0..nl)
         .map(|i| f64::from_bits(u64_at(40 + 8 * i)))
         .collect();
@@ -2090,7 +2263,12 @@ fn read_candidates(
             }
         })
         .collect();
-    Ok((f, cands, complete))
+    Ok(Candidates {
+        f,
+        cands,
+        complete,
+        provenance,
+    })
 }
 
 /// `flab select --dump-workload M`: the workload's first `M` base-derived queries and `M`
@@ -2186,7 +2364,25 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     use diskann_filter_lab::select;
     let t0 = Instant::now();
     let store = LabelStore::read(&a.dataset.join("labels.flab"))?;
-    let costs = run::read_costs(&a.calibration)?;
+    let (costs, cost_doc) = run::read_costs_doc(&a.calibration)?;
+    // Provenance: the calibration is bound to the graph's data points, the base and the
+    // machine; the pair contexts and the outputs to the label store.
+    let labels_fp = LabelsFp::of(&store);
+    let graph_fp = GraphFp::of_path(&a.graph)?;
+    let base_shape = base_shape::<T>(&a.dataset)?;
+    let cpu = prov::cpu_model();
+    let mut checks = Checker::new(a.allow_provenance_mismatch);
+    checks.calibration(
+        &format!("calibration {}", a.calibration.display()),
+        &cost_doc,
+        &Expect {
+            labels: Some(&labels_fp),
+            graph: Some((&graph_fp, GraphPart::Data)),
+            base: Some(&base_shape),
+            cpu_model: cpu.as_deref(),
+        },
+    )?;
+    let labels_prov = Provenance::of_labels(&store);
     std::fs::create_dir_all(&a.out_dir)?;
     let base_file = run::data::base_file(&a.dataset)?;
     let parts = select::IndexBytes::of(&a.dataset, &a.graph, &store, T::DTYPE.size())?;
@@ -2269,7 +2465,18 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     // workload, and (labels of 64 to n − 1 points) the candidates.
     let t = Instant::now();
     let (f, contexts, complete) = match &a.load_candidates {
-        Some(path) => read_candidates(path, &store, a.singleton)?,
+        Some(path) => {
+            let c = read_candidates(path, &store, a.singleton)?;
+            checks.check(
+                &format!("pair contexts {}", path.display()),
+                c.provenance.as_ref(),
+                &Expect {
+                    labels: Some(&labels_fp),
+                    ..Expect::default()
+                },
+            )?;
+            (c.f, c.cands, c.complete)
+        }
         None => {
             let (counts, f) = select::label_weights(&store, a.singleton, a.threads);
             let contexts = select::pair_contexts(&store, &counts, a.singleton, a.threads);
@@ -2285,7 +2492,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             .unwrap_or_default()
     );
     if let Some(path) = &a.save_candidates {
-        write_candidates(path, &store, a.singleton, &f, &contexts)?;
+        write_candidates(path, &store, a.singleton, &f, &contexts, &labels_prov)?;
     }
     let count_s = secs(t);
     if a.uniform > 0.0 {
@@ -2595,6 +2802,12 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         })),
         "mean_cost_start_ns": mean_start,
         "pair_alternative": graph_track.then_some(pair_alternative),
+        "provenance": Provenance {
+            graph: Some(graph_fp.clone()),
+            ..labels_prov.clone()
+        }
+        .to_json(),
+        "provenance_checks": checks.to_json(),
     });
     let report_of = |b: f64, sel: &select::Selection, select_s: f64, extra: Value| -> Value {
         let mut r = common.clone();
@@ -2683,7 +2896,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
                 None => sel.best.islands.clone(),
             };
             let out = a.out_dir.join(format!("sel-b{}.trees.txt", tag(*b)));
-            let text: String = trees.iter().map(|l| format!("{l}\n")).collect();
+            let text: String = labels_prov.comment_line()
+                + &trees.iter().map(|l| format!("{l}\n")).collect::<String>();
             std::fs::write(&out, text)?;
             build["trees"] =
                 json!({ "output": out, "labels": trees.len(), "fixed": fixed_max.is_some() });
@@ -2692,7 +2906,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             if !sel.best.islands.is_empty() {
                 let ix = union.subset(&sel.best.islands);
                 let out = a.out_dir.join(format!("sel-b{}.islands.flab", tag(*b)));
-                ix.write(&out)?;
+                ix.write_with(&out, Some(&labels_prov))?;
                 ensure!(
                     IslandIndex::read(&out)? == ix,
                     "{} does not read back",
@@ -2725,7 +2939,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             )?;
             let wall = secs(t);
             let out = a.out_dir.join(format!("sel-b{}.pairs.flab", tag(*b)));
-            ix.write(&out)?;
+            ix.write_with(&out, Some(&labels_prov))?;
             ensure!(
                 PairIndex::read(&out)? == ix,
                 "{} does not read back",
@@ -2817,7 +3031,7 @@ fn pairs_command(c: PairsCommand) -> Result<()> {
                     let f = *f;
                     let tag = format!("{}", (f * 1000.0).round() as u64);
                     let out = out_dir.join(format!("{stem}-b{tag}.flab"));
-                    ix.write(&out)?;
+                    ix.write_with(&out, Some(&Provenance::of_labels(&store)))?;
                     ensure!(
                         PairIndex::read(&out)? == ix,
                         "{} does not read back identically",
@@ -2941,7 +3155,7 @@ fn sketches_command(c: SketchesCommand) -> Result<()> {
                 let sk = LabelSketches::build(&store, b, seed, threads);
                 let build_s = secs(t);
                 let out = out_dir.join(format!("sketches-b{b}.flab"));
-                sk.write(&out)?;
+                sk.write_with(&out, Some(&Provenance::of_labels(&store)))?;
                 ensure!(
                     LabelSketches::read(&out)? == sk,
                     "{} does not read back identically",

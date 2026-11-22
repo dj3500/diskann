@@ -167,6 +167,11 @@ impl LabelStore {
         &self.posting_points[self.posting_offsets[l] as usize..self.posting_offsets[l + 1] as usize]
     }
 
+    /// Every label's postings, concatenated in label id order.
+    pub fn postings_flat(&self) -> &[u32] {
+        &self.posting_points
+    }
+
     #[inline]
     pub fn posting_len(&self, l: u32) -> usize {
         let l = l as usize;
