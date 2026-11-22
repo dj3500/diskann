@@ -831,6 +831,22 @@ pub fn select(
     )
 }
 
+/// [`select`] without island candidates: the combination postings alone, on the same workload,
+/// prices, budget and stop.
+pub fn select_pairs(
+    labels: &LabelStore,
+    sample: &QuerySample,
+    values: &[PairValue],
+    params: &Params,
+) -> Selection {
+    select_with(
+        labels,
+        || IslandGreedy::new(sample, labels, params.r, |_| false),
+        values,
+        params,
+    )
+}
+
 /// [`select`] with another per-label kind than the islands (e.g. track G's router trees,
 /// [`crate::select_g`]); `values` are the pair kind's terms (combination postings, or pair
 /// trees), by decreasing value.
@@ -1400,5 +1416,47 @@ mod tests {
         let bound = sample.weighted_mean(&floor) - derived;
         assert!(best.t_ns >= bound - 1e-6 * mean, "{} < {bound}", best.t_ns);
         assert!(best.t_ns > 0.0);
+    }
+
+    #[test]
+    fn pairs_only_selection_takes_no_island() {
+        let s = store();
+        let c = UnitCosts::default();
+        let (counts, f) = label_weights(&s, 0.5, 2);
+        let contexts = pair_contexts(&s, &counts, 0.5, 2);
+        let model = QueryModel {
+            n_queries: 4_000,
+            seed: 13,
+            cap: 512,
+            uniform: 0.5,
+            contexts: contexts.len() as u64,
+            ..Default::default()
+        };
+        let u = std::sync::Arc::new(crate::workload::independent(&s, &contexts, &model, 2));
+        let sample = QuerySample::build_mixed(&s, &c, 10, model, Some(u), 2);
+        let cands: Vec<PairCand> = contexts
+            .iter()
+            .filter(|p| is_candidate_label(&s, p.a) && is_candidate_label(&s, p.b))
+            .copied()
+            .collect();
+        let values = pair_values(&s, &c, 10, &model, &f, &cands);
+        let params = Params {
+            k: 10,
+            r: 8,
+            budget_bytes: u64::MAX / 4,
+            model,
+            stop: Stop::Budget,
+            mean_ns: sample.mean_base_ns(),
+            index_bytes: 1 << 30,
+            ..Default::default()
+        };
+        let joint = select(&s, &sample, &values, &params);
+        assert!(!joint.best.islands.is_empty() && !joint.pairs.is_empty());
+        let pairs = select_pairs(&s, &sample, &values, &params);
+        assert!(pairs.best.islands.is_empty() && pairs.best.island_bytes == 0);
+        assert!(!pairs.pairs.is_empty());
+        // Without a budget the joint greedy takes every item that still saves: its model cost
+        // is not above the one with pairs alone.
+        assert!(joint.best.t_ns <= pairs.best.t_ns * (1.0 + 1e-12));
     }
 }
