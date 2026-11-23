@@ -481,8 +481,16 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
   `pair` plan) and per-label sub-graphs (islands, the cost crossover's `island` route), written as
   `sel-b<B>.pairs.flab` / `sel-b<B>.islands.flab` (a kind with nothing selected writes no file) and
   built; `--islands false` selects the combination postings alone (no island candidates; the same
-  workload, prices, budget and stop). `--track graph`: a router tree per label and a pair tree
-  per label pair, valued against the graph router alone; writes the selected labels
+  workload, prices, budget and stop). Both kinds are valued on one sample of the workload: an
+  item's saving is how much it lowers the current cost of the sample queries it serves (an island
+  a query with its label as a single-label clause; a pair a data-like query with both labels as
+  single-label clauses, or an independent query holding both), shared between the kinds, so the
+  expected saving never exceeds the mean cost. `pair-values.tsv` lists each candidate pair's
+  closed-form terms (`prob`: the probability that a data-like query holds the pair's context
+  `{a} ∧ {b}`; `saving_ns`: the pair plan's saving on that context alone), which choose the
+  candidates but do not price them. `--track graph`: a router tree per label and a pair tree
+  per label pair, valued against the graph router alone (a pair tree on data-like queries in
+  that closed form); writes the selected labels
   (`sel-b<B>.trees.txt`, for `flab steiner --labels-file`) and pairs (`sel-b<B>.pairs.flab`, for
   `flab steiner --construction pairs`).
   With `--fixed-trees-max-size SIZE` the label trees are fixed by a size cap instead (every label

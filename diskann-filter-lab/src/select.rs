@@ -28,14 +28,29 @@
 //! `n_queries` base-derived queries, weight `(1 − μ)/n_queries` each, and `U` as weighted
 //! queries — its one- and two-label parts exactly, its three-label part as `n_queries` walks;
 //! [`crate::workload::independent`]; per query the cost of its best route without auxiliary
-//! structures and of the island of each single-label clause). The costs do not depend on the
+//! structures, of the island of each single-label clause and its pairs of single-label clauses).
+//! The costs do not depend on the
 //! query vector; [`crate::workload::Walk::draw`] draws `U` i.i.d. with its vectors (seeded),
 //! for measurements on concrete queries.
 //!
-//! **Pairs** are too many, and each drawn too rarely, for a sample of base-derived queries (a
-//! pair whose joint posting holds `j` points is drawn with probability ∝ `j/n`), so their value
-//! on `D` is the expectation in closed form: the probability that a query's clauses in the
-//! categories of `a` and `b` are `{a}` and `{b}`, `(1 − μ)·P_ab` with
+//! **Pairs** are valued on the same sample, as islands are: on every sample query a pair serves
+//! — a base-derived query with single-label clauses `{a}` and `{b}` (and clauses of any kind
+//! besides), an independent query holding both labels (two or three labels) — the cost of the
+//! `pair` plan there ([`pair_plan_ns`]: its list read with the other clauses checked, the
+//! matches' distances) against that query's current cost, which a taken island or pair lowers
+//! (one cost per query, shared by the kinds; of several stored pairs the cheapest counts). The
+//! expected saving of a selection is thus the mean time it removes from the sample's queries,
+//! at most their mean cost. Only pairs that co-occur are candidates (a query of the workload has
+//! a match), of labels of at least [`pairs::T_MIN`] points, whose `pair` plan saves time on
+//! their **context** `{a} ∧ {b}` alone (`s = min(|P_a|, |P_b|)`, `M = j`):
+//!
+//! ```text
+//! saving = min(s·pred(s/n) + M·dist(M/n), base(M/n)) − (gallop_cold + j·pred(j/n) + M·dist(M/n))
+//! ```
+//!
+//! (the scan of the smaller clause or the post-filter route `base` at rate `M/n`, against the
+//! joint posting read with a residual clause checked), at `4·(j + 3)` bytes. A base-derived
+//! query holds the context with probability `P_ab`:
 //!
 //! ```text
 //! P_ab = ¼·[(1 − fresh)²·g_ab + (1 − (1 − fresh)²)·f_a·f_b]
@@ -45,22 +60,15 @@
 //!
 //! (both categories kept: ¼; `L_p(x)`: the labels of point `p` in the category of `x`; `w(L)`:
 //! the probability that a kept category's clause is a given one of its `L` labels alone, drawn
-//! as a single label or as a random subset of one; the other categories may be kept too), times
-//! the saving of the `pair` plan on `{a} ∧ {b}` (`s = min(|P_a|, |P_b|)`, `M = j`):
-//!
-//! ```text
-//! saving = min(s·pred(s/n) + M·dist(M/n), base(M/n)) − (gallop_cold + j·pred(j/n) + M·dist(M/n))
-//! ```
-//!
-//! (the scan of the smaller clause or the post-filter route `base` at rate `M/n`, against the
-//! joint posting read with a residual clause checked), at `4·(j + 3)` bytes; on `U` a pair is
-//! valued on every sample query holding both its labels (two or three labels:
-//! [`pair_plan_ns`] — its list read with the other clauses checked, the matches' distances),
-//! against that query's current cost, which a taken island or pair lowers (one cost per query,
-//! shared by the kinds; of several stored pairs the cheapest counts). Only pairs that
-//! co-occur are candidates (a query of the workload has a match), of labels of at least
-//! [`pairs::T_MIN`] points. On `D`, a pair is valued against the routes without auxiliary
-//! structures (not modelled: a base-derived query served by both kinds).
+//! as a single label or as a random subset of one; the other categories may be kept too), ∝ `j/n`:
+//! a pair is drawn rarely, and its base-derived value is noisy, as a rare label's island's is.
+//! The closed form `(1 − μ)·P_ab·saving` ([`PairValue`], reported) values the pair as if every
+//! base-derived query holding its context were that context alone. It is the base-derived value
+//! of the pair kind of a per-label kind without base-derived samples ([`LabelKind::data_sample`]:
+//! track G's pair trees), not of the combination postings: a query with `k` single-label clauses
+//! holds `k(k − 1)/2` contexts, each counted in full, and its other clauses, which may make it
+//! cheap, are ignored (on a store of many categories with tiny labels, the closed-form terms of
+//! the pairs summed to more than the workload's mean cost).
 //!
 //! **Selection.** One greedy over both kinds by expected saving per query per byte. It stops
 //! ([`Stop::Elasticity`]) at the first item whose relative saving of the mean query time is
@@ -187,6 +195,14 @@ pub trait LabelKind {
     fn independent(&self) -> Option<(&crate::workload::Independent, usize)> {
         None
     }
+    /// The sample whose base-derived queries a pair item serves as it serves the independent
+    /// ones ([`QuerySample::data_pair_queries`]: the queries with single-label clauses `{a}`
+    /// and `{b}`; shared, as [`Self::independent`]). `None`: on the base-derived queries a
+    /// pair is valued in closed form ([`PairValue::prob`] times [`PairValue::saving_ns`]), not
+    /// shared.
+    fn data_sample(&self) -> Option<&QuerySample> {
+        None
+    }
     /// Cost (ns) of sample query `q` when the pair `(a, b)` (`joint` points) is stored and
     /// serves it (`None`: it does not). The kernel takes, of several stored pairs, the one with
     /// the fewest points: [`Self::serve`] keeps the cheapest.
@@ -229,6 +245,11 @@ impl LabelKind for IslandGreedy<'_> {
     fn independent(&self) -> Option<(&crate::workload::Independent, usize)> {
         IslandGreedy::independent(self)
     }
+
+    fn data_sample(&self) -> Option<&QuerySample> {
+        Some(IslandGreedy::sample(self))
+    }
+
     fn pair_cost(&self, q: usize, _a: u32, _b: u32, joint: u32) -> Option<f64> {
         IslandGreedy::pair_cost(self, q, joint)
     }
@@ -484,7 +505,8 @@ pub struct Params {
     pub index_bytes: u64,
 }
 
-/// Value terms of a pair candidate.
+/// Value terms of a pair candidate: its context's closed form (see the module documentation;
+/// the combination postings are priced on the sample instead, [`LabelKind::data_sample`]).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct PairValue {
     pub cand: PairCand,
@@ -494,7 +516,7 @@ pub struct PairValue {
     /// Saving of the `pair` plan on the context (ns).
     pub saving_ns: f64,
     pub bytes: u64,
-    /// Expected saving per query per byte.
+    /// Expected saving per query per byte on the contexts (`prob · saving_ns / bytes`).
     pub value: f64,
 }
 
@@ -680,22 +702,34 @@ fn run<G: LabelKind>(
         Stop::Budget => params.floor,
         Stop::Elasticity => t / b,
     };
-    // A pair's marginal saving per query: its base-derived part (`prob · saving`) plus, on each
-    // independent query holding both its labels (if the per-label kind holds them), the query's
-    // weight times how much the pair plan lowers the query's current cost (`cost`: the pair
-    // plan's cost there).
+    // A pair's marginal saving per query: on each sample query it serves (base-derived queries
+    // with single-label clauses `{a}`, `{b}`, if the per-label kind holds them, and independent
+    // queries holding both labels), the query's weight times how much the pair plan lowers the
+    // query's current cost (`cost`: the pair plan's cost there); without the base-derived
+    // queries, their part in closed form (`prob · saving`).
+    let closed_form = gr.data_sample().is_none();
     let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(values.len());
     let mut served: Vec<(usize, f64, f64)> = Vec::new();
     {
         let ind = gr.independent();
+        let data = gr.data_sample();
         for v in values {
             let start = served.len();
-            if let Some((u, first)) = ind {
-                for i in u.pair_queries(v.cand.a, v.cand.b) {
-                    let q = first + i;
-                    if let Some(cost) = gr.pair_cost(q, v.cand.a, v.cand.b, v.cand.joint) {
-                        served.push((q, gr.query_weight(q), cost));
-                    }
+            if !eligible(v) {
+                ranges.push((start, start));
+                continue;
+            }
+            let (a, b) = (v.cand.a, v.cand.b);
+            let qs = data
+                .into_iter()
+                .flat_map(|d| d.data_pair_queries(a, b))
+                .chain(
+                    ind.into_iter()
+                        .flat_map(|(u, first)| u.pair_queries(a, b).map(move |i| first + i)),
+                );
+            for q in qs {
+                if let Some(cost) = gr.pair_cost(q, a, b, v.cand.joint) {
+                    served.push((q, gr.query_weight(q), cost));
                 }
             }
             ranges.push((start, served.len()));
@@ -704,7 +738,12 @@ fn run<G: LabelKind>(
     let pair_gain = |gr: &G, i: usize| -> f64 {
         let v = &values[i];
         let (a, b) = ranges[i];
-        v.prob * v.saving_ns
+        let derived = if closed_form {
+            v.prob * v.saving_ns
+        } else {
+            0.0
+        };
+        derived
             + served[a..b]
                 .iter()
                 .map(|&(q, w, cost)| w * (gr.query_cost(q) - cost).max(0.0))
@@ -1393,29 +1432,121 @@ mod tests {
         let sel = select(&s, &sample, &values, &params);
         let best = &sel.best;
         assert!(!best.islands.is_empty() && !best.pairs.is_empty());
-        // A lower bound on the cost with everything built: every query at its cheapest island,
-        // every independent query holding a taken pair at that pair's plan if cheaper; the
-        // pairs' base-derived savings are counted apart (not shared). The selection's model
-        // cost is not below it: no saving is counted twice on a query.
-        let mut floor = sample.island_floor_ns();
-        let mut derived = 0.0;
-        let mut served = 0;
+        // The selection's model cost is the sample's mean cost with its items built (every
+        // query at its cheapest route among them): no saving is counted twice on a query.
+        let mut served = (0, 0);
+        let mut taken = Vec::new();
         for &i in &best.pairs {
             let v = &values[i];
-            derived += v.prob * v.saving_ns;
+            taken.push((v.cand.a, v.cand.b, v.cand.joint));
+            served.0 += sample.data_pair_queries(v.cand.a, v.cand.b).count();
             for j in u.pair_queries(v.cand.a, v.cand.b) {
-                let q = sample.n_data + j;
-                let cost = sample
-                    .pair_cost(q, v.cand.joint)
-                    .expect("an independent query");
-                floor[q] = floor[q].min(cost);
-                served += usize::from(u.queries[j].labels.len() == 3);
+                served.1 += usize::from(u.queries[j].labels.len() == 3);
             }
         }
-        assert!(served > 0, "a taken pair serves some three-label query");
-        let bound = sample.weighted_mean(&floor) - derived;
-        assert!(best.t_ns >= bound - 1e-6 * mean, "{} < {bound}", best.t_ns);
+        assert!(served.0 > 0, "a taken pair serves some base-derived query");
+        assert!(served.1 > 0, "a taken pair serves some three-label query");
+        let built = sample.weighted_mean(&sample.costs_with(&best.islands, &taken));
+        assert!(
+            (best.t_ns - built).abs() <= 1e-9 * mean,
+            "{} vs {built}",
+            best.t_ns
+        );
         assert!(best.t_ns > 0.0);
+    }
+
+    /// A store of many categories with tiny labels (as authors or submitters): 4,000 points,
+    /// each with one label in each of six categories of ten labels (about 400 points each) and
+    /// one in each of two categories of tiny labels (5 and 8 points).
+    fn tiny_store() -> LabelStore {
+        let mut b = LabelStoreBuilder::new();
+        let h = |p: u64, s: u64| {
+            let mut z =
+                p.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ s.wrapping_mul(0xd1b5_4a32_d192_ed03);
+            z = (z ^ (z >> 31)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z ^ (z >> 29)
+        };
+        let cats: Vec<String> = (0..8).map(|c| format!("c{c}")).collect();
+        for p in 0..4000u64 {
+            let mut names: Vec<(usize, String)> = (0..6)
+                .map(|c| (c, format!("c{c}v{}", h(p, c as u64) % 10)))
+                .collect();
+            names.push((6, format!("t{}", p / 5)));
+            names.push((7, format!("u{}", (p * 13 % 4000) / 8)));
+            let v: Vec<(&str, &str)> = names
+                .iter()
+                .map(|(c, l)| (cats[*c].as_str(), l.as_str()))
+                .collect();
+            b.push_point(v).unwrap();
+        }
+        b.finish().unwrap()
+    }
+
+    #[test]
+    fn many_overlapping_contexts_of_tiny_labels_save_at_most_the_mean_cost() {
+        let s = tiny_store();
+        let c = UnitCosts::default();
+        let (counts, f) = label_weights(&s, 0.5, 2);
+        let contexts = pair_contexts(&s, &counts, 0.5, 2);
+        for uniform in [0.0, 0.5] {
+            let model = QueryModel {
+                n_queries: 20_000,
+                seed: 17,
+                cap: 512,
+                uniform,
+                contexts: contexts.len() as u64,
+                ..Default::default()
+            };
+            let u = std::sync::Arc::new(crate::workload::independent(&s, &contexts, &model, 2));
+            let sample = QuerySample::build_mixed(&s, &c, 10, model, Some(u), 2);
+            let cands: Vec<PairCand> = contexts
+                .iter()
+                .filter(|p| is_candidate_label(&s, p.a) && is_candidate_label(&s, p.b))
+                .copied()
+                .collect();
+            let values = pair_values(&s, &c, 10, &model, &f, &cands);
+            let mean = sample.mean_base_ns();
+            // The pairs' closed-form terms claim more than the workload's mean cost: a query
+            // holds many contexts, and a tiny clause makes most queries cheap.
+            let closed: f64 = values.iter().map(|v| v.prob * v.saving_ns).sum();
+            assert!(closed > 2.0 * mean, "μ {uniform}: {closed} vs {mean}");
+            for stop in [Stop::Elasticity, Stop::Budget] {
+                let params = Params {
+                    k: 10,
+                    r: 8,
+                    budget_bytes: u64::MAX / 4,
+                    model,
+                    stop,
+                    mean_ns: mean,
+                    index_bytes: 1 << 24,
+                    ..Default::default()
+                };
+                let sel = select(&s, &sample, &values, &params);
+                assert!(!sel.pairs.is_empty(), "μ {uniform}, {stop:?}: pairs taken");
+                for r in &sel.runs {
+                    let saving = r.island_saving_ns + r.pair_saving_ns;
+                    assert!(
+                        r.island_saving_ns >= 0.0 && r.pair_saving_ns >= 0.0 && saving <= mean,
+                        "μ {uniform}, {stop:?}, T {:?}: {saving} of {mean}",
+                        r.t_big
+                    );
+                    assert!(r.t_ns > 0.0);
+                }
+                // The kept run's cost is the sample's with its items built.
+                let best = &sel.best;
+                let taken: Vec<(u32, u32, u32)> = best
+                    .pairs
+                    .iter()
+                    .map(|&i| (values[i].cand.a, values[i].cand.b, values[i].cand.joint))
+                    .collect();
+                let built = sample.weighted_mean(&sample.costs_with(&best.islands, &taken));
+                assert!(
+                    (best.t_ns - built).abs() <= 1e-9 * mean,
+                    "μ {uniform}, {stop:?}: {} vs {built}",
+                    best.t_ns
+                );
+            }
+        }
     }
 
     #[test]

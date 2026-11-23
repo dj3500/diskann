@@ -288,7 +288,9 @@ fn meets(row: &[u32], clause: &[u32]) -> bool {
 /// query's match count `M` and smallest clause `s_min`: `exact = s_min · pred + M · dist`,
 /// `base` the post-filter route at rate `M / n`) and, for every single-label clause `ℓ` whose
 /// island would be cheaper, that island's cost (the post-filter route on `|P_ℓ|` points at
-/// rate `M / |P_ℓ|`).
+/// rate `M / |P_ℓ|`). For the combination postings ([`crate::select`]), every base-derived
+/// query's pairs of single-label clauses `{a}`, `{b}` whose labels can be in a stored pair
+/// ([`crate::select::is_candidate_label`]), and its match count.
 #[derive(Debug, Clone)]
 pub struct QuerySample {
     pub model: QueryModel,
@@ -297,6 +299,11 @@ pub struct QuerySample {
     pub base_ns: Vec<f64>,
     /// `(label, query, island cost)` of the cheaper islands, by label.
     recs: Vec<(u32, u32, f32)>,
+    /// `(a, b, query)` for every pair `a < b` of candidate labels of two single-label clauses
+    /// of a base-derived query, sorted.
+    data_pairs: Vec<(u32, u32, u32)>,
+    /// Match count `M` of each base-derived query.
+    data_m: Vec<f64>,
     /// Base-derived queries (the first `n_data` of `base_ns`).
     pub n_data: usize,
     /// The workload's independent queries `U` (weighted).
@@ -514,13 +521,29 @@ impl QuerySample {
             let (kl, clauses, cats) = scratch;
             let mut base = Vec::new();
             let mut recs = Vec::new();
+            let mut pairs = Vec::new();
+            let mut ms = Vec::new();
             for qi in ci * chunk..((ci + 1) * chunk).min(n_total) {
                 let (s_min, m) = if qi < model.n_queries {
                     if !draw_query(labels, &model, qi, kl, clauses, cats) {
                         base.push(0.0);
+                        ms.push(0.0);
                         continue;
                     }
                     let (_, s_min, m) = query_matches(labels, &model, kl, clauses);
+                    ms.push(m);
+                    // The pairs a stored combination posting could serve the query through:
+                    // single-label clauses (in distinct categories, by increasing label).
+                    let singles = clauses
+                        .iter()
+                        .filter(|&&(a, b)| b - a == 1)
+                        .map(|&(a, _)| kl[a])
+                        .filter(|&l| crate::select::is_candidate_label(labels, l));
+                    for (x, a) in singles.clone().enumerate() {
+                        for b in singles.clone().skip(x + 1) {
+                            pairs.push((a.min(b), a.max(b), qi as u32));
+                        }
+                    }
                     (s_min, m)
                 } else {
                     let w = &uq[qi - model.n_queries];
@@ -561,19 +584,26 @@ impl QuerySample {
                     }
                 }
             }
-            (base, recs)
+            (base, recs, pairs, ms)
         });
         let mut base_ns = Vec::with_capacity(n_total);
         let mut recs = Vec::new();
-        for (b, r) in parts {
+        let mut data_pairs = Vec::new();
+        let mut data_m = Vec::with_capacity(model.n_queries);
+        for (b, r, p, m) in parts {
             base_ns.extend(b);
             recs.extend(r);
+            data_pairs.extend(p);
+            data_m.extend(m);
         }
         recs.sort_unstable_by_key(|&(l, q, _)| (l, q));
+        data_pairs.sort_unstable();
         Self {
             model,
             base_ns,
             recs,
+            data_pairs,
+            data_m,
             n_data: model.n_queries,
             independent,
             costs: c.clone(),
@@ -647,24 +677,56 @@ impl QuerySample {
         (md, mu)
     }
 
-    /// Cost (ns) of independent query `q` served by a stored pair of `joint` points among its
-    /// labels: the pair's list read with the other clauses checked, the matches' distances
-    /// ([`pair_plan_ns`]); `None` for a base-derived query.
+    /// Cost (ns) of query `q` served by a stored pair of `joint` points among the labels of its
+    /// single-label clauses: the pair's list read with the other clauses checked, the matches'
+    /// distances ([`pair_plan_ns`]).
     pub fn pair_cost(&self, q: usize, joint: u32) -> Option<f64> {
-        let ind = self.independent.as_deref()?;
-        let w = ind.queries.get(q.checked_sub(self.n_data)?)?;
-        let m = w.joint.min(f64::from(joint)).max(1.0);
+        let m = match q.checked_sub(self.n_data) {
+            None => *self.data_m.get(q)?,
+            Some(i) => self.independent.as_deref()?.queries.get(i)?.joint,
+        };
+        let m = m.min(f64::from(joint)).max(1.0);
         Some(pair_plan_ns(&self.costs, self.n_points, joint, m))
     }
 
-    /// Each query's cheapest cost with every candidate island built (a lower bound on its cost
-    /// with islands; tests).
+    /// The base-derived queries (sample indices) with single-label clauses `{a}` and `{b}`
+    /// (`a < b`, both [`crate::select::is_candidate_label`]).
+    pub fn data_pair_queries(&self, a: u32, b: u32) -> impl Iterator<Item = usize> + '_ {
+        let lo = self
+            .data_pairs
+            .partition_point(|&(x, y, _)| (x, y) < (a, b));
+        self.data_pairs[lo..]
+            .iter()
+            .take_while(move |&&(x, y, _)| (x, y) == (a, b))
+            .map(|&(_, _, q)| q as usize)
+    }
+
+    /// Number of `(pair, base-derived query)` records ([`Self::data_pair_queries`]).
+    pub fn n_data_pairs(&self) -> usize {
+        self.data_pairs.len()
+    }
+
+    /// Each query's cost with the islands of `islands` (sorted) and the pairs `(a, b, joint)`
+    /// built: its cheapest route (tests).
     #[cfg(test)]
-    pub(crate) fn island_floor_ns(&self) -> Vec<f64> {
+    pub(crate) fn costs_with(&self, islands: &[u32], pairs: &[(u32, u32, u32)]) -> Vec<f64> {
         let mut x = self.base_ns.clone();
-        for &(_, q, isl) in &self.recs {
-            let c = &mut x[q as usize];
-            *c = c.min(f64::from(isl));
+        for &(l, q, isl) in &self.recs {
+            if islands.binary_search(&l).is_ok() {
+                let c = &mut x[q as usize];
+                *c = c.min(f64::from(isl));
+            }
+        }
+        for &(a, b, joint) in pairs {
+            let ind = self.independent();
+            let qs = self.data_pair_queries(a, b).chain(
+                ind.into_iter()
+                    .flat_map(|(u, first)| u.pair_queries(a, b).map(move |i| first + i)),
+            );
+            for q in qs {
+                let c = self.pair_cost(q, joint).expect("a sample query");
+                x[q] = x[q].min(c);
+            }
         }
         x
     }
@@ -883,6 +945,11 @@ impl<'s> IslandGreedy<'s> {
     /// The sample's independent queries and the index of the first.
     pub fn independent(&self) -> Option<(&Independent, usize)> {
         self.sample.independent()
+    }
+
+    /// The sample (its base-derived queries' pairs of single-label clauses).
+    pub fn sample(&self) -> &'s QuerySample {
+        self.sample
     }
 
     /// Cost of sample query `q` when a stored pair of `joint` points among its labels serves it.

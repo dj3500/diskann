@@ -2632,6 +2632,12 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             String::new()
         }
     );
+    // The base-derived queries' pairs of single-label clauses, on which the combination
+    // postings are valued (track G: none; its pair trees are valued in closed form there).
+    let data_pair_records = sample.as_ref().map(|s| s.n_data_pairs());
+    if let Some(r) = data_pair_records {
+        println!("{r} (pair, base-derived query) records value the combination postings");
+    }
     let t = Instant::now();
     // Labels whose bound on any pair's value reaches the floor (all of them without a floor).
     let keep: Vec<bool> = {
@@ -2818,6 +2824,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "mean_cost_derived_ns": mean_derived,
         "mean_cost_independent_ns": mean_u,
         "pair_contexts": contexts.len(),
+        "data_pair_records": data_pair_records,
         "independent": {
             "labels": n_single, "pairs": n_pair, "walks": n_walk,
             "k_max": independent.as_deref().map_or(0, |u| u.k_max),
