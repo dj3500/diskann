@@ -1596,17 +1596,24 @@ mod tests {
                 }
                 // The kept run's cost is the sample's with its items built.
                 let best = &sel.best;
-                let taken: Vec<(u32, u32, u32)> = best
+                let built_pairs: Vec<(u32, u32, u32)> = best
                     .pairs
                     .iter()
                     .map(|&i| (values[i].cand.a, values[i].cand.b, values[i].cand.joint))
                     .collect();
-                let built = sample.weighted_mean(&sample.costs_with(&best.islands, &taken));
+                let built = sample.weighted_mean(&sample.costs_with(&best.islands, &built_pairs));
                 assert!(
                     (best.t_ns - built).abs() <= 1e-9 * mean,
                     "μ {uniform}, {stop:?}: {} vs {built}",
                     best.t_ns
                 );
+                // The take record holds every item once; its marginal savings, none negative,
+                // add up to the run's saving.
+                let t = &best.taken;
+                assert_eq!(t.len(), best.islands.len() + best.pairs.len());
+                assert!(t.iter().all(|x| x.saving_ns >= 0.0));
+                let sum: f64 = t.iter().map(|x| x.saving_ns).sum();
+                assert!((sum - best.saving_ns()).abs() <= 1e-9 * mean, "{sum}");
             }
         }
     }

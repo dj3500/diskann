@@ -501,7 +501,13 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
   edge, the routers' vectors, a pair tree's root entry); `--tree-bytes rows` (a fixed row per
   router) reproduces selections made before that accounting.
 - Each run writes a JSON report (the runs per threshold, bytes, the model's mean costs, coverage
-  of `--report` predicate sets, `provenance`). `--save-candidates` / `--load-candidates` keep the
+  of `--report` predicate sets, `provenance`) and `sel-b<B>.taken.tsv`: the kept run's items in
+  the order the greedy took them (`order`, `kind`, labels `a` and `b`, `key` = value per byte at
+  the take, `saving_ns` = marginal expected saving per query, `bytes`). The keys do not increase
+  along the order, so a prefix is the selection the greedy would have stopped with (a trim to a
+  smaller budget keeps one), and the marginal savings add up to the report's
+  `expected_saving_ns` (the matrix of the pairs' big labels, charged first, is not an item).
+  `--save-candidates` / `--load-candidates` keep the
   counting pass over every co-occurring label pair (the costly part on large label stores; the
   file, magic `SELCAND3`, records the label store's fingerprint after its records: a `u64`
   length and the provenance JSON; `SELCAND2` / `SELCAND1` files of earlier versions load with a
