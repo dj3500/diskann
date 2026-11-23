@@ -595,6 +595,25 @@ pub fn pair_value_bound(
     (own / (16.0 * nf) + other * f[a as usize] * f_max / 64.0) * s * c.pred(s / nf)
 }
 
+/// One item the greedy took, in the order taken. Its key is the greedy's value per byte at the
+/// take (expected saving per query per byte given the items taken before it); savings only fall
+/// as items are taken, so the keys do not increase along the order and a prefix of it is the
+/// selection the greedy would have made had it stopped there (what a trim to a smaller budget
+/// keeps).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Taken {
+    /// A per-label item (an island; track G: a router tree): `b` is `u32::MAX`.
+    pub pair: bool,
+    pub a: u32,
+    pub b: u32,
+    /// Value per byte at the take (ns per query per byte).
+    pub key: f64,
+    /// Marginal expected saving per query (ns).
+    pub saving_ns: f64,
+    /// The selector's model bytes of the item.
+    pub bytes: u64,
+}
+
 /// One run of the greedy (see [`select`]).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Run {
@@ -619,6 +638,9 @@ pub struct Run {
     /// the run with the smallest product is kept).
     pub t_ns: f64,
     pub index_bytes: u64,
+    /// The items in the order taken (written by `flab select` as `taken.tsv`).
+    #[serde(skip)]
+    pub taken: Vec<Taken>,
 }
 
 impl Run {
@@ -805,6 +827,14 @@ fn run<G: LabelKind>(
             out.island_saving_ns += g;
             out.island_bytes += bytes;
             out.islands.push(gr.label(x));
+            out.taken.push(Taken {
+                pair: false,
+                a: gr.label(x),
+                b: u32::MAX,
+                key,
+                saving_ns: g,
+                bytes,
+            });
             t_cur -= g;
             b_cur += bytes as f64;
             cut = key;
@@ -827,6 +857,14 @@ fn run<G: LabelKind>(
                 out.pair_saving_ns += g;
                 out.pair_bytes += v.bytes;
                 out.pairs.push(i);
+                out.taken.push(Taken {
+                    pair: true,
+                    a: v.cand.a,
+                    b: v.cand.b,
+                    key,
+                    saving_ns: g,
+                    bytes: v.bytes,
+                });
                 t_cur -= g;
                 b_cur += v.bytes as f64;
                 cut = key;
@@ -1394,6 +1432,30 @@ mod tests {
         assert!(none.best.islands.is_empty() && none.pairs.is_empty());
         let big = select(&s, &sample, &values, &params(1 << 40, Stop::Elasticity));
         assert_eq!(big.best.islands, all.best.islands);
+        // The take record: every item once, keys not increasing, the totals of the run; a
+        // smaller budget's selection starts like it (the greedy's order, cut where it stops).
+        for sel in [&all, &big] {
+            let t = &sel.best.taken;
+            assert_eq!(t.len(), sel.best.islands.len() + sel.best.pairs.len());
+            assert!(t.windows(2).all(|w| w[1].key <= w[0].key * (1.0 + 1e-9)));
+            let mut isl: Vec<u32> = t.iter().filter(|x| !x.pair).map(|x| x.a).collect();
+            isl.sort_unstable();
+            assert_eq!(isl, sel.best.islands);
+            let mut prs: Vec<(u32, u32)> =
+                t.iter().filter(|x| x.pair).map(|x| (x.a, x.b)).collect();
+            prs.sort_unstable();
+            assert_eq!(prs, sel.pairs);
+            let bytes: u64 = t.iter().map(|x| x.bytes).sum();
+            assert_eq!(bytes, sel.best.island_bytes + sel.best.pair_bytes);
+            let saving: f64 = t.iter().map(|x| x.saving_ns).sum();
+            assert!((saving - sel.best.saving_ns()).abs() <= 1e-6 * saving.abs().max(1.0));
+        }
+        if let (Some(first), Some(_)) = (all.best.taken.first(), all.best.taken.get(1)) {
+            let mut p = params(1 << 20, Stop::Budget);
+            p.budget_bytes = all.best.fixed_bytes + first.bytes;
+            let one = select(&s, &sample, &values, &p);
+            assert!(one.runs.iter().any(|r| r.taken.first() == Some(first)));
+        }
     }
 
     #[test]
