@@ -764,27 +764,10 @@ fn start_tables_of_one_graph_share_it() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Provenance: a sidecar built from another label store of the same shape
-/// (two points swap their labels: the same counts, sizes and dictionary) is rejected, loads with
-/// `allow_provenance_mismatch` and a warning in `run.json`; one written before provenance was
-/// recorded loads with a warning; a calibration of another point count is rejected.
-#[test]
-fn sidecars_of_another_label_store_are_rejected() {
-    use diskann_filter_lab::{pairs::PairIndex, provenance::Provenance};
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("flab-run-provenance-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let d = write_dataset(&dir);
-    let (px, _) = PairIndex::build(&d.labels, 1 << 20, 1);
-    px.write_with(
-        &dir.join("pairs.flab"),
-        Some(&Provenance::of_labels(&d.labels)),
-    )
-    .unwrap();
-    px.write(&dir.join("pairs-legacy.flab")).unwrap();
-    // Two points of one `m` label and different `g` labels other than `g=0` and `g=1` swap
-    // their rows: the same counts, sizes and dictionary; the stored pair the loader's sampled
-    // content check reads (the first) keeps its list.
+/// `d`'s label store with two points swapping their rows: the same counts, sizes and dictionary.
+/// The points share their `m` label and have different `g` labels other than `g=0` and `g=1`, so
+/// the stored pair the pairs loader's sampled content check reads (the first) keeps its list.
+fn swap_two_points(d: &Data) -> LabelStore {
     let name = |p: u32, c: &str| -> String {
         let row = d.labels.row(p);
         row.iter()
@@ -820,7 +803,28 @@ fn sidecars_of_another_label_store_are_rejected() {
     }
     let swapped = b.finish().unwrap();
     assert_eq!(swapped.dict_hash(), d.labels.dict_hash());
-    swapped.write(&dir.join("labels.flab")).unwrap();
+    swapped
+}
+
+/// Provenance: a sidecar built from another label store of the same shape
+/// (two points swap their labels: the same counts, sizes and dictionary) is rejected, loads with
+/// `allow_provenance_mismatch` and a warning in `run.json`; one written before provenance was
+/// recorded loads with a warning; a calibration of another point count is rejected.
+#[test]
+fn sidecars_of_another_label_store_are_rejected() {
+    use diskann_filter_lab::{pairs::PairIndex, provenance::Provenance};
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flab-run-provenance-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = write_dataset(&dir);
+    let (px, _) = PairIndex::build(&d.labels, 1 << 20, 1);
+    px.write_with(
+        &dir.join("pairs.flab"),
+        Some(&Provenance::of_labels(&d.labels)),
+    )
+    .unwrap();
+    px.write(&dir.join("pairs-legacy.flab")).unwrap();
+    swap_two_points(&d).write(&dir.join("labels.flab")).unwrap();
     let toml = |pairs: &str, calibration: &str| {
         let p = dir.join(format!("prov-{pairs}-{}.toml", calibration.len()));
         std::fs::write(
@@ -908,6 +912,133 @@ pairs_sidecar = "{ds}/{pairs}"
     assert!(
         format!("{err:#}").contains("measured on other data"),
         "{err:#}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Provenance of `flab steiner --leaf-starts` trees: the start table (the members of each label
+/// of at most one block, the tree roots of the others) records the label store and every node of
+/// the new graph; a run on the trees takes the tree route through the member starts; after a
+/// same-shape label change (two points swap their labels, so two member lists no longer equal
+/// their postings) the run rejects the table.
+#[test]
+fn leaf_start_trees_are_bound_to_their_label_store() {
+    use clap::Parser;
+    use diskann_filter_lab::{
+        build::steiner::{self, SteinerArgs},
+        provenance::{self, GraphFp, LabelsFp},
+        starts,
+    };
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        steiner: SteinerArgs,
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flab-run-leaf-starts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let d = write_dataset(&dir);
+    let (gdir, trees) = (dir.join("graph"), dir.join("trees"));
+    let path = |p: &Path| p.display().to_string();
+    let mut argv: Vec<String> = ["flab-steiner", "--dataset"].map(String::from).to_vec();
+    argv.extend([
+        path(&dir),
+        "--graph".into(),
+        path(&gdir),
+        "--starts".into(),
+        path(&gdir.join("starts.flab")),
+        "--out-dir".into(),
+        path(&trees),
+    ]);
+    argv.extend(
+        [
+            "--construction",
+            "tree",
+            "--block",
+            "64",
+            "--min-size",
+            "0",
+            "--max-size",
+            "n/1",
+            "--router",
+            "centroid",
+            "--partition",
+            "kmeans",
+            "--leaf-starts",
+            "-t",
+            "1",
+        ]
+        .map(String::from),
+    );
+    steiner::run(&Cli::try_parse_from(argv).unwrap().steiner).unwrap();
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(trees.join("meta.json")).unwrap()).unwrap();
+    let small = (0..d.labels.n_labels() as u32)
+        .filter(|&l| d.labels.posting_len(l) <= 64)
+        .count();
+    assert!(small > 0 && small < d.labels.n_labels(), "{small}");
+    assert_eq!(meta["labels_with_member_starts"], small);
+    assert_eq!(meta["labels_with_routers"], d.labels.n_labels() - small);
+    let recorded = provenance::of_file(
+        &trees.join("starts.flab"),
+        starts::MAGIC,
+        starts::N_SECTIONS,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(recorded.labels, Some(LabelsFp::of(&d.labels)));
+    assert_eq!(
+        recorded.graph,
+        Some(GraphFp::of(
+            &Graph::read(&trees.join("graph.flab")).unwrap()
+        ))
+    );
+    assert_eq!(meta["provenance"], recorded.to_json());
+
+    let toml = dir.join("leaf.toml");
+    std::fs::write(
+        &toml,
+        format!(
+            r#"
+[experiment]
+name = "leaf-starts-test"
+dataset = "{ds}"
+graph = "{ds}/trees"
+panel = "panels/p.tsv"
+split = "discovery"
+k = [5]
+efforts = [10]
+mode = "trace"
+runs_dir = "{ds}/runs"
+
+[[config]]
+name = "tree"
+starts = "label(c*)+global"
+collector = "heap"
+tree_route = "row_scan"
+tree_effort = "fixed(4)"
+"#,
+            ds = dir.display()
+        ),
+    )
+    .unwrap();
+    let opts = run::Options::default();
+    let dirs = run::run(&toml, &opts).unwrap();
+    let pq = std::fs::read_to_string(dirs[0].join("perquery.tsv")).unwrap();
+    let header: Vec<&str> = pq.lines().next().unwrap().split('\t').collect();
+    let route = header.iter().position(|&c| c == "route").unwrap();
+    assert!(
+        pq.lines()
+            .skip(1)
+            .any(|l| l.split('\t').nth(route) == Some("tree")),
+        "{pq}"
+    );
+
+    swap_two_points(&d).write(&dir.join("labels.flab")).unwrap();
+    let err = format!("{:#}", run::run(&toml, &opts).unwrap_err());
+    assert!(
+        err.contains("starts.flab") && err.contains("built from other inputs"),
+        "{err}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
