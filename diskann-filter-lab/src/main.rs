@@ -605,6 +605,10 @@ struct SelectArgs {
     /// `--track graph`: also select pair trees (`false`: router trees per label only).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pair_trees: bool,
+    /// `--track hybrid`: also select islands (`false`: combination postings only, on the same
+    /// workload, prices, budget and stop).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    islands: bool,
     /// `--track graph`: mean router fan-out `b̄` of the k-means trees (fan-out bound 64).
     #[arg(long, default_value_t = 26.0)]
     tree_fanout: f64,
@@ -2409,6 +2413,10 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
     let parts = select::IndexBytes::of(&a.dataset, &a.graph, &store, T::DTYPE.size())?;
     let n = store.n_points();
     let graph_track = a.track == SelectTrack::Graph;
+    ensure!(
+        a.islands || !graph_track,
+        "--islands false selects the hybrid's combination postings alone (--track hybrid)"
+    );
     let tree_bytes = select_tree_bytes(a.track, a.tree_bytes)?;
     let pair_alternative = select_pair_alternative(a.track, a.pair_alternative)?;
     let fixed_max = match &a.fixed_trees_max_size {
@@ -2733,7 +2741,8 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         };
         let t = Instant::now();
         let sel = match (&sample, &tree_sample, &pricing) {
-            (Some(sample), _, _) => select::select(&store, sample, &values, &params),
+            (Some(sample), _, _) if a.islands => select::select(&store, sample, &values, &params),
+            (Some(sample), _, _) => select::select_pairs(&store, sample, &values, &params),
             (_, Some(ts), Some(pr)) => select::select_with(
                 &store,
                 || {
@@ -2818,6 +2827,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         "route_curves": a.route_curves,
         "unreachable": if a.unreachable == SelectUnreachable::AtMax { "at-max" } else { "must" },
         "pair_trees": a.pair_trees,
+        "island_candidates": a.islands,
         "fixed_trees": fixed.map(|(nt, s, b)| json!({
             "max_size": fixed_max, "labels": nt, "expected_saving_ns": s, "model_bytes": b,
         })),

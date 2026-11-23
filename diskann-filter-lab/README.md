@@ -478,9 +478,11 @@ calibrated unit costs (`flab calibrate` of the graph the index searches); no que
 - **Kinds.** `--track hybrid` (default): combination postings (pairs of labels, the exact path's
   `pair` plan) and per-label sub-graphs (islands, the cost crossover's `island` route), written as
   `sel-b<B>.pairs.flab` / `sel-b<B>.islands.flab` (a kind with nothing selected writes no file) and
-  built. `--track graph`: a router tree per label and a pair tree per label pair, valued against
-  the graph router alone; writes the selected labels (`sel-b<B>.trees.txt`, for `flab steiner
-  --labels-file`) and pairs (`sel-b<B>.pairs.flab`, for `flab steiner --construction pairs`).
+  built; `--islands false` selects the combination postings alone (no island candidates; the same
+  workload, prices, budget and stop). `--track graph`: a router tree per label and a pair tree
+  per label pair, valued against the graph router alone; writes the selected labels
+  (`sel-b<B>.trees.txt`, for `flab steiner --labels-file`) and pairs (`sel-b<B>.pairs.flab`, for
+  `flab steiner --construction pairs`).
   With `--fixed-trees-max-size SIZE` the label trees are fixed by a size cap instead (every label
   of 1 to SIZE points, as `flab steiner --construction tree --min-size 0 --max-size SIZE` builds
   them; their modelled bytes count in `B` unless `--index-bytes` is given) and only pair trees
