@@ -2877,12 +2877,42 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
         r[format!("{kind}_sizes")] = json!(sizes);
         r["n_pairs"] = json!(sel.pairs.len());
         r["n_big"] = json!(sel.big_labels.len());
+        r["taken"] = json!({
+            "items": sel.best.taken.len(),
+            "file": format!("sel-b{}.taken.tsv", tag(b)),
+            "order": "the best run's items in the order taken; key = value per byte at the take \
+                      (expected saving per query per byte given the items before it; does not \
+                      increase along the order, so a prefix is the selection stopped there)",
+        });
         r["build"] = extra;
         r
+    };
+    // The best run's items in the order taken (a trim to a smaller budget keeps a prefix).
+    let write_taken = |b: f64, sel: &select::Selection| -> Result<()> {
+        let mut tsv = String::from("order\tkind\ta\tb\tkey\tsaving_ns\tbytes\n");
+        for (i, t) in sel.best.taken.iter().enumerate() {
+            let kind = match (t.pair, graph_track) {
+                (true, _) => "pair",
+                (false, true) => "tree",
+                (false, false) => "island",
+            };
+            let b = if t.pair {
+                t.b.to_string()
+            } else {
+                String::new()
+            };
+            tsv += &format!(
+                "{i}\t{kind}\t{}\t{b}\t{:e}\t{:e}\t{}\n",
+                t.a, t.key, t.saving_ns, t.bytes
+            );
+        }
+        std::fs::write(a.out_dir.join(format!("sel-b{}.taken.tsv", tag(b))), tsv)?;
+        Ok(())
     };
     if a.dry_run {
         for (b, _, sel, select_s) in &sels {
             let r = report_of(*b, sel, *select_s, Value::Null);
+            write_taken(*b, sel)?;
             std::fs::write(
                 a.out_dir.join(format!("sel-b{}.selection.json", tag(*b))),
                 serde_json::to_string_pretty(&r)? + "\n",
@@ -3006,6 +3036,7 @@ fn select_command<T: diskann_filter_lab::build::BuildElement>(a: SelectArgs) -> 
             });
         }
         let r = report_of(*b, sel, *select_s, build);
+        write_taken(*b, sel)?;
         std::fs::write(
             a.out_dir.join(format!("sel-b{}.json", tag(*b))),
             serde_json::to_string_pretty(&r)? + "\n",
