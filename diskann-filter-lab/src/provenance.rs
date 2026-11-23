@@ -19,7 +19,12 @@
 //!   same over `samples(n_nodes)`, where a row contributes its degree and then its neighbour ids
 //!   in stored order. `flab steiner` appends routers without changing the rows of the base
 //!   graph's nodes, so a Steiner graph and its base share the data part (`n_data`,
-//!   `data_edges`, `data_hash`).
+//!   `data_edges`, `data_hash`). A graph is fingerprinted as `flab run` loads it: a DiskANN
+//!   index (`<prefix>` with its vector file `<prefix>.data`) has its frozen points as the last
+//!   nodes (auxiliary: in `n_nodes`, `edges` and `hash`, not in the data part), and the unused
+//!   empty list that ends the Rust in-memory provider's graph files is no node; `flab
+//!   provenance` reads such an index in one pass over the graph file and the vector file's
+//!   header (no vectors).
 //! - `samples(m)`: every position `0..m` when `m ≤ 65,536`, else 1,024 runs of 64 consecutive
 //!   positions starting at `⌊i·m/1,024⌋` (`i = 0..1,024`), in increasing order: few random
 //!   reads of a file.
@@ -46,6 +51,7 @@
 //! not bound to a graph); the base shape and the CPU model for calibrations.
 
 use std::{
+    collections::{HashMap, HashSet},
     io::{Read, Seek},
     path::Path,
 };
@@ -172,22 +178,23 @@ pub struct GraphFp {
 
 impl GraphFp {
     pub fn of(g: &Graph) -> Self {
-        Self::from_rows(
-            g.n_data(),
-            g.n_nodes(),
-            |v| g.degree(v as u32) as u64,
-            |v, out| {
-                out.clear();
-                out.extend_from_slice(g.neighbors(v as u32));
-                Ok(())
-            },
-        )
+        let data_edges: u64 = (0..g.n_data()).map(|v| g.degree(v as u32) as u64).sum();
+        let edges = data_edges
+            + (g.n_data()..g.n_nodes())
+                .map(|v| g.degree(v as u32) as u64)
+                .sum::<u64>();
+        Self::from_rows(g.n_data(), g.n_nodes(), data_edges, edges, |v, out| {
+            out.clear();
+            out.extend_from_slice(g.neighbors(v as u32));
+            Ok(())
+        })
         .expect("in-memory rows")
     }
 
     /// The fingerprint of a graph file: of `graph.flab` (or a directory holding one) from its
     /// degrees and the sampled rows only (unbuffered reads: a buffered reader would refill its
-    /// buffer at every seek); of a DiskANN graph file by loading it.
+    /// buffer at every seek); of a DiskANN graph file as `flab run` loads it, see
+    /// [`Self::of_diskann`].
     pub fn of_path(path: &Path) -> Result<Self> {
         let p = if path.is_dir() {
             path.join("graph.flab")
@@ -195,7 +202,15 @@ impl GraphFp {
             path.to_owned()
         };
         if container::peek_magic(&p)? != *graph::MAGIC {
-            return Ok(Self::of(&diskann_io::open(&p, None)?));
+            let data = diskann_io::data_path(&p);
+            let rows = match data.exists() {
+                true => Some(diskann_io::vector_file_shape(&data)?.0),
+                false => None,
+            };
+            let open =
+                || std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()));
+            return Self::of_diskann(open()?, open()?, rows)
+                .with_context(|| format!("fingerprinting the DiskANN graph {}", p.display()));
         }
         let file = std::fs::File::open(&p).with_context(|| format!("opening {}", p.display()))?;
         let mut r = container::Reader::new(file, graph::MAGIC)?;
@@ -207,32 +222,59 @@ impl GraphFp {
             "{}: a degree exceeds the row size",
             p.display()
         );
-        Self::from_rows(
-            n_data,
-            n_nodes,
-            |v| u64::from(degrees[v]),
-            |v, out| {
-                out.resize(degrees[v] as usize, 0);
-                r.read_range(1, n_nodes * r_max, v * r_max, out.as_mut_slice())
-            },
-        )
+        let data_edges: u64 = degrees[..n_data].iter().map(|&d| u64::from(d)).sum();
+        let edges = data_edges + degrees[n_data..].iter().map(|&d| u64::from(d)).sum::<u64>();
+        Self::from_rows(n_data, n_nodes, data_edges, edges, |v, out| {
+            out.resize(degrees[v] as usize, 0);
+            r.read_range(1, n_nodes * r_max, v * r_max, out.as_mut_slice())
+        })
         .with_context(|| format!("fingerprinting {}", p.display()))
     }
 
+    /// The fingerprint of a DiskANN graph file (two readers of it: its node layout, then one
+    /// sequential pass over the lists) as `flab run` loads the index with its vector file of
+    /// `rows` rows: the last `F` of those nodes are the frozen points (auxiliary nodes, in the
+    /// whole graph's part), a trailing unused list is no node. Reads no vectors: only the
+    /// vector file's header gives `rows` (`None`: no vector file, for graphs without frozen
+    /// points).
+    pub fn of_diskann<R: Read + Seek>(layout: R, lists: R, rows: Option<usize>) -> Result<Self> {
+        let (header, n_nodes) = diskann_io::index_nodes(layout, rows)?;
+        let n_data = n_nodes - header.n_frozen as usize;
+        let wanted: HashSet<usize> = samples(n_data).chain(samples(n_nodes)).collect();
+        let mut kept: HashMap<usize, Vec<u32>> = HashMap::with_capacity(wanted.len());
+        let (mut data_edges, mut edges) = (0u64, 0u64);
+        diskann_io::scan_index(lists, n_nodes, |v, list| {
+            edges += list.len() as u64;
+            if v < n_data {
+                data_edges += list.len() as u64;
+            }
+            if wanted.contains(&v) {
+                kept.insert(v, list.to_vec());
+            }
+            Ok(())
+        })?;
+        Self::from_rows(n_data, n_nodes, data_edges, edges, |v, out| {
+            out.clear();
+            out.extend_from_slice(&kept[&v]);
+            Ok(())
+        })
+    }
+
+    /// From the edge counts and the rows of the sampled nodes (a row contributes its degree, then
+    /// its neighbour ids).
     fn from_rows(
         n_data: usize,
         n_nodes: usize,
-        degree: impl Fn(usize) -> u64,
+        data_edges: u64,
+        edges: u64,
         mut row: impl FnMut(usize, &mut Vec<u32>) -> Result<()>,
     ) -> Result<Self> {
-        let data_edges: u64 = (0..n_data).map(&degree).sum();
-        let edges = data_edges + (n_data..n_nodes).map(&degree).sum::<u64>();
         let mut buf = Vec::new();
         let mut hash = |n: usize| -> Result<u64> {
             let mut h = Hasher::default();
             for v in samples(n) {
-                h.push(degree(v));
                 row(v, &mut buf)?;
+                h.push(buf.len() as u64);
                 for &u in &buf {
                     h.push(u64::from(u));
                 }
@@ -675,5 +717,55 @@ mod tests {
         let mut k = g.clone();
         k.set_neighbors(2, &[1]).unwrap();
         assert!(!GraphFp::of(&k).same_data(&a));
+    }
+
+    /// A DiskANN graph file in the layout of `diskann_io` (header, then each list).
+    fn diskann_file(start: u32, n_frozen: u64, lists: &[&[u32]]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for list in lists {
+            body.extend_from_slice(&(list.len() as u32).to_le_bytes());
+            body.extend(list.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        let h = diskann_io::Header {
+            file_size: diskann_io::HEADER_BYTES + body.len() as u64,
+            max_degree: 3,
+            start,
+            n_frozen,
+        };
+        [h.to_bytes().to_vec(), body].concat()
+    }
+
+    #[test]
+    fn a_diskann_index_is_fingerprinted_as_loaded_with_its_frozen_points() {
+        use std::io::Cursor;
+        // Three data points, a frozen point (node 3, the start) and the unused list of the Rust
+        // in-memory provider's files; the vector file has 4 rows.
+        let lists: [&[u32]; 5] = [&[1, 3], &[2], &[0], &[0, 1, 2], &[]];
+        let file = diskann_file(3, 1, &lists);
+        let data = [&4u32.to_le_bytes()[..], &1u32.to_le_bytes(), &[1, 2, 3, 4]].concat();
+        let (g, _) = diskann_io::read_index(
+            Cursor::new(&file),
+            Some((Cursor::new(&data), crate::vectors::DType::U8)),
+        )
+        .unwrap();
+        let fp = GraphFp::of_diskann(Cursor::new(&file), Cursor::new(&file), Some(4)).unwrap();
+        assert_eq!(fp, GraphFp::of(&g));
+        assert_eq!(
+            (fp.n_data, fp.n_nodes, fp.data_edges, fp.edges),
+            (3, 4, 4, 7)
+        );
+        // Without the vector file the node count is unknown.
+        assert!(GraphFp::of_diskann(Cursor::new(&file), Cursor::new(&file), None).is_err());
+        // The frozen point's row is in the whole graph's part only.
+        let other = diskann_file(3, 1, &[&[1, 3], &[2], &[0], &[0, 2], &[]]);
+        let fo = GraphFp::of_diskann(Cursor::new(&other), Cursor::new(&other), Some(4)).unwrap();
+        assert!(fo.same_data(&fp) && fo != fp);
+        // Without frozen points the lists are the nodes, as without a vector file.
+        let plain = diskann_file(0, 0, &lists[..4]);
+        let (g, _) =
+            diskann_io::read_index::<_, Cursor<Vec<u8>>>(Cursor::new(&plain), None).unwrap();
+        let fp = GraphFp::of_diskann(Cursor::new(&plain), Cursor::new(&plain), None).unwrap();
+        assert_eq!(fp, GraphFp::of(&g));
+        assert_eq!(fp.n_nodes, 4);
     }
 }

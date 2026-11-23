@@ -693,8 +693,13 @@ Fingerprints (JSON; 64-bit hashes as `"0x"` and 16 hexadecimal digits):
 - `graph`: `n_data`, `n_nodes`, `data_edges` (the out-degrees of the data points summed),
   `edges` (of all nodes), `data_hash` and `hash`: `H` over the rows of the nodes
   `samples(m)` with `m = n_data` resp. `n_nodes`, a row contributing its degree, then its
-  neighbour ids in stored order. Graphs are fingerprinted as loaded (`graph.flab`, or a
-  DiskANN index read as `flab import-graph` reads it). `flab steiner` appends routers without
+  neighbour ids in stored order. Graphs are fingerprinted as `flab run` loads them
+  (`graph.flab`, or a DiskANN index `<prefix>` with its vector file `<prefix>.data`: the
+  index's `F` frozen points are its last nodes, auxiliary nodes counted in `n_nodes`, `edges`
+  and `hash` but not in the data part, and the unused empty list that ends the Rust in-memory
+  provider's graph files is no node; `flab provenance` and `flab select` read such an index in
+  one sequential pass over the graph file plus the vector file's header, no vectors; without a
+  vector file the lists are the nodes, which needs `F = 0`). `flab steiner` appends routers without
   changing the rows of the base graph's nodes, so a Steiner graph and its base graph share the
   data part (`n_data`, `data_edges`, `data_hash`).
 - `base`: `n`, `dim`, `dtype` (`"u8"` or `"f32"`); `cpu_model`: `model name` of

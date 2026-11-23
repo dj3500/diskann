@@ -30,7 +30,7 @@
 use std::{
     fs::File,
     io::{BufReader, Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -244,6 +244,109 @@ pub fn read_index_files(graph: &Path, data: Option<(&Path, DType)>) -> Result<(G
         .with_context(|| format!("reading the DiskANN graph {}", graph.display()))
 }
 
+/// The vector file of the DiskANN index with graph file `graph`: `<graph>.data`.
+pub fn data_path(graph: &Path) -> PathBuf {
+    let mut p = graph.as_os_str().to_owned();
+    p.push(".data");
+    PathBuf::from(p)
+}
+
+/// Shape of a `.bin` vector file from its header and size: (rows, dimension, element type, `u8`
+/// or `f32`).
+pub fn vector_file_shape(path: &Path) -> Result<(usize, usize, DType)> {
+    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let len = f.metadata()?.len();
+    let (rows, dim) = read_bin_header(&mut f)?;
+    let cells = (rows * dim) as u64;
+    match [DType::U8, DType::F32]
+        .into_iter()
+        .find(|t| len == 8 + cells * t.size() as u64)
+    {
+        Some(t) => Ok((rows, dim, t)),
+        None => bail!(
+            "{}: {len} bytes are no {rows} × {dim} u8 or f32 vectors",
+            path.display()
+        ),
+    }
+}
+
+/// The node layout [`read_index`] gives a DiskANN graph file, without reading the lists when
+/// the vector file's row count `rows` is known: the header and the node count (`rows`; without
+/// it the number of lists, which needs a graph without frozen points: the lists of the Rust
+/// in-memory provider's files end with an unused one that only the vector file tells apart).
+pub fn index_nodes<R: Read + Seek>(graph: R, rows: Option<usize>) -> Result<(Header, usize)> {
+    let mut r = BufReader::with_capacity(1 << 22, graph);
+    let file_len = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(0))?;
+    let header = Header::read(&mut r)?;
+    ensure!(
+        header.file_size == file_len,
+        "the header says {} bytes but the file has {file_len}",
+        header.file_size
+    );
+    let n_frozen = usize::try_from(header.n_frozen).unwrap_or(usize::MAX);
+    let n_nodes = match rows {
+        Some(rows) => rows,
+        None => {
+            ensure!(
+                n_frozen == 0,
+                "the graph has {n_frozen} frozen points; its node count needs the vector file"
+            );
+            count_lists(&mut r, &header)?
+        }
+    };
+    ensure!(
+        n_frozen <= n_nodes,
+        "{n_frozen} frozen points but {n_nodes} nodes"
+    );
+    ensure!(
+        (header.start as usize) < n_nodes,
+        "start {} out of range ({n_nodes} nodes)",
+        header.start
+    );
+    Ok((header, n_nodes))
+}
+
+/// Reads the adjacency lists of the `n_nodes` nodes of a DiskANN graph file (see
+/// [`index_nodes`]) in one sequential pass and calls `row(id, neighbors)` for each, with the
+/// checks of [`read_index`] (degrees, neighbor ids, at most one trailing empty list); reads no
+/// vectors and keeps no lists.
+pub fn scan_index<R: Read + Seek>(
+    graph: R,
+    n_nodes: usize,
+    mut row: impl FnMut(usize, &[u32]) -> Result<()>,
+) -> Result<()> {
+    let mut r = BufReader::with_capacity(1 << 22, graph);
+    let file_len = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(0))?;
+    let header = Header::read(&mut r)?;
+    let r_max = header.max_degree as usize;
+    let (mut pos, mut list) = (HEADER_BYTES, Vec::with_capacity(r_max));
+    for id in 0..n_nodes {
+        ensure!(
+            file_len - pos >= 4,
+            "the graph has {id} adjacency lists for {n_nodes} nodes"
+        );
+        let k = read_u32(&mut r)? as usize;
+        ensure!(
+            k <= r_max && file_len - pos - 4 >= 4 * k as u64,
+            "node {id}: degree {k} exceeds the maximum degree {r_max} or the file"
+        );
+        list.resize(k, 0);
+        r.read_exact(bytemuck::cast_slice_mut(&mut list))?;
+        if let Some(&v) = list.iter().find(|&&v| v as usize >= n_nodes) {
+            bail!("node {id}: neighbor {v} out of range ({n_nodes} nodes)");
+        }
+        row(id, &list)?;
+        pos += 4 + 4 * k as u64;
+    }
+    ensure!(
+        pos == file_len || (file_len - pos == 4 && read_u32(&mut r)? == 0),
+        "the graph has more adjacency lists than {n_nodes} nodes and one unused empty list"
+    );
+    Ok(())
+}
+
 /// Loads a graph from `graph.flab`, or directly from a DiskANN graph file (with its vector
 /// file, see [`read_index`]).
 pub fn open(path: &Path, data: Option<(&Path, DType)>) -> Result<Graph> {
@@ -449,6 +552,46 @@ mod tests {
         assert!(with_rows(2, &LISTS).is_err());
         assert!(with_rows(3, &LISTS).is_err());
         assert!(with_rows(3, &[&[1], &[0], &[], &[]]).is_ok());
+    }
+
+    /// The lists `scan_index` reads, with the node count `index_nodes` gives.
+    fn scan(file: &[u8], rows: Option<usize>) -> Result<(Header, Vec<Vec<u32>>)> {
+        let (header, n_nodes) = index_nodes(Cursor::new(file), rows)?;
+        let mut lists = Vec::new();
+        scan_index(Cursor::new(file), n_nodes, |id, list| {
+            assert_eq!(id, lists.len());
+            lists.push(list.to_vec());
+            Ok(())
+        })?;
+        Ok((header, lists))
+    }
+
+    #[test]
+    fn scanning_reads_the_nodes_read_index_reads() {
+        // A frozen point (node 3) and the Rust in-memory provider's unused list: 4 nodes, as
+        // with the vector file's 4 rows.
+        let file = graph_file(3, 3, 1, &[LISTS[0], LISTS[1], LISTS[2], LISTS[3], &[]]);
+        let data = bin_file::<u8>(4, 2, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let (g, _) = read_index(Cursor::new(&file), Some((Cursor::new(data), DType::U8))).unwrap();
+        let (h, lists) = scan(&file, Some(4)).unwrap();
+        assert_eq!((h.n_frozen, lists.len()), (1, g.n_nodes()));
+        for (id, list) in lists.iter().enumerate() {
+            assert_eq!(g.neighbors(id as u32), &list[..]);
+        }
+        // Without frozen points the lists are the nodes.
+        let file = graph_file(3, 2, 0, &LISTS);
+        assert_eq!(scan(&file, None).unwrap().1.len(), 4);
+        // The node count of a graph with frozen points needs the vector file's rows; lists
+        // missing for them, a second extra list or a non-empty extra list are errors.
+        let file = graph_file(3, 3, 1, &LISTS);
+        assert!(scan(&file, None).is_err());
+        assert!(scan(&file, Some(4)).is_ok());
+        assert!(scan(&file, Some(5)).is_err());
+        let lists: [&[u32]; 4] = [&[1], &[0], &[], &[]];
+        assert!(scan(&graph_file(3, 1, 1, &lists), Some(3)).is_ok());
+        assert!(scan(&graph_file(3, 1, 1, &lists), Some(2)).is_err());
+        let lists: [&[u32]; 4] = [&[1], &[0], &[], &[0]];
+        assert!(scan(&graph_file(3, 1, 1, &lists), Some(3)).is_err());
     }
 
     #[test]

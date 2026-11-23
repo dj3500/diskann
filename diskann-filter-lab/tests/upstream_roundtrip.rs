@@ -6,7 +6,8 @@
 //! Round trip through the Rust in-memory index of `diskann-providers`: build a small index,
 //! save it with `SaveWith`, import the saved files with `diskann_io::read_index`, and compare
 //! every adjacency list, the starts and the frozen point with what the index holds in memory and
-//! with what the upstream graph loader reads back.
+//! with what the upstream graph loader reads back; then fingerprint the saved files (provenance)
+//! as `flab run` loads them, also with `flab provenance`.
 
 use std::io::{Cursor, Read};
 
@@ -18,6 +19,8 @@ use diskann::{
 use diskann_filter_lab::{
     diskann_io,
     graph::{AuxKind, Graph},
+    provenance::GraphFp,
+    run,
     vectors::DType,
 };
 use diskann_providers::{
@@ -127,4 +130,37 @@ fn upstream_saved_index_imports_identically() {
     let mut bytes = Vec::new();
     g.write_to(&mut bytes).unwrap();
     assert_eq!(Graph::read_from(Cursor::new(bytes)).unwrap(), g);
+
+    // Provenance of the saved files, as `flab run` loads them (the frozen point an auxiliary
+    // node, the unused list no node): from the graph file and the vector file's header, in
+    // memory, and by `flab provenance` (which also checks its in-memory load).
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flab-upstream-index-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prefix = dir.join("index");
+    std::fs::write(&prefix, file("/index").into_inner()).unwrap();
+    std::fs::write(dir.join("index.data"), file("/index.data").into_inner()).unwrap();
+    let fp = GraphFp::of_path(&prefix).unwrap();
+    assert_eq!(fp, GraphFp::of(&g));
+    assert_eq!((fp.n_data, fp.n_nodes), (n as u64, n as u64 + 1));
+    let loaded = run::data::load_graph(&prefix, None, DType::U8).unwrap();
+    assert_eq!(GraphFp::of(&loaded.graph), fp);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_flab"))
+        .arg("provenance")
+        .arg("--graph")
+        .arg(&prefix)
+        .arg("--in-memory")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        serde_json::from_value::<GraphFp>(doc["graph"].clone()).unwrap(),
+        fp
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

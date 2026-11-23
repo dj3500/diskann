@@ -854,14 +854,15 @@ struct ProvenanceArgs {
     #[arg(long)]
     dataset: Option<PathBuf>,
     /// Graph (a directory with `graph.flab`, a `graph.flab`, or a DiskANN graph file): its
-    /// fingerprint.
+    /// fingerprint, as `flab run` loads it (a DiskANN index's frozen points are auxiliary
+    /// nodes; its node count comes from the header of its vector file `<file>.data`).
     #[arg(long)]
     graph: Option<PathBuf>,
     /// Derived files whose recorded provenance is printed (`null`: none recorded).
     #[arg(long)]
     file: Vec<PathBuf>,
-    /// Also load the graph and fingerprint it in memory, as `flab run` does (the times of both
-    /// are reported).
+    /// Also load the graph (a DiskANN index with its vector file) and fingerprint it in memory,
+    /// as `flab run` does (the times of both are reported).
     #[arg(long)]
     in_memory: bool,
 }
@@ -902,7 +903,15 @@ fn provenance_command(a: &ProvenanceArgs) -> Result<()> {
             } else {
                 g.clone()
             };
-            let graph = diskann_io::open(&file, None)?;
+            // As `flab run` loads it: a DiskANN index with its vector file (frozen points).
+            let data = diskann_io::data_path(&file);
+            let graph = match container::peek_magic(&file)? != *graph::MAGIC && data.exists() {
+                true => {
+                    let dtype = diskann_io::vector_file_shape(&data)?.2;
+                    diskann_io::open(&file, Some((&data, dtype)))?
+                }
+                false => diskann_io::open(&file, None)?,
+            };
             times.insert("graph_load".into(), json!(secs(t)));
             let t = Instant::now();
             ensure!(
