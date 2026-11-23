@@ -101,9 +101,11 @@ flab select --track graph --dataset <dir> --calibration costs.json --graph <grap
         --budget 40 -t 2 --out-dir <dir>
 
 # Router trees per label (auxiliary router nodes reached only from the start table) and pair trees
-# over selected label pairs, on any graph over the same points
+# over selected label pairs, on any graph over the same points; --leaf-starts: a label of at most
+# one block (--block members) gets no router, its members are its starts (no router vector)
 flab steiner --dataset <dir> --graph <graph> --starts starts.flab --construction tree --block 64 \
-        --min-size 0 --max-size n/10 --router centroid --partition kmeans -t 2 --out-dir <trees>
+        --min-size 0 --max-size n/10 --router centroid --partition kmeans --leaf-starts -t 2 \
+        --out-dir <trees>
 flab steiner --dataset <dir> --graph <trees> --starts <trees>/starts.flab --construction pairs \
         --pairs pairs.flab --block 64 --min-size 0 --max-size n/1 --router centroid \
         --partition kmeans -t 2 --out-dir <pair trees>
@@ -198,7 +200,7 @@ are navigated, never evaluated against the predicate and never returned.
 | `static_bitsets` | `on` (default: the planned exact path, the probe and the post-filter route check clauses with the static bitsets when the index has them), `off`: on the label rows (the plans keep their forms without bitsets: `bitmap` scatters postings, `rowand` gallops; the bitsets are not built for such configurations alone): an ablation of the stored dense rows; excludes `predicate = "static_bits(θ)"` and `materializer = "dense_static"` |
 | `threshold_on` | `bound` (default: the `threshold` crossover takes the exact path when `min_c U_c ≤ T` of `exact`, `U_c` = the sum of clause `c`'s posting sizes), `estimate`: the graph route when the sketch estimate `M̂` of the match count is `≥ T`, else the exact path (needs `crossover = "threshold"`, `estimates = "sketch"` and an exact path with a threshold; the estimates are made once, before routing, and `m_hat` is recorded); an ablation that separates better match-count estimates from pricing by the cost model |
 | `df_pipeline` | `off` (default), `on`: the exact plan `df` checks a candidate inside the answer bound one block of 32 candidates after its distance, with its row offsets and row prefetched meanwhile (as `scan` prefetches its checks; the cost model prices `df`'s checks with the prefetched check curves); the same checks, answers and counters as the direct loop, only memory timing |
-| `tree_route` | `off` (default), `row_scan`, `bitmap`, `static_bits`, `cost`: a query whose binding clause c\* has router-tree roots (`flab steiner`) as starts searches the trees (`aux_only`, strict admission, a heap of the `K` best matches) with that member check; `cost` chooses per query the check of the lowest model cost (calibrated unit costs) |
+| `tree_route` | `off` (default), `row_scan`, `bitmap`, `static_bits`, `cost`: a query whose binding clause c\* has router-tree roots (`flab steiner`) as starts, or labels whose starts are exactly their members (`--leaf-starts`; checked at seeding, never listed), searches the trees (`aux_only`, strict admission, a heap of the `K` best matches) with that member check; `cost` chooses per query the check of the lowest model cost (calibrated unit costs) |
 | `tree_effort` | `list` (default: the configuration's list), `curve` (the calibrated tree effort curve, `flab tree-calibrate`), `capped`, `fixed(F)` (one router frontier `F` for every query and effort) |
 | `tree_pairs` | `off` (default), `on`: a query whose clause pair is exactly covered by pair trees (`flab steiner --construction pairs`; the run's `pairs_sidecar` and `pair_roots`) with fewer members than c\* searches those trees |
 
